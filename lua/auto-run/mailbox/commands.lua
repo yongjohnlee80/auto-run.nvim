@@ -1,0 +1,301 @@
+---auto-run.mailbox.commands — register the Phase 1 `run.*` mailbox
+---verbs (ADR-0048 §11; SPECS-table blueprint from
+---auto-agents/mailbox/todos_commands.lua).
+---
+---Phase 1 roster — read / mutate / stop tier ONLY (execution-starting
+---verbs `run.start` / `run.test_run` / `run.debug_start` are Phase 2
+---and trust-gated via `auto-core.trust` capability `run.exec`):
+---
+---  Read (always allowed):
+---    run.list           — config inventory (slim projection)
+---    run.show           — one effective (merged) config
+---    run.profiles_list  — env-profile inventory
+---    run.status         — resolver + store status (no jobs yet)
+---    run.validate       — whole-store schema/merge inspection
+---
+---  Store mutations (data, not execution — always allowed):
+---    run.add            — create a config
+---    run.update         — patch (write-routing per §3.1)
+---    run.remove         — delete a config file
+---    run.set_dir        — shared-tier dir override
+---    run.import         — launch.json → tracked tier
+---
+---Secret values NEVER appear in verb responses — configs carry refs
+---only, and this module never touches composed env values.
+---@module 'auto-run.mailbox.commands'
+
+local M = {}
+
+local OWNER = "auto-run"
+
+-- ── envelopes (mailbox commands convention) ─────────────────────
+
+---@param value any
+---@return table
+local function ok_response(value)
+  return { ok = true, value = value }
+end
+
+---@param code string
+---@param message string
+---@return table
+local function err_response(code, message)
+  return { ok = false, error = message, code = code }
+end
+
+---Lazy + soft store access so this module loads cleanly when
+---auto-core is absent at startup.
+---@return table? store, table? errenv
+local function store_or_err()
+  local ok, mod = pcall(require, "auto-run.store")
+  if not ok or type(mod) ~= "table" then
+    return nil, err_response("dependency_unavailable",
+      "auto-run.store is not available")
+  end
+  return mod
+end
+
+---Wrap a `(value, err)` Lua-API result into an envelope.
+---@param value any
+---@param err string?
+---@param code string?
+---@return table
+local function wrap_two_value(value, err, code)
+  if value == nil and err ~= nil then
+    return err_response(code or "internal_error", tostring(err))
+  end
+  return ok_response(value)
+end
+
+-- ── handlers ────────────────────────────────────────────────────
+
+local function h_list(_args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  local okl, list = pcall(store.list)
+  if not okl then return err_response("internal_error", tostring(list)) end
+  return ok_response({ count = #list, configs = list })
+end
+
+local function h_show(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  local opts = {}
+  if type(args.profile) == "string" and args.profile ~= "" then
+    opts.profile = args.profile
+  end
+  local eff, err, meta = store.get(args.name, opts)
+  if not eff then return err_response("not_found", tostring(err)) end
+  return ok_response({
+    config     = eff,
+    layers     = meta and meta.layers or {},
+    provenance = meta and meta.provenance or {},
+  })
+end
+
+local function h_profiles_list(_args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  local okl, list = pcall(store.list_profiles)
+  if not okl then return err_response("internal_error", tostring(list)) end
+  return ok_response({ count = #list, profiles = list })
+end
+
+local function h_status(_args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  local oks, status = pcall(store.status)
+  if not oks then return err_response("internal_error", tostring(status)) end
+  -- Phase 1: store/resolver status only; the jobs table arrives with
+  -- the Phase 2 execution engine.
+  status.jobs = {}
+  return ok_response(status)
+end
+
+local function h_validate(_args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  local okv, report = pcall(store.validate)
+  if not okv then return err_response("internal_error", tostring(report)) end
+  return ok_response(report)
+end
+
+local function h_add(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if type(args.config) ~= "table" then
+    return err_response("invalid_args", "args.config must be a table")
+  end
+  local opts = {}
+  if args.tier ~= nil then
+    if args.tier ~= "tracked" and args.tier ~= "shared" then
+      return err_response("invalid_args", "args.tier must be 'tracked' or 'shared'")
+    end
+    opts.tier = args.tier
+  end
+  if args.overwrite ~= nil then opts.overwrite = args.overwrite == true end
+  local path, err = store.add(args.config, opts)
+  if not path then return err_response("invalid_args", tostring(err)) end
+  return ok_response({ name = args.config.name, path = path })
+end
+
+local function h_update(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  if type(args.patch) ~= "table" then
+    return err_response("invalid_args", "args.patch must be a table")
+  end
+  local result, err = store.update(args.name, args.patch)
+  if not result then
+    local code = tostring(err):match("launch%.json shim") and "import_required"
+      or (tostring(err):match("not found") and "not_found" or "invalid_args")
+    return err_response(code, tostring(err))
+  end
+  return ok_response(result)
+end
+
+local function h_remove(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  local opts = {}
+  if args.tier ~= nil then
+    if args.tier ~= "tracked" and args.tier ~= "shared" then
+      return err_response("invalid_args", "args.tier must be 'tracked' or 'shared'")
+    end
+    opts.tier = args.tier
+  end
+  local okr, err = store.remove(args.name, opts)
+  if not okr then
+    local code = tostring(err):match("not found") and "not_found" or "internal_error"
+    return err_response(code, tostring(err))
+  end
+  return ok_response({ removed = args.name })
+end
+
+local function h_set_dir(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if args.path ~= nil and type(args.path) ~= "string" then
+    return err_response("invalid_args", "args.path, when provided, must be a string")
+  end
+  local dirs, err = store.set_dir(args.path)
+  return wrap_two_value(dirs, err, "invalid_args")
+end
+
+local function h_import(args)
+  local store, errenv = store_or_err(); if not store then return errenv end
+  if args.name ~= nil and type(args.name) ~= "string" then
+    return err_response("invalid_args", "args.name, when provided, must be a string")
+  end
+  if args.on_conflict ~= nil
+      and args.on_conflict ~= "overwrite"
+      and args.on_conflict ~= "skip"
+      and args.on_conflict ~= "rename" then
+    return err_response("invalid_args",
+      "args.on_conflict must be one of overwrite|skip|rename")
+  end
+  local oki, import = pcall(require, "auto-run.import")
+  if not oki then
+    return err_response("dependency_unavailable", "auto-run.import is not available")
+  end
+  local summary, err = import.import(args.name, { on_conflict = args.on_conflict })
+  return wrap_two_value(summary, err, "import_failed")
+end
+
+-- ── command specs ───────────────────────────────────────────────
+
+---@type table<string, table>
+local SPECS = {
+  ["run.list"] = {
+    owner       = OWNER,
+    description = "List run configs (both store tiers + launch.json shims while read-through is active). Slim projection {name, kind, runtime, tags, layers, origin, error?}; deterministic tier-then-filename order. Full merged shape via run.show.",
+    schema      = {},
+    handler     = h_list,
+  },
+  ["run.show"] = {
+    owner       = OWNER,
+    description = "Fetch one config's EFFECTIVE (7-layer merged) record plus layer + per-field provenance. Optional `profile` selects the env profile applied as merge layer 5. Extends cycles / dangling targets surface as structured errors.",
+    schema      = { name = "string", profile = "string?" },
+    handler     = h_show,
+  },
+  ["run.profiles_list"] = {
+    owner       = OWNER,
+    description = "List env profiles across both tiers: {name, tiers}. Profiles carry secret NAMES/refs only — never values.",
+    schema      = {},
+    handler     = h_profiles_list,
+  },
+  ["run.status"] = {
+    owner       = OWNER,
+    description = "Resolver + store status for the current anchor: both tier paths, origin (override|derived), launch.json read-through state, config/profile counts, known dirs. Phase 1: `jobs` is always empty (execution engine is Phase 2).",
+    schema      = {},
+    handler     = h_status,
+  },
+  ["run.validate"] = {
+    owner       = OWNER,
+    description = "Schema-check every config + profile file in both tiers and run extends-chain resolution (cycles, dangling targets). Returns {ok, checked, issues[]}.",
+    schema      = {},
+    handler     = h_validate,
+  },
+
+  ["run.add"] = {
+    owner       = OWNER,
+    description = "Create a run config. `config` is the full record (name + kind required). `tier` defaults to tracked when inside a git repo; `overwrite=true` replaces a same-tier file. Data mutation only — never starts anything.",
+    schema      = { config = "any", tier = "string?", overwrite = "boolean?" },
+    handler     = h_add,
+  },
+  ["run.update"] = {
+    owner       = OWNER,
+    description = "Patch a config. Write-routing per ADR-0048 §3.1: lands on the highest writable layer (shared-local file, else shared overrides.json) and reports which (`layer` in the response). launch.json shims are read-only → code=import_required.",
+    schema      = { name = "string", patch = "any" },
+    handler     = h_update,
+  },
+  ["run.remove"] = {
+    owner       = OWNER,
+    description = "Delete a config file (shared tier preferred unless `tier` given); the overrides.json entry is dropped once no tier holds the name.",
+    schema      = { name = "string", tier = "string?" },
+    handler     = h_remove,
+  },
+  ["run.set_dir"] = {
+    owner       = OWNER,
+    description = "Override the shared-local store dir for the anchor's repo (mirrors todos.set_dir). Pass `path = nil`/empty to clear. Returns the re-resolved dirs {tracked, shared, origin}.",
+    schema      = { path = "string?" },
+    handler     = h_set_dir,
+  },
+  ["run.import"] = {
+    owner       = OWNER,
+    description = "Import launch.json entries into the TRACKED tier with origin=launch.json. Optional `name` imports one entry; `on_conflict` ∈ overwrite|skip|rename (default skip) resolves same-name collisions. Returns {imported, skipped, renamed, errors, source}.",
+    schema      = { name = "string?", on_conflict = "string?" },
+    handler     = h_import,
+  },
+}
+
+M._SPECS = SPECS  -- exposed for tests / introspection
+
+---Register every run.* command against the auto-core mailbox command
+---registry. Idempotent — safe on every setup (re-registering with the
+---same owner replaces the spec).
+---@return { registered: string[], skipped: string[] }
+function M.register_all()
+  local okc, core = pcall(require, "auto-core")
+  local out = { registered = {}, skipped = {} }
+  if not (okc and core and core.mailbox and core.mailbox.commands) then
+    for name in pairs(SPECS) do out.skipped[#out.skipped + 1] = name end
+    table.sort(out.skipped)
+    return out
+  end
+  for name, spec in pairs(SPECS) do
+    local okr, regerr = core.mailbox.commands.register(name, spec)
+    if okr then
+      out.registered[#out.registered + 1] = name
+    else
+      out.skipped[#out.skipped + 1] = name
+      require("auto-run.log").warn("mailbox",
+        string.format("register('%s') failed: %s", name, tostring(regerr)))
+    end
+  end
+  table.sort(out.registered)
+  table.sort(out.skipped)
+  return out
+end
+
+return M

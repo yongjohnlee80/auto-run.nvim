@@ -25,6 +25,43 @@ Strict JSON, one file per config. Resolution through
 `require("auto-run.store").resolve_run_dirs()` — the only path
 authority.
 
+## Module layout (Phase 1)
+
+```
+lua/auto-run/
+├── init.lua             -- setup(), topic registration, public facade
+├── config.lua           -- plugin opts (not run configs)
+├── log.lua              -- auto-core.log wrapper (silent-INFO degrade)
+├── store/
+│   ├── init.lua         -- CRUD + 7-layer merge assembly + validate/status
+│   ├── paths.lua        -- resolve_run_dirs() + set_dir override registry
+│   ├── schema.lua       -- config/profile validation
+│   └── merge.lua        -- pure merge engine (field rules, tombstones, extends)
+├── env/init.lua         -- substitution + profile pipeline + 0600 materialization
+├── import/init.lua      -- launch.json JSONC importer + read-through shims
+└── mailbox/commands.lua -- run.* verb SPECS + register_all()
+
+plugin/auto-run.lua      -- :AutoRun {list|show|validate|import|doctor|set-dir}
+tests/smoke.lua          -- nvim --headless -u tests/smoke.lua -c 'qa!'
+```
+
+Phase 2–3 modules (`exec/`, `adapters/`, `discovery/`, `dap/`,
+`keymaps.lua`) land with their phases per the ADR rollout table.
+
+## Usage
+
+```lua
+require("auto-run").setup()
+```
+
+- `:AutoRun doctor` — resolver output for the current anchor (both
+  tiers, origin, override state, launch.json read-through).
+- `:AutoRun import` — one-shot launch.json migration into the
+  tracked tier (`origin = "launch.json"` provenance).
+- Mailbox verbs (`run.list` … `run.import`) register automatically
+  when the auto-core mailbox surface is present; execution verbs
+  arrive in Phase 2 behind the `run.exec` trust capability.
+
 ## Requirements
 
 - Neovim ≥ 0.10
