@@ -3,22 +3,29 @@
 ---Phase 1 surface: the two-tier `.auto-run/` store + resolver
 ---(`auto-run.store`), the substitution + env-profile pipeline
 ---(`auto-run.env`), launch.json interop (`auto-run.import`), and the
----read/mutate/stop-tier `run.*` mailbox verbs
----(`auto-run.mailbox.commands`). Execution, DAP, discovery, and
----keymaps arrive in Phases 2–3.
+---read/mutate `run.*` mailbox verbs (`auto-run.mailbox.commands`).
+---
+---Phase 2 surface: the execution engine (`auto-run.exec` — jobs,
+---strategies, terminal provider), the DAP bridge (`auto-run.dap` —
+---provider registration, debug_test parity, attach flows, UI
+---wiring), breakpoint persistence + reconcile sweep
+---(`auto-run.dap.breakpoints`), the §10 keymaps
+---(`auto-run.keymaps`), and the trust-gated execution verbs.
+---Discovery, adapters, and the auto-finder panels are Phase 3.
 ---
 ---auto-run consumes auto-core primitives ONLY (`fs.atomic`, `state`,
 ---`events`, `git.worktree`/`git.repo`, `trust`, `log`,
 ---`mailbox.commands`) and never re-derives shared state
 ---([[auto-family-state-ownership]]).
 ---
----Phase 1 IO note: every persisted write in this plugin is a
----synchronous atomic write (fs.atomic / the env module's private
----0600 writer) — there is no plugin-owned deferred IO to flush on
----VimLeavePre. The `auto-run` state namespace (dir overrides,
----known-dirs registry) is debounced by auto-core.state, which owns
----its own VimLeavePre flush. Any future deferred writer added here
----MUST register its own flush per [[auto-core-maintenance]] #9.
+---IO note: every persisted write in this plugin is a synchronous
+---atomic write (fs.atomic / the env module's private 0600 writer).
+---The one plugin-owned deferred writer — the breakpoint reconcile
+---debounce — registers its own synchronous VimLeavePre flush per
+---[[auto-core-maintenance]] #9 (see `auto-run.dap.breakpoints`).
+---The `auto-run` state namespace (dir overrides, known-dirs
+---registry) is debounced by auto-core.state, which owns its own
+---VimLeavePre flush.
 ---@module 'auto-run'
 
 local M = {}
@@ -38,11 +45,11 @@ M.TOPICS = {
     payload = "{ name?: string, action: 'add'|'update'|'remove'|'set_dir', tier?: string, layer?: string, shared?: string, origin?: string }",
   },
   ["run.job:started"] = {
-    doc     = "A run/test job started (Phase 2 execution engine).",
+    doc     = "A run/test job started (exec engine, §6).",
     payload = "{ id: string, config: string, strategy: 'run'|'term'|'dap', pid?: integer }",
   },
   ["run.job:exited"] = {
-    doc     = "A run/test job exited (Phase 2 execution engine).",
+    doc     = "A run/test job exited (exec engine, §6).",
     payload = "{ id: string, config: string, code: integer, signal?: integer }",
   },
   ["run.results:changed"] = {
@@ -50,11 +57,11 @@ M.TOPICS = {
     payload = "{ root: string, positions: table<string, { status: string, duration_ms?: number }> }",
   },
   ["run.session:changed"] = {
-    doc     = "A DAP session started / stopped / changed state (Phase 2).",
+    doc     = "A DAP session started / stopped / changed state (dap bridge, §6).",
     payload = "{ id: string, config?: string, state: string }",
   },
   ["run.breakpoints:changed"] = {
-    doc     = "The persisted breakpoint store changed (Phase 2).",
+    doc     = "The persisted breakpoint store changed (§9).",
     payload = "{ path?: string, count: integer, action: 'add'|'remove'|'clear'|'reconcile' }",
   },
   ["run.discovery:changed"] = {
@@ -132,8 +139,20 @@ function M.setup(opts)
   -- Materialized-env startup sweep (§4.1). Best-effort + silent.
   pcall(function() require("auto-run.env").sweep() end)
 
+  -- Phase 2: DAP bridge (quiet no-op without nvim-dap) + breakpoint
+  -- persistence sync points (autocmds always; dap listeners when
+  -- nvim-dap is present).
+  require("auto-run.dap").setup()
+  require("auto-run.dap.breakpoints").setup()
+
   M._initialized = true
   return true
+end
+
+---Register the ADR-0048 §10 default keymaps (`<leader>r*`,
+---`<leader>d*`, F7–F10). Call after `setup()`.
+function M.default_keymaps()
+  require("auto-run.keymaps").default_keymaps()
 end
 
 -- ── public facade ───────────────────────────────────────────────
@@ -145,6 +164,10 @@ setmetatable(M, {
     if key == "store" then return require("auto-run.store") end
     if key == "env" then return require("auto-run.env") end
     if key == "import" then return require("auto-run.import") end
+    if key == "exec" then return require("auto-run.exec") end
+    if key == "dap" then return require("auto-run.dap") end
+    if key == "breakpoints" then return require("auto-run.dap.breakpoints") end
+    if key == "keymaps" then return require("auto-run.keymaps") end
     if key == "log" then return require("auto-run.log") end
     if key == "config" then return require("auto-run.config").options end
     return nil

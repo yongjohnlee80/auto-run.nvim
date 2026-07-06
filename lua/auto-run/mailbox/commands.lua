@@ -1,17 +1,14 @@
----auto-run.mailbox.commands — register the Phase 1 `run.*` mailbox
----verbs (ADR-0048 §11; SPECS-table blueprint from
+---auto-run.mailbox.commands — register the `run.*` mailbox verbs
+---(ADR-0048 §11; SPECS-table blueprint from
 ---auto-agents/mailbox/todos_commands.lua).
----
----Phase 1 roster — read / mutate / stop tier ONLY (execution-starting
----verbs `run.start` / `run.test_run` / `run.debug_start` are Phase 2
----and trust-gated via `auto-core.trust` capability `run.exec`):
 ---
 ---  Read (always allowed):
 ---    run.list           — config inventory (slim projection)
 ---    run.show           — one effective (merged) config
 ---    run.profiles_list  — env-profile inventory
----    run.status         — resolver + store status (no jobs yet)
+---    run.status         — resolver + store status + LIVE jobs
 ---    run.validate       — whole-store schema/merge inspection
+---    run.jobs           — session job inventory (live + exited)
 ---
 ---  Store mutations (data, not execution — always allowed):
 ---    run.add            — create a config
@@ -20,8 +17,24 @@
 ---    run.set_dir        — shared-tier dir override
 ---    run.import         — launch.json → tracked tier
 ---
+---  Control (always allowed):
+---    run.stop           — UNGATED per §11: stopping a live job is a
+---                         safety/control operation. Only ever
+---                         terminates jobs auto-run itself started —
+---                         unknown/foreign ids are not_found.
+---
+---  Execution-starting (trust-gated — auto-core.trust `run.exec`):
+---    run.start / run.test_run / run.debug_start
+---    Every handler calls trust.check("run.exec", <config name>)
+---    FIRST. The mailbox path is hard-wired force-incapable: no verb
+---    schema carries a force/bypass flag, handlers never call
+---    trust.set, and unknown args can't smuggle one in — an agent can
+---    never bootstrap execution trust remotely (ADR-0035 §4.5
+---    wiring). run.test_run is Phase 2 scoped to kind=test CONFIGS.
+---
 ---Secret values NEVER appear in verb responses — configs carry refs
----only, and this module never touches composed env values.
+---only, job records carry no env at all, and this module never
+---touches composed env values.
 ---@module 'auto-run.mailbox.commands'
 
 local M = {}
@@ -105,9 +118,13 @@ local function h_status(_args)
   local store, errenv = store_or_err(); if not store then return errenv end
   local oks, status = pcall(store.status)
   if not oks then return err_response("internal_error", tostring(status)) end
-  -- Phase 1: store/resolver status only; the jobs table arrives with
-  -- the Phase 2 execution engine.
+  -- Live jobs (Phase 2 execution engine) — projections carry no env.
   status.jobs = {}
+  local okx, exec = pcall(require, "auto-run.exec")
+  if okx then
+    local okl, jobs = pcall(exec.list, { active_only = true })
+    if okl then status.jobs = jobs end
+  end
   return ok_response(status)
 end
 
@@ -202,6 +219,150 @@ local function h_import(args)
   return wrap_two_value(summary, err, "import_failed")
 end
 
+-- ── execution handlers (Phase 2, ADR-0048 §11) ──────────────────
+
+---@return table? exec, table? errenv
+local function exec_or_err()
+  local ok, mod = pcall(require, "auto-run.exec")
+  if not ok or type(mod) ~= "table" then
+    return nil, err_response("dependency_unavailable",
+      "auto-run.exec is not available")
+  end
+  return mod
+end
+
+---Trust gate shared by every execution-starting verb. Force-incapable
+---BY CONSTRUCTION: this helper only ever calls `trust.check`
+---(read-only); no schema below carries a force/bypass flag and no
+---handler calls `trust.set` — a remote agent cannot bootstrap
+---execution trust (ADR-0035 §4.5 wiring, ADR-0048 §11).
+---@param config_name string
+---@return table? errenv  nil when trusted
+local function check_exec_trust(config_name)
+  local okt, trust = pcall(require, "auto-core.trust")
+  if not okt or type(trust) ~= "table" then
+    return err_response("dependency_unavailable",
+      "auto-core.trust is not available")
+  end
+  local allowed, reason = trust.check("run.exec", config_name)
+  if not allowed then
+    return err_response("trust_required",
+      "run.exec capability check failed (" .. tostring(reason) .. ") for '"
+      .. config_name .. "' — execution-starting verbs need the workspace "
+      .. "run.exec trust capability, enabled interactively in the host "
+      .. "(first-run acknowledgment); it cannot be enabled via mailbox")
+  end
+  return nil
+end
+
+---Envelope code for a failed launch: the structured compose-error
+---code when present, else a not-found / generic mapping.
+---@param err string?
+---@param detail table?
+---@return string
+local function launch_err_code(err, detail)
+  if type(detail) == "table" and type(detail.code) == "string" then
+    return detail.code
+  end
+  if tostring(err):match("not found") then return "not_found" end
+  return "exec_failed"
+end
+
+local function h_start(args)
+  local exec, errenv = exec_or_err(); if not exec then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  local trust_err = check_exec_trust(args.name)
+  if trust_err then return trust_err end
+  local opts = {}
+  if type(args.profile) == "string" and args.profile ~= "" then
+    opts.profile = args.profile
+  end
+  if type(args.args) == "table" then opts.args = args.args end
+  if args.strategy ~= nil then
+    if args.strategy ~= "run" and args.strategy ~= "term" and args.strategy ~= "dap" then
+      return err_response("invalid_args",
+        "args.strategy must be one of run|term|dap")
+    end
+    opts.strategy = args.strategy
+  end
+  local launched, err, detail = exec.start(args.name, opts)
+  if not launched then
+    return err_response(launch_err_code(err, detail), tostring(err))
+  end
+  return ok_response(launched)
+end
+
+local function h_test_run(args)
+  local exec, errenv = exec_or_err(); if not exec then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  local trust_err = check_exec_trust(args.name)
+  if trust_err then return trust_err end
+  local opts = {}
+  if type(args.profile) == "string" and args.profile ~= "" then
+    opts.profile = args.profile
+  end
+  if args.package ~= nil then
+    if type(args.package) ~= "string" or args.package == "" then
+      return err_response("invalid_args", "args.package must be a non-empty string")
+    end
+    opts.package = args.package
+  end
+  if args.test_name ~= nil then
+    if type(args.test_name) ~= "string" or args.test_name == "" then
+      return err_response("invalid_args", "args.test_name must be a non-empty string")
+    end
+    opts.test_name = args.test_name
+  end
+  local launched, err, detail = exec.test_run(args.name, opts)
+  if not launched then
+    local code = launch_err_code(err, detail)
+    if tostring(err):match("kind=test configs only") then code = "invalid_args" end
+    return err_response(code, tostring(err))
+  end
+  return ok_response(launched)
+end
+
+local function h_debug_start(args)
+  local exec, errenv = exec_or_err(); if not exec then return errenv end
+  if type(args.name) ~= "string" or args.name == "" then
+    return err_response("invalid_args", "args.name must be a non-empty string")
+  end
+  local trust_err = check_exec_trust(args.name)
+  if trust_err then return trust_err end
+  local opts = { strategy = "dap" }
+  if type(args.profile) == "string" and args.profile ~= "" then
+    opts.profile = args.profile
+  end
+  local launched, err, detail = exec.start(args.name, opts)
+  if not launched then
+    return err_response(launch_err_code(err, detail), tostring(err))
+  end
+  return ok_response(launched)
+end
+
+local function h_stop(args)
+  local exec, errenv = exec_or_err(); if not exec then return errenv end
+  if type(args.id) ~= "string" or args.id == "" then
+    return err_response("invalid_args", "args.id must be a non-empty string")
+  end
+  local oks, err = exec.stop(args.id)
+  if not oks then
+    return err_response("not_found", tostring(err))
+  end
+  return ok_response({ stopped = args.id })
+end
+
+local function h_jobs(_args)
+  local exec, errenv = exec_or_err(); if not exec then return errenv end
+  local okl, jobs = pcall(exec.list)
+  if not okl then return err_response("internal_error", tostring(jobs)) end
+  return ok_response({ count = #jobs, jobs = jobs })
+end
+
 -- ── command specs ───────────────────────────────────────────────
 
 ---@type table<string, table>
@@ -226,7 +387,7 @@ local SPECS = {
   },
   ["run.status"] = {
     owner       = OWNER,
-    description = "Resolver + store status for the current anchor: both tier paths, origin (override|derived), launch.json read-through state, config/profile counts, known dirs. Phase 1: `jobs` is always empty (execution engine is Phase 2).",
+    description = "Resolver + store status for the current anchor: both tier paths, origin (override|derived), launch.json read-through state, config/profile counts, known dirs, plus `jobs` — the LIVE (still-running) job projections (no env values).",
     schema      = {},
     handler     = h_status,
   },
@@ -266,6 +427,41 @@ local SPECS = {
     description = "Import launch.json entries into the TRACKED tier with origin=launch.json. Optional `name` imports one entry; `on_conflict` ∈ overwrite|skip|rename (default skip) resolves same-name collisions. Returns {imported, skipped, renamed, errors, source}.",
     schema      = { name = "string?", on_conflict = "string?" },
     handler     = h_import,
+  },
+
+  -- Execution-starting verbs (trust-gated, ADR-0048 §11). None of
+  -- these schemas may EVER grow a force/bypass flag — the mailbox
+  -- path is hard-wired force-incapable.
+  ["run.start"] = {
+    owner       = OWNER,
+    description = "TRUST-GATED (auto-core.trust capability run.exec, checked against the config name; enable interactively in the host — never via mailbox). Launch a config with its kind's default strategy (run→run, debug→dap, test→run) or an explicit `strategy` ∈ run|term|dap. Returns the launch descriptor; job records never carry env values.",
+    schema      = { name = "string", profile = "string?", args = "any?", strategy = "string?" },
+    handler     = h_start,
+  },
+  ["run.test_run"] = {
+    owner       = OWNER,
+    description = "TRUST-GATED (run.exec). Phase 2 scope: kind=test CONFIGS only (plain `go test` on the configured package; discovered positions are Phase 3). Optional `package` overrides the package under test, `test_name` adds -run ^name$.",
+    schema      = { name = "string", profile = "string?", package = "string?", test_name = "string?" },
+    handler     = h_test_run,
+  },
+  ["run.debug_start"] = {
+    owner       = OWNER,
+    description = "TRUST-GATED (run.exec). Start a nvim-dap session for a config (strategy forced to dap). Requires nvim-dap in the host.",
+    schema      = { name = "string", profile = "string?" },
+    handler     = h_debug_start,
+  },
+
+  ["run.stop"] = {
+    owner       = OWNER,
+    description = "UNGATED control verb (ADR-0048 §11): stopping a live job is a safety operation. Only ever terminates jobs auto-run itself started this session — unknown or foreign ids return not_found.",
+    schema      = { id = "string" },
+    handler     = h_stop,
+  },
+  ["run.jobs"] = {
+    owner       = OWNER,
+    description = "Read-only session job inventory (live + exited): {id, config, strategy, cmd, pid, dir, started_at, exited, code, signal}. Never includes env values.",
+    schema      = {},
+    handler     = h_jobs,
   },
 }
 

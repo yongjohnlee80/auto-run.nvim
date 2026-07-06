@@ -16,6 +16,13 @@
 --   [7] env pipeline (trust gate, materialization, sweep)
 --   [8] launch.json import + read-through contract
 --   [9] mailbox verb envelopes (handlers called in-process)
+--   [10] exec — job engine end-to-end (§6)
+--   [11] exec — strategy resolution + terminal provider probe
+--   [12] mailbox — trust-gated exec verbs + ungated run.stop (§11)
+--   [13] breakpoints — API persistence (real nvim-dap, §9)
+--   [14] breakpoints — reconcile sweep + sync tunables
+--   [15] breakpoints — stale-line drop on restore
+--   [16] breakpoints — worktree-relative rehydration (two worktrees)
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -42,7 +49,10 @@ else
 end
 
 local LAZY = vim.fn.expand("~/.local/share/nvim/lazy")
-for _, dep in ipairs({ "plenary.nvim" }) do
+-- Real nvim-dap on the rtp for the §9 breakpoint sections — the
+-- persistence + reconcile paths run against the actual
+-- dap.breakpoints get/set surface, not a stub.
+for _, dep in ipairs({ "plenary.nvim", "nvim-dap" }) do
   local p = LAZY .. "/" .. dep
   if vim.fn.isdirectory(p) == 1 then vim.opt.rtp:prepend(p) end
 end
@@ -52,6 +62,10 @@ end
 require("auto-core.state").configure({
   persist_dir = vim.fn.tempname() .. "_state-isolation",
 })
+
+-- Ring-only logging: WARN paths (e.g. the §9 stale-breakpoint drop)
+-- must not stripe headless stderr — clean-stderr rule.
+require("auto-core.log").configure({ notify = false })
 
 -- ── runner harness ───────────────────────────────────────────────
 local pass_count, fail_count = 0, 0
@@ -734,19 +748,16 @@ local commands = require("auto-core.mailbox.commands")
 local run_cmds = require("auto-run.mailbox.commands")
 
 local reg = run_cmds.register_all()
-ok("register_all registers all 10 Phase 1 verbs (idempotent)",
-  #reg.registered == 10 and #reg.skipped == 0, vim.inspect(reg))
+ok("register_all registers all 15 verbs (idempotent)",
+  #reg.registered == 15 and #reg.skipped == 0, vim.inspect(reg))
 local expected_verbs = {
-  "run.add", "run.import", "run.list", "run.profiles_list", "run.remove",
-  "run.set_dir", "run.show", "run.status", "run.update", "run.validate",
+  "run.add", "run.debug_start", "run.import", "run.jobs", "run.list",
+  "run.profiles_list", "run.remove", "run.set_dir", "run.show",
+  "run.start", "run.status", "run.stop", "run.test_run",
+  "run.update", "run.validate",
 }
-ok("verb roster matches the Phase 1 read/mutate tier exactly",
+ok("verb roster matches the Phase 1+2 tiers exactly",
   vim.deep_equal(reg.registered, expected_verbs), vim.inspect(reg.registered))
-local no_exec = true
-for _, v in ipairs({ "run.start", "run.test_run", "run.debug_start", "run.stop" }) do
-  if commands.get(v) ~= nil then no_exec = false end
-end
-ok("NO execution verbs registered in Phase 1", no_exec)
 local spec = commands.get("run.list")
 ok("registry entry owned by auto-run",
   spec ~= nil and spec.owner == "auto-run")
@@ -773,7 +784,7 @@ ok("run.status reports resolver + store state",
     and env_status.value.tracked == lj .. "/.auto-run"
     and env_status.value.origin == "derived"
     and env_status.value.read_through == false)
-ok("run.status Phase 1: jobs always empty",
+ok("run.status jobs empty before any launch",
   type(env_status.value.jobs) == "table" and next(env_status.value.jobs) == nil)
 
 local env_add = commands.get("run.add").handler({
@@ -830,6 +841,599 @@ vim.cmd("runtime! plugin/auto-run.lua")
 local ucmds = vim.api.nvim_get_commands({})
 ok(":AutoRun user command registered", ucmds.AutoRun ~= nil)
 ok(":AutoRun validate runs clean", pcall(vim.cmd, "AutoRun validate"))
+
+-- ═════════════════════════ Phase 2 ══════════════════════════════
+-- Cross-section carriers live on ONE table (sections below run in
+-- do-blocks so the main chunk stays under Lua's 200-local cap).
+local P2 = {}
+P2.exec = require("auto-run.exec")
+P2.strategies = require("auto-run.exec.strategies")
+P2.bps = require("auto-run.dap.breakpoints")
+
+---Wait until fn() is truthy (returns the final value).
+local function wait_for(fn, ms)
+  vim.wait(ms or 8000, function() return fn() and true or false end, 25)
+  return fn()
+end
+
+---Decode the container-store breakpoints.json → records list.
+local function read_bp_store()
+  local file = container .. "/.auto-run/breakpoints.json"
+  if vim.fn.filereadable(file) == 0 then return {} end
+  local okd, data = pcall(vim.json.decode,
+    table.concat(vim.fn.readfile(file), "\n"))
+  return (okd and type(data) == "table" and type(data.breakpoints) == "table")
+    and data.breakpoints or {}
+end
+
+---Find a record by path+lnum in a record list.
+local function find_bp(records, path, lnum)
+  for _, r in ipairs(records) do
+    if r.path == path and r.lnum == lnum then return r end
+  end
+  return nil
+end
+
+-- ── [10] exec — job engine end-to-end ───────────────────────────
+print("\n[10] exec — job engine (per-run dirs, events, env, stop)")
+do
+  worktree.set_active(plain)
+  require("auto-run.config").setup({
+    env  = { dir = fx .. "/env-cache" },
+    exec = { runs_dir = fx .. "/runs" },
+  })
+  local exec = P2.exec
+
+  store.add({
+    name = "echo-run", kind = "run", program = "sh",
+    args = { "-c", "echo out-line; echo val=$SMOKE_ENV_VAL; echo err-line 1>&2; exit 3" },
+    env = { SMOKE_ENV_VAL = "hello-env" },
+  }, { tier = "shared" })
+
+  local started_ev, exited_ev
+  local h1 = core.events.subscribe("run.job:started", function(p) started_ev = p end)
+  local h2 = core.events.subscribe("run.job:exited", function(p) exited_ev = p end)
+
+  local launched, lerr = exec.start("echo-run")
+  ok("start() launches a run-strategy job", launched ~= nil, tostring(lerr))
+  ok("job record: id + pid + strategy=run",
+    launched and launched.id:match("^r%d") ~= nil
+      and type(launched.pid) == "number" and launched.strategy == "run",
+    vim.inspect(launched))
+  ok("run.job:started published with the pid",
+    started_ev ~= nil and started_ev.id == launched.id
+      and started_ev.config == "echo-run" and started_ev.pid == launched.pid,
+    vim.inspect(started_ev))
+
+  local done = wait_for(function() return exited_ev end)
+  ok("run.job:exited published with the exit code",
+    done ~= nil and done.id == launched.id and done.code == 3,
+    vim.inspect(done))
+
+  local run_dir = fx .. "/runs/" .. launched.id
+  ok("per-run dir exists under the configured runs root",
+    vim.fn.isdirectory(run_dir) == 1, run_dir)
+  local out_txt = table.concat(vim.fn.readfile(run_dir .. "/stdout"), "\n")
+  local err_txt = table.concat(vim.fn.readfile(run_dir .. "/stderr"), "\n")
+  ok("stdout streamed to its own file", out_txt:find("out-line", 1, true) ~= nil, out_txt)
+  ok("stderr streamed SEPARATELY", err_txt:find("err-line", 1, true) ~= nil
+    and out_txt:find("err-line", 1, true) == nil, err_txt)
+  ok("composed env reached the process (Phase 1 pipeline)",
+    out_txt:find("val=hello-env", 1, true) ~= nil, out_txt)
+  local result = vim.json.decode(
+    table.concat(vim.fn.readfile(run_dir .. "/result.json"), "\n"))
+  ok("result.json is the machine-readable channel (code=3)",
+    result.id == launched.id and result.code == 3 and result.config == "echo-run")
+  ok("result.json carries NO env values",
+    vim.inspect(result):find("hello-env", 1, true) == nil)
+
+  local jobs = exec.list()
+  ok("list() sees the exited job", #jobs >= 1 and jobs[#jobs].exited == true)
+  ok("job projections carry no env",
+    vim.inspect(jobs):find("hello%-env") == nil)
+  ok("materialized env file discarded on exit",
+    vim.fn.filereadable(fx .. "/env-cache/" .. launched.id .. ".env") == 0)
+
+  -- run_last replays the previous launch.
+  exited_ev = nil
+  local relaunched, rerr = exec.run_last()
+  ok("run_last() replays the last launch", relaunched ~= nil
+    and relaunched.id ~= launched.id, tostring(rerr))
+  ok("replayed job exits too",
+    wait_for(function() return exited_ev end) ~= nil)
+
+  -- stop() — only jobs auto-run started.
+  store.add({ name = "sleeper", kind = "run", program = "sh",
+    args = { "-c", "sleep 30" } }, { tier = "shared" })
+  exited_ev = nil
+  local sleeper = exec.start("sleeper")
+  ok("long-running job starts", sleeper ~= nil and sleeper.pid ~= nil)
+  local stop_ok, stop_err = exec.stop(sleeper.id)
+  ok("stop() signals a job we started", stop_ok == true, tostring(stop_err))
+  local sdone = wait_for(function() return exited_ev end)
+  ok("stopped job exits by signal",
+    sdone ~= nil and (sdone.signal == 15 or (sdone.code or 0) ~= 0),
+    vim.inspect(sdone))
+  local ghost_ok, ghost_err = exec.stop("r00000000-000000-9999")
+  ok("stop() on an unknown id is not-found",
+    ghost_ok == nil and tostring(ghost_err):find("not found", 1, true) ~= nil,
+    tostring(ghost_err))
+
+  -- No default timeout: a spawned job spec without timeout_ms passes
+  -- none to vim.system (observable only as absence — the sleeper ran
+  -- until signalled, not reaped by a default timeout).
+  ok("no default timeout (sleeper lived until stop)", sdone ~= nil)
+
+  core.events.unsubscribe(h1)
+  core.events.unsubscribe(h2)
+end
+
+-- ── [11] exec — strategies + terminal provider probe ────────────
+print("\n[11] exec — strategy resolution + terminal provider")
+do
+  local strategies = P2.strategies
+
+  local s = strategies.resolve("run")
+  ok("kind=run defaults to strategy run", s == "run")
+  ok("kind=debug defaults to dap", strategies.resolve("debug") == "dap")
+  ok("kind=test defaults to run (plain test run)",
+    strategies.resolve("test") == "run")
+  ok("kind=test with debug=true resolves dap",
+    strategies.resolve("test", { debug = true }) == "dap")
+  ok("per-launch override wins",
+    strategies.resolve("run", { strategy = "term" }) == "term")
+  local bad, bad_err = strategies.resolve("run", { strategy = "banana" })
+  ok("invalid strategy is a structured error",
+    bad == nil and tostring(bad_err):find("run|term|dap") ~= nil, tostring(bad_err))
+
+  -- Provider probe order: registered > auto-agents (absent headless)
+  -- > builtin fallback.
+  local _, source0 = strategies.terminal_provider()
+  ok("no registered provider → builtin fallback (auto-agents absent)",
+    source0 == "builtin", tostring(source0))
+
+  local captured
+  strategies.register_terminal_provider(function(spec)
+    captured = spec
+    return true
+  end)
+  local _, source1 = strategies.terminal_provider()
+  ok("registered provider is preferred", source1 == "registered")
+
+  store.add({
+    name = "term-cfg", kind = "run", program = "sh",
+    args = { "-c", "echo terminal" },
+    env = { TERM_SECRET = "sekrit-terminal-value" },
+  }, { tier = "shared" })
+  local launched, lerr = P2.exec.start("term-cfg", { strategy = "term" })
+  ok("term-strategy launch routes through the provider",
+    launched ~= nil and launched.strategy == "term"
+      and launched.provider == "registered", tostring(lerr))
+  ok("provider received the spec (argv + cmdline + run id)",
+    captured ~= nil and captured.cmd[1] == "sh"
+      and type(captured.cmdline) == "string" and captured.run_id == launched.id,
+    vim.inspect(captured and captured.cmd))
+  ok("composed env arrives as a materialized env FILE",
+    captured.env_file ~= nil and vim.fn.filereadable(captured.env_file) == 1)
+  local est = vim.uv.fs_stat(captured.env_file)
+  ok("term env file is 0600", est and bit.band(est.mode, 511) == 384)
+  ok("secret VALUE never appears on the rendered command line",
+    captured.cmdline:find("sekrit-terminal-value", 1, true) == nil
+      and captured.cmdline:find(captured.env_file, 1, true) ~= nil,
+    captured.cmdline)
+
+  strategies.register_terminal_provider(nil)
+  local _, source2 = strategies.terminal_provider()
+  ok("clearing the provider restores the probe", source2 == "builtin")
+end
+
+-- ── [12] mailbox — trust-gated exec verbs (§11) ─────────────────
+print("\n[12] mailbox — run.exec trust gate, ungated run.stop")
+do
+  trust._reset_for_tests()
+  local h_start = commands.get("run.start").handler
+  local h_test_run = commands.get("run.test_run").handler
+  local h_debug_start = commands.get("run.debug_start").handler
+  local h_stop = commands.get("run.stop").handler
+  local h_jobs = commands.get("run.jobs").handler
+  local h_status = commands.get("run.status").handler
+
+  -- Untrusted → structured trust error; nothing runs.
+  local env1 = h_start({ name = "echo-run" })
+  ok("untrusted run.start → trust_required",
+    env1.ok == false and env1.code == "trust_required", vim.inspect(env1))
+  ok("trust error names the capability",
+    tostring(env1.error):find("run.exec", 1, true) ~= nil)
+  ok("untrusted run.test_run → trust_required",
+    h_test_run({ name = "echo-run" }).code == "trust_required")
+  ok("untrusted run.debug_start → trust_required",
+    h_debug_start({ name = "echo-run" }).code == "trust_required")
+
+  -- Mailbox can never force-enable (no ack → set refuses; no schema
+  -- carries a force flag).
+  local set_ok, set_err = trust.set("run.exec", { enabled = true })
+  ok("trust.set without first-run ack refuses",
+    set_ok == false and set_err == "trust_not_acknowledged", tostring(set_err))
+  for _, verb in ipairs({ "run.start", "run.test_run", "run.debug_start", "run.stop" }) do
+    local schema = commands.get(verb).schema or {}
+    local clean = true
+    for k in pairs(schema) do
+      if tostring(k):lower():find("force") or tostring(k):lower():find("bypass") then
+        clean = false
+      end
+    end
+    ok(verb .. " schema carries NO force/bypass flag", clean, vim.inspect(schema))
+  end
+
+  -- Interactive ack + enable → the verb runs.
+  trust.acknowledge_first_run("run.exec")
+  ok("trust.set after ack succeeds", trust.set("run.exec", { enabled = true }) == true)
+
+  local exited_ev
+  local h_ev = core.events.subscribe("run.job:exited", function(p) exited_ev = p end)
+  local env2 = h_start({ name = "echo-run" })
+  ok("trusted run.start launches", env2.ok == true and env2.value.id ~= nil,
+    vim.inspect(env2))
+  ok("verb response carries no env values",
+    vim.inspect(env2):find("hello%-env") == nil)
+  ok("mailbox-started job exits",
+    wait_for(function() return exited_ev and exited_ev.id == env2.value.id end) ~= nil)
+
+  -- Allowlist scopes trust to config-name patterns.
+  trust.set("run.exec", { allowlist = { "^echo%-" } })
+  local env3 = h_start({ name = "sleeper" })
+  ok("allowlist-rejected config → trust_required",
+    env3.ok == false and env3.code == "trust_required"
+      and tostring(env3.error):find("allowlist_rejected", 1, true) ~= nil,
+    vim.inspect(env3))
+  trust.set("run.exec", { allowlist = false })
+
+  -- test_run: Phase 2 scope is kind=test configs only.
+  local env4 = h_test_run({ name = "echo-run" })
+  ok("run.test_run on a kind=run config → invalid_args",
+    env4.ok == false and env4.code == "invalid_args"
+      and tostring(env4.error):find("kind=test", 1, true) ~= nil,
+    vim.inspect(env4))
+  store.add({ name = "pkg-tests", kind = "test", runtime = "go",
+    build_flags = "-count=1", program = "./..." }, { tier = "shared" })
+  exited_ev = nil
+  local env5 = h_test_run({ name = "pkg-tests" })
+  ok("run.test_run on a kind=test config launches `go test` on the package",
+    env5.ok == true
+      and vim.deep_equal(env5.value.cmd, { "go", "test", "-count=1", "./..." }),
+    vim.inspect(env5))
+  ok("test job exits",
+    wait_for(function() return exited_ev and exited_ev.id == env5.value.id end) ~= nil)
+
+  -- test_name/package plumbed through to the argv.
+  exited_ev = nil
+  local env5b = h_test_run({ name = "pkg-tests", package = "./pkg/x", test_name = "TestFoo" })
+  ok("run.test_run plumbs test_name + package into the argv",
+    env5b.ok == true and vim.deep_equal(env5b.value.cmd,
+      { "go", "test", "-count=1", "-run", "^TestFoo$", "./pkg/x" }),
+    vim.inspect(env5b))
+  wait_for(function() return exited_ev and exited_ev.id == env5b.value.id end)
+
+  -- run.debug_start reaches the exec layer once trusted (structured
+  -- not_found for unknown configs; a live dap session needs an
+  -- adapter + UI, out of headless scope).
+  local env6 = h_debug_start({ name = "no-such-config" })
+  ok("trusted run.debug_start unknown config → not_found",
+    env6.ok == false and env6.code == "not_found", vim.inspect(env6))
+
+  -- run.stop is UNGATED: disable exec trust, stop a live job.
+  local sleeper = P2.exec.start("sleeper")
+  ok("live job for the stop test", sleeper ~= nil)
+  local env_status = h_status({})
+  local live_seen = false
+  for _, j in ipairs(env_status.value.jobs) do
+    if j.id == sleeper.id then live_seen = true end
+  end
+  ok("run.status includes live jobs", env_status.ok == true and live_seen,
+    vim.inspect(env_status.value.jobs))
+
+  trust.set("run.exec", { enabled = false })
+  exited_ev = nil
+  local env7 = h_stop({ id = sleeper.id })
+  ok("run.stop works with exec trust DISABLED (ungated)",
+    env7.ok == true and env7.value.stopped == sleeper.id, vim.inspect(env7))
+  wait_for(function() return exited_ev and exited_ev.id == sleeper.id end)
+  local env8 = h_stop({ id = "r19990101-000000-0001" })
+  ok("run.stop foreign/unknown id → not_found",
+    env8.ok == false and env8.code == "not_found", vim.inspect(env8))
+
+  local env9 = h_jobs({})
+  ok("run.jobs lists the session inventory",
+    env9.ok == true and env9.value.count >= 4
+      and env9.value.jobs[1].id ~= nil, vim.inspect(env9.value.count))
+
+  -- Re-enable for nothing further — leave trust OFF (default-deny).
+  core.events.unsubscribe(h_ev)
+end
+
+-- ── [13] breakpoints — API persistence (real nvim-dap) ──────────
+print("\n[13] breakpoints — §9 store, API mutations persist synchronously")
+do
+  local okd, dap = pcall(require, "dap")
+  ok("real nvim-dap on rtp", okd, tostring(dap))
+
+  -- Re-run setup with dap present: provider + listeners + sync points.
+  ok("setup() re-wires with dap present", auto_run.setup() == true)
+  ok("dap.providers.configs['auto-run'] registered (never dap.configurations)",
+    dap.providers.configs["auto-run"] ~= nil)
+  ok("winfixbuf guard listener registered",
+    dap.listeners.before.event_stopped["auto-run-avoid-winfixbuf"] ~= nil)
+  ok("failed-start capture listeners registered",
+    dap.listeners.after.event_output["auto-run-errors"] ~= nil)
+  ok("breakpoint session-boundary listeners registered",
+    dap.listeners.before.launch["auto-run-breakpoints"] ~= nil)
+
+  -- Provider emits lazy configs for matching-filetype buffers.
+  worktree.set_active(plain)
+  local go_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[go_buf].filetype = "go"
+  local provided = require("auto-run.dap").provider(go_buf)
+  local echo_entry
+  for _, c in ipairs(provided) do
+    if c.name == "[auto-run] echo-run" then echo_entry = c end
+  end
+  ok("provider emits store configs for the buffer's filetype",
+    echo_entry ~= nil, vim.inspect(#provided))
+  ok("provider fields are function-valued (lazy)",
+    echo_entry and type(echo_entry.program) == "function")
+  ok("lazy field resolves through merge+substitution on evaluation",
+    echo_entry and echo_entry.program() == "sh")
+
+  -- default_keymaps: §10 table registered with desc strings.
+  auto_run.default_keymaps()
+  local descs = {}
+  for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
+    if m.desc then descs[m.desc] = true end
+  end
+  local expected_descs = {
+    "Run: Pick Config & Run", "Run: Run Last", "Run: Nearest Test",
+    "Run: Current Test File", "Run: Pick Env Profile for Next Run",
+    "Run: New Run Config (scaffold)",
+    "Debug: Toggle Breakpoint", "Debug: Conditional Breakpoint",
+    "Debug: Clear Breakpoints", "Debug: Continue / Start",
+    "Debug: Nearest Test", "Debug: Entry Point (pick)",
+    "Debug: Attach to Remote dlv Server", "Debug: Terminate",
+    "Debug: Restart", "Debug: Doctor",
+    "Run: Continue / Start (dap)", "Run: Step Over (dap)",
+    "Run: Step Into (dap)", "Run: Step Out (dap)",
+  }
+  local missing = {}
+  for _, d in ipairs(expected_descs) do
+    if not descs[d] then missing[#missing + 1] = d end
+  end
+  ok("§10 keymap table registered (desc on everything)",
+    #missing == 0, vim.inspect(missing))
+
+  -- Breakpoint persistence in the linked-worktree fixture.
+  local main_wt = container .. "/main"
+  vim.fn.mkdir(main_wt .. "/src", "p")
+  local lines = {}
+  for i = 1, 10 do lines[i] = ("local line_%d = %d"):format(i, i) end
+  write_file(main_wt .. "/src/app.lua", table.concat(lines, "\n") .. "\n")
+  ok("app fixture committed",
+    git(main_wt, "add", ".") and git(main_wt, "commit", "-q", "-m", "app"))
+  ok("second worktree created",
+    git(fx, "--git-dir=" .. container .. "/.bare", "worktree", "add", "-q",
+      "-b", "smoke-wt2", container .. "/wt2", "main"))
+
+  worktree.set_active(main_wt)
+  local dirs = store.resolve_run_dirs()
+  ok("shared tier is the container store", dirs.shared == container .. "/.auto-run")
+
+  vim.cmd.edit(main_wt .. "/src/app.lua")
+  local app_buf = vim.api.nvim_get_current_buf()
+  P2.app_buf = app_buf
+
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  local t_ok, t_err = P2.bps.toggle()
+  ok("API toggle succeeds", t_ok == true, tostring(t_err))
+  local records = read_bp_store()
+  ok("toggle persists SYNCHRONOUSLY to <container>/.auto-run/breakpoints.json",
+    #records == 1 and records[1].path == "src/app.lua" and records[1].lnum == 3,
+    vim.inspect(records))
+
+  vim.api.nvim_win_set_cursor(0, { 5, 0 })
+  P2.bps.set({ condition = "x > 1" })
+  records = read_bp_store()
+  local cond_rec = find_bp(records, "src/app.lua", 5)
+  ok("conditional breakpoint persists its condition",
+    #records == 2 and cond_rec ~= nil and cond_rec.condition == "x > 1",
+    vim.inspect(records))
+
+  vim.api.nvim_win_set_cursor(0, { 3, 0 })
+  P2.bps.toggle()   -- off
+  records = read_bp_store()
+  ok("toggle-off removes the record", #records == 1
+    and find_bp(records, "src/app.lua", 3) == nil, vim.inspect(records))
+
+  local stats = P2.bps.stats()
+  ok("stats() reports the store",
+    stats.file == container .. "/.auto-run/breakpoints.json"
+      and stats.count == 1 and stats.files == 1, vim.inspect(stats))
+end
+
+-- ── [14] breakpoints — reconcile sweep ──────────────────────────
+print("\n[14] breakpoints — reconcile sweep + tunables")
+do
+  local dap = require("dap")
+  local bp_ev
+  local h_ev = core.events.subscribe("run.breakpoints:changed",
+    function(p) bp_ev = p end)
+
+  -- Direct nvim-dap mutation (bypasses auto-run's API) …
+  vim.api.nvim_set_current_buf(P2.app_buf)
+  vim.api.nvim_win_set_cursor(0, { 7, 0 })
+  dap.toggle_breakpoint()
+  local records = read_bp_store()
+  ok("direct dap toggle is NOT yet persisted", find_bp(records, "src/app.lua", 7) == nil)
+
+  -- … the sweep persists it.
+  local changed = P2.bps.reconcile()
+  records = read_bp_store()
+  ok("reconcile() persists direct dap mutations",
+    changed == true and find_bp(records, "src/app.lua", 7) ~= nil,
+    vim.inspect(records))
+  ok("run.breakpoints:changed published with action=reconcile",
+    bp_ev ~= nil and bp_ev.action == "reconcile", vim.inspect(bp_ev))
+
+  -- Entries for files with NO loaded buffer survive the sweep.
+  local raw = vim.json.decode(table.concat(
+    vim.fn.readfile(container .. "/.auto-run/breakpoints.json"), "\n"))
+  table.insert(raw.breakpoints,
+    { path = "src/ghost.lua", lnum = 1, enabled = true })
+  write_file(container .. "/.auto-run/breakpoints.json", vim.json.encode(raw))
+  local changed2 = P2.bps.reconcile()
+  records = read_bp_store()
+  ok("sweep keeps records for unloaded files (diff scope = loaded buffers)",
+    changed2 == false and find_bp(records, "src/ghost.lua", 1) ~= nil,
+    vim.inspect(records))
+
+  -- CursorHold → debounced sweep (wiring end-to-end).
+  vim.api.nvim_win_set_cursor(0, { 9, 0 })
+  dap.toggle_breakpoint()
+  vim.api.nvim_exec_autocmds("CursorHold", {})
+  local swept = wait_for(function()
+    return find_bp(read_bp_store(), "src/app.lua", 9)
+  end, 5000)
+  ok("CursorHold debounce sweeps within the window", swept ~= nil)
+
+  -- Tunable full-disable: editing-time sweeps off, boundary flushes stay.
+  require("auto-run.config").setup({
+    env  = { dir = fx .. "/env-cache" },
+    exec = { runs_dir = fx .. "/runs" },
+    breakpoint_sync = { cursorhold = false },
+  })
+  P2.bps.setup()
+  local function count_auto(event)
+    return #vim.api.nvim_get_autocmds({ group = "AutoRunBreakpoints", event = event })
+  end
+  ok("cursorhold=false removes the CursorHold sweep", count_auto("CursorHold") == 0)
+  ok("cursorhold=false removes the BufWritePost sweep", count_auto("BufWritePost") == 0)
+  ok("VimLeavePre exit flush STAYS active when disabled", count_auto("VimLeavePre") == 1)
+  ok("BufReadPost restore stays active", count_auto("BufReadPost") == 1)
+  ok("session-boundary flush listener stays active",
+    require("dap").listeners.before.launch["auto-run-breakpoints"] ~= nil)
+
+  -- interval_ms sweep.
+  require("auto-run.config").setup({
+    env  = { dir = fx .. "/env-cache" },
+    exec = { runs_dir = fx .. "/runs" },
+    breakpoint_sync = { cursorhold = false, interval_ms = 100 },
+  })
+  P2.bps.setup()
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  dap.toggle_breakpoint()
+  local interval_swept = wait_for(function()
+    return find_bp(read_bp_store(), "src/app.lua", 2)
+  end, 5000)
+  ok("interval_ms periodic sweep persists direct mutations", interval_swept ~= nil)
+
+  -- Restore the default sync config for the remaining sections.
+  require("auto-run.config").setup({
+    env  = { dir = fx .. "/env-cache" },
+    exec = { runs_dir = fx .. "/runs" },
+  })
+  P2.bps.setup()
+  core.events.unsubscribe(h_ev)
+
+  -- clear_all wipes live + store (incl. unloaded-file records).
+  P2.bps.clear_all()
+  ok("clear_all empties the store (incl. unloaded files)", #read_bp_store() == 0)
+  local live = require("dap.breakpoints").get()
+  local live_count = 0
+  for _, bps_list in pairs(live) do live_count = live_count + #bps_list end
+  ok("clear_all empties the live registry", live_count == 0)
+end
+
+-- ── [15] breakpoints — stale-line drop on restore ───────────────
+print("\n[15] breakpoints — restore + stale-lnum drop")
+do
+  local main_wt = container .. "/main"
+  write_file(main_wt .. "/src/stale.lua", "-- one\n-- two\n-- three\n")
+  write_file(main_wt .. "/src/fresh.lua", "-- one\n-- two\n-- three\n-- four\n")
+
+  -- Seed the store directly (simulates a previous session).
+  write_file(container .. "/.auto-run/breakpoints.json", vim.json.encode({
+    version = 1,
+    breakpoints = {
+      { path = "src/stale.lua", lnum = 99, enabled = true },
+      { path = "src/fresh.lua", lnum = 2, enabled = true, condition = "y == 2" },
+    },
+  }))
+
+  vim.cmd.edit(main_wt .. "/src/fresh.lua")
+  local fresh_buf = vim.api.nvim_get_current_buf()
+  local live = require("dap.breakpoints").get(fresh_buf)[fresh_buf] or {}
+  ok("restore applies persisted breakpoints on BufReadPost",
+    #live == 1 and live[1].line == 2, vim.inspect(live))
+  ok("restore preserves the condition", live[1] and live[1].condition == "y == 2")
+
+  vim.cmd.edit(main_wt .. "/src/stale.lua")
+  local stale_buf = vim.api.nvim_get_current_buf()
+  local stale_live = require("dap.breakpoints").get(stale_buf)[stale_buf]
+  ok("stale lnum (99 > 3 lines) is NOT applied",
+    stale_live == nil or #stale_live == 0, vim.inspect(stale_live))
+  local records = read_bp_store()
+  ok("stale record dropped from the store (with a warn log)",
+    find_bp(records, "src/stale.lua", 99) == nil, vim.inspect(records))
+  ok("fresh record survives the drop rewrite",
+    find_bp(records, "src/fresh.lua", 2) ~= nil)
+end
+
+-- ── [16] breakpoints — rehydration across two worktrees ─────────
+print("\n[16] breakpoints — worktree-relative paths, one container store")
+do
+  local wt2 = container .. "/wt2"
+  ok("wt2 checkout has the committed app file",
+    vim.fn.filereadable(wt2 .. "/src/app.lua") == 1)
+
+  -- Save a set while MAIN is active.
+  worktree.set_active(container .. "/main")
+  write_file(container .. "/.auto-run/breakpoints.json", vim.json.encode({
+    version = 1,
+    breakpoints = {
+      { path = "src/app.lua", lnum = 5, enabled = true, condition = "x > 1" },
+      { path = "src/app.lua", lnum = 7, enabled = true },
+    },
+  }))
+
+  -- Switch to WT2 — same container store, paths re-anchor.
+  worktree.set_active(wt2)
+  local dirs = store.resolve_run_dirs()
+  ok("wt2 resolves to the SAME shared store",
+    dirs.shared == container .. "/.auto-run" and dirs.root == wt2,
+    vim.inspect(dirs))
+
+  vim.cmd.edit(wt2 .. "/src/app.lua")
+  local buf2 = vim.api.nvim_get_current_buf()
+  local live = require("dap.breakpoints").get(buf2)[buf2] or {}
+  table.sort(live, function(a, b) return a.line < b.line end)
+  ok("saved set rehydrates in the sibling worktree",
+    #live == 2 and live[1].line == 5 and live[2].line == 7, vim.inspect(live))
+  ok("condition rehydrates too", live[1] and live[1].condition == "x > 1")
+
+  -- And the reconcile sweep in wt2 keeps the store worktree-relative.
+  P2.bps.reconcile()
+  local records = read_bp_store()
+  ok("post-sweep records stay worktree-RELATIVE",
+    find_bp(records, "src/app.lua", 5) ~= nil
+      and find_bp(records, "src/app.lua", 7) ~= nil, vim.inspect(records))
+end
+
+-- :AutoRun Phase 2 subcommands (plugin file already sourced in [9]).
+print("\n[17] :AutoRun — Phase 2 subcommands + doctor additions")
+do
+  ok(":AutoRun jobs runs clean", pcall(vim.cmd, "AutoRun jobs"))
+  ok(":AutoRun doctor (with dap + breakpoint sections) runs clean",
+    pcall(vim.cmd, "AutoRun doctor"))
+  local okc = pcall(vim.cmd, "AutoRun stop not-a-job")
+  ok(":AutoRun stop unknown id errors gracefully", okc)
+end
 
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))

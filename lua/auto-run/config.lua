@@ -29,6 +29,34 @@ M.defaults = {
     ---creating the plain-repo shared tier.
     scaffold_gitignore = true,
   },
+  ---Execution engine (ADR-0048 §6).
+  exec = {
+    ---Directory for per-run output dirs. nil resolves at runtime to
+    ---`stdpath("cache") .. "/auto-run/runs"` — NEVER inside a repo.
+    runs_dir = nil,
+    ---auto-agents playground terminal slot used by the default
+    ---auto-agents term-strategy provider (T1..T4).
+    term_slot = 1,
+  },
+  ---DAP bridge (ADR-0048 §6).
+  dap = {
+    ---dap-view wiring: `true` → opinionated layout + auto open/close
+    ---(gobugger parity); a table → passed to dap-view setup verbatim;
+    ---`false` → no dap-view wiring at all.
+    view = true,
+  },
+  ---Breakpoint reconcile-sweep tuning (ADR-0048 §9, r3 amendment).
+  ---`cursorhold = false` disables the editing-time debounced sweep
+  ---(CursorHold + BufWritePost); `interval_ms` adds a periodic sweep
+  ---when set to a positive number. Session-boundary flushes (dap
+  ---session start/stop) and the VimLeavePre exit flush stay active
+  ---even when both are disabled.
+  breakpoint_sync = {
+    cursorhold = true,
+    interval_ms = nil,
+    ---Debounce window for the editing-time sweep triggers.
+    debounce_ms = 500,
+  },
 }
 
 ---@type AutoRunOptions

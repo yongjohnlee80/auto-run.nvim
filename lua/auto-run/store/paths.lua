@@ -259,6 +259,22 @@ function M.overrides_file(shared_dir)
   return fs_path.join(shared_dir, "overrides.json")
 end
 
+---`<shared>/breakpoints.json` (ADR-0048 §9 — ALWAYS the shared tier;
+---one store per repo, both layouts).
+---@param shared_dir string
+---@return string
+function M.breakpoints_file(shared_dir)
+  return fs_path.join(shared_dir, "breakpoints.json")
+end
+
+---`<shared>/state.json` (per-repo session state: last-picked config
+---per kind — ADR-0048 §2).
+---@param shared_dir string
+---@return string
+function M.state_file(shared_dir)
+  return fs_path.join(shared_dir, "state.json")
+end
+
 ---Test-only: wipe cache + override registry. Not part of the public
 ---API stability contract.
 function M._reset_for_tests()
