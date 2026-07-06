@@ -1,8 +1,13 @@
 # Changelog
 
-## v0.1.0 (unreleased)
+## [v0.1.0] — 2026-07-06
 
 ADR-0048 Phases 1–2 — core store + env engine, execution + DAP.
+Lector-reviewed: two implementation reviews (`change_requested`) with
+all five findings fixed and re-reviewed `approved` at `17caebe`
+(shell-quoted sourced env files, fatal `overrides_corrupt`
+diagnostics, term env cleanup hooks, breakpoint-store error
+surfacing, `command_env` timeout). Smoke 315/0.
 
 ### Added (Phase 2 — execution + DAP)
 
