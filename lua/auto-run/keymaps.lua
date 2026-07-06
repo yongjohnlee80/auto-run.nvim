@@ -36,6 +36,43 @@ function M.default_keymaps()
   local function exec() return require("auto-run.exec") end
   local function bridge() return require("auto-run.dap") end
   local function bps() return require("auto-run.dap.breakpoints") end
+  local function discovery() return require("auto-run.discovery") end
+
+  ---Nearest discovered position for the current buffer, with the
+  ---Phase 4 fallback contract: `(node)` when discovery resolves one;
+  ---`(nil, true)` when the buffer isn't discovery material (no
+  ---adapter claims it / no file) — callers fall back to the Phase 2
+  ---config path with a hint; `(nil, false)` after a warn-logged
+  ---discovery error (no fallback — the buffer IS a test file).
+  ---@return table? node, boolean? fall_back
+  local function nearest_or_fallback()
+    local node, nerr, reason = discovery().nearest(0)
+    if node then return node, nil end
+    if reason == "no_adapter" or reason == "no_file" then
+      require("auto-run.log").info("keymaps", tostring(nerr)
+        .. " — falling back to the kind=test config path")
+      return nil, true
+    end
+    require("auto-run.log").warn("keymaps", tostring(nerr))
+    return nil, false
+  end
+
+  ---Shared Phase 2 fallback: pick a kind=test config and run it
+  ---(`opts` reach exec.test_run — package/test_name overrides).
+  ---@param opts table
+  local function fallback_test_run(opts)
+    exec().pick_config("test", function(name, reason)
+      if not name then
+        if reason == "no_matches" then
+          require("auto-run.log").warn("keymaps",
+            "no kind=test configs — scaffold one with <leader>rc")
+        end
+        return
+      end
+      local _, err = exec().test_run(name, opts)
+      if err then require("auto-run.log").error("keymaps", err) end
+    end)
+  end
 
   -- ── F-keys (kept, unchanged — §10) ─────────────────────────────
   if dap_ok then
@@ -69,54 +106,39 @@ function M.default_keymaps()
   end, "Run: Run Last")
 
   -- <leader>rt — run nearest test  [provenance: new]
+  -- Discovery position nearest the cursor, run through the Phase 3
+  -- position engine (adapter build_spec → job → parsed results).
+  -- Buffers no adapter claims fall back to the Phase 2 config path.
   bind("n", "<leader>rt", function()
-    exec().pick_config("test", function(name, reason)
-      if not name then
-        if reason == "no_matches" then
-          require("auto-run.log").warn("keymaps",
-            "no kind=test configs — scaffold one with <leader>rc")
-        end
-        return
-      end
-      local opts = {}
-      -- Nearest-test selection via dap-go's treesitter helper when
-      -- available (Phase 3 brings auto-run's own discovery); falls
-      -- back to the configured package.
-      local okt, ts = pcall(require, "dap-go-ts")
-      if okt and vim.bo.filetype == "go" then
-        local okc, closest = pcall(ts.closest_test)
-        if okc and type(closest) == "table" then
-          if type(closest.name) == "string" and closest.name ~= "" then
-            opts.test_name = closest.name
-          end
-          if type(closest.package) == "string" and closest.package ~= "" then
-            opts.package = closest.package
-          end
-        end
-      end
-      local _, err = exec().test_run(name, opts)
+    local node, fall_back = nearest_or_fallback()
+    if node then
+      local _, err = discovery().run_position(node.id)
       if err then require("auto-run.log").error("keymaps", err) end
-    end)
+      return
+    end
+    if fall_back then fallback_test_run({}) end
   end, "Run: Nearest Test")
 
   -- <leader>rf — run current test file  [provenance: new]
+  -- The current file's FILE position (nearest() resolves the file
+  -- node's path even when the cursor sits inside a test). Same
+  -- fallback contract as <leader>rt.
   bind("n", "<leader>rf", function()
-    exec().pick_config("test", function(name, reason)
-      if not name then
-        if reason == "no_matches" then
-          require("auto-run.log").warn("keymaps",
-            "no kind=test configs — scaffold one with <leader>rc")
-        end
-        return
-      end
+    local node, fall_back = nearest_or_fallback()
+    if node then
+      -- File-position id = the file's absolute path.
+      local _, err = discovery().run_position(node.path)
+      if err then require("auto-run.log").error("keymaps", err) end
+      return
+    end
+    if fall_back then
       local opts = {}
       local file = vim.api.nvim_buf_get_name(0)
       if file ~= "" and not file:match("^%w+://") then
         opts.package = vim.fn.fnamemodify(file, ":h")
       end
-      local _, err = exec().test_run(name, opts)
-      if err then require("auto-run.log").error("keymaps", err) end
-    end)
+      fallback_test_run(opts)
+    end
   end, "Run: Current Test File")
 
   -- <leader>rp — pick env profile for next run  [provenance: new]
@@ -184,7 +206,18 @@ function M.default_keymaps()
   end
 
   -- <leader>dt — debug nearest test  [provenance: gobugger `dt`]
+  -- Same nearest resolution as <leader>rt, routed through
+  -- debug_position for go test positions (jump + dap-go debug_test
+  -- with the repo's kind=test config merged in). Anything else —
+  -- non-go positions, undiscovered buffers — takes the Phase 2
+  -- config path (dap-go cursor selection).
   bind("n", "<leader>dt", function()
+    local node = discovery().nearest(0)
+    if node and node.type == "test" and node.adapter == "go" then
+      local _, err = discovery().debug_position(node.id)
+      if err then require("auto-run.log").error("keymaps", err) end
+      return
+    end
     exec().pick_config("test", function(name, reason)
       if reason == "cancelled" then return end
       -- No kind=test configs → dap-go defaults (gobugger's

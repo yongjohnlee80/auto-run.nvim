@@ -2,9 +2,71 @@
 
 ## [Unreleased]
 
-ADR-0048 Phase 3 (auto-run half) — test discovery + adapters. The
-auto-finder `tests`/`debug` views are the separate auto-finder half
-of this phase. Smoke 441/0.
+ADR-0048 Phase 3 (auto-run half) — test discovery + adapters — plus
+the Phase 4 gobugger-parity gate (§14.2). The auto-finder
+`tests`/`debug` views are the separate auto-finder half of Phase 3.
+Smoke 520/0.
+
+### Added (Phase 4 — parity gate)
+
+- **`:AutoRun doctor --fix`** (`auto-run.doctor`, ADR §13/§14):
+  gobugger `fix_worktree` port — `git worktree repair` from the
+  repo's common dir, with the anchor passed along when its `.git` is
+  a gitfile (repairs moved worktrees too). Common-dir resolution
+  survives a BROKEN worktree gitfile via a container boundary walk
+  (`.bare/` dir = the common dir). Interactive-only — mutating, so
+  never a mailbox verb; the read-only mailbox surface stays
+  `run.status`. `--fix` completes on `:AutoRun doctor <Tab>`.
+- **Doctor parity rows** (gobugger doctor coverage): a `git /
+  worktree` section (project root + `.bare/`/`.git/` marker, anchor
+  `.git` kind incl. gitfile target `[OK|MISSING]`, `git status`
+  health with a `--fix` hint on failure, git common dir, go module
+  root via the go adapter's `module_dir`) and a `configs by kind`
+  section with `[session pick]` markers (`exec.picks()`, new
+  diagnostic accessor over the per-repo pick memory).
+- **`discovery.nearest(bufnr?)`**: nearest-position resolution by
+  buffer line — on-demand parse, deepest position containing the
+  cursor line, else the last position starting at/above it, else the
+  file node; structured `(nil, err, reason)` misses
+  (`no_file|no_adapter|outside_root|parse_failed|no_positions`).
+- **`<leader>rt` / `<leader>rf` / `<leader>dt` rewired onto
+  discovery positions** (ADR §10 as-designed): rt runs the nearest
+  position and rf the current file's position through the Phase 3
+  position engine (`run_position` — adapter build_spec, parsed
+  per-position results); dt routes the same nearest resolution
+  through `debug_position` for go test positions (jump + dap-go
+  merge payload). Buffers no adapter claims fall back to the Phase 2
+  kind=test config path with a logged hint.
+
+### Changed (Phase 4 — parity gate)
+
+- **Store name pattern widened** to accept colons and parens
+  (`Go: Debug Test (LM)`) — real-world launch.json entry names (and
+  VSCode's own `"<lang>: <verb>"` convention) now import verbatim;
+  path separators remain rejected.
+
+### Gate evidence (smoke sections [30]–[35])
+
+- [30] the REAL LabelManager launch.json (copied into a fixture)
+  imports with correct kind/build_flags/env_files mapping; the
+  outside-the-worktree `${workspaceFolder}/../` envFile path
+  survives substitution unnormalized.
+- [31] a launch.json matching the go-test-env skill's documented
+  emission imports and `debug_test` carries
+  buildFlags/env/envFile-contents into the dap-go merge payload
+  (config env winning over the env file), through both the dap
+  bridge and `exec.test_run(debug=true)`.
+- [32] `pick_config` kind filtering + per-repo pick memory
+  round-trip (state.json on disk, worktree switch, stale-pick
+  fall-through, `clear_pick`).
+- [33] programmatic gobugger→auto-run keymap audit: every lhs
+  gobugger's actual `default_keymaps()` registers is asserted
+  kept/remapped/dropped per the ADR §10 table.
+- [34] doctor parity rows + `--fix` against a deliberately-broken
+  worktree gitfile fixture (git_info flags it, repair heals it,
+  structured error outside a repo).
+- [35] rt/rf/dt end-to-end through real `go test -json` runs +
+  the no-adapter fallback path.
 
 ### Added (Phase 3 — discovery + adapters)
 

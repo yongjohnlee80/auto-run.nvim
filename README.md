@@ -80,8 +80,15 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
 - `:AutoRun tests` / `:AutoRun scan` — render the discovered position
   tree (status glyphs from the last results) / run a bounded full
   scan of the active worktree.
-- `:AutoRun doctor` — resolver output, test-adapter roots + discovery
+- `:AutoRun doctor` — resolver output, git/worktree health (project
+  root + marker, anchor `.git` kind incl. gitfile-target state,
+  `git status`, common dir, go module root), configs per kind with
+  the remembered session pick, test-adapter roots + discovery
   snapshot, dap-adapter health, breakpoint-store stats, live jobs.
+- `:AutoRun doctor --fix` — `git worktree repair` from the repo's
+  common dir (gobugger `fix_worktree` parity; survives a broken
+  worktree gitfile via the container walk). Interactive-only —
+  mutating, so never exposed as a mailbox verb.
 - `:AutoRun last-error` — replay the last failed-start dap capture in
   a scratch buffer.
 - `:AutoRun import` — one-shot launch.json migration into the
@@ -263,9 +270,15 @@ pcall-gated on their dependency and all carry `desc` strings.
 | `<leader>dq` / `dR` | terminate / restart | kept |
 | `<leader>dD` | doctor | gobugger `dD` |
 
+`<leader>rt` / `<leader>rf` run the discovery position nearest the
+cursor / the current file's position through the Phase 3 position
+engine; `<leader>dt` routes the same nearest resolution through
+`debug_position` for go test positions. Buffers no adapter claims
+fall back to the Phase 2 kind=test config path with a logged hint.
+
 Dropped from keymaps (moved to panel/commands): `dL` reload (store
 auto-reloads), `dE` last error (`:AutoRun last-error`), `dF`
-fix-worktree, scaffold keys.
+fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
 
 ## Requirements
 

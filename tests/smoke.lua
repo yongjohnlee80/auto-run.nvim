@@ -36,6 +36,12 @@
 --   [27] adapters — jest fixture, build_spec, stubbed end-to-end
 --   [28] mailbox — run.tests_list / run.results / positional test_run
 --   [29] :AutoRun tests|scan + doctor adapter diagnostics
+--   [30] import — REAL launch.json sample (LabelManager copy)
+--   [31] import + debug_test — go-test-env skill shape → dap-go merge
+--   [32] exec — pick_config kind filter + per-repo pick memory
+--   [33] keymaps — gobugger→auto-run remap audit (ADR §10, programmatic)
+--   [34] doctor — gobugger parity rows + `--fix` worktree repair
+--   [35] keymaps — rt/rf/dt discovery-position routing + fallback
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -2498,6 +2504,567 @@ do
       and doc:find("root " .. jestfix, 1, true) ~= nil, doc)
   ok("doctor reports the discovery snapshot",
     doc:find("discovered", 1, true) ~= nil)
+end
+
+-- ═════════════════════ Phase 4 — parity gate ════════════════════
+
+-- ── [30] import — REAL launch.json sample (LabelManager copy) ───
+print("\n[30] import — real LabelManager launch.json sample (copy)")
+do
+  -- The richest real-world launch.json known to this machine, copied
+  -- into a fixture repo (the real repo is NEVER touched). When the
+  -- sample is unreachable (other machines) a verbatim embedded copy
+  -- keeps the assertions meaningful.
+  local sample = "/home/johno/Source/Projects/LabelManager/lm/.vscode/launch.json"
+  local content
+  local sf = io.open(sample, "r")
+  if sf then
+    content = sf:read("*a")
+    sf:close()
+  end
+  ok("real sample readable (gate evidence source)", content ~= nil, sample)
+  content = content or [[
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Go: Debug Test (LM)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "envFile": "${workspaceFolder}/../.config/test.env",
+      "buildFlags": "-tags=test,gold"
+    },
+    {
+      "name": "Go: Debug Main (gold-http)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/gold-http",
+      "args": [
+        "start",
+        "-c=/home/johno/Source/Projects/LabelManager/lm/.config/gold-prod.toml"
+      ],
+      "buildFlags": "-buildvcs=false"
+    }
+  ]
+}
+]]
+
+  local lmfix = fx .. "/lmfix"
+  ok("sample fixture repo created", make_plain_repo(lmfix))
+  write_file(lmfix .. "/.vscode/launch.json", content)
+  worktree.set_active(lmfix)
+
+  ok("read-through active on the sample (no store yet)",
+    import.read_through_active() == true)
+  local names = {}
+  for _, c in ipairs(store.list()) do names[#names + 1] = c.name end
+  table.sort(names)
+  ok("both real entries surface as shims", vim.deep_equal(names,
+    { "Go: Debug Main (gold-http)", "Go: Debug Test (LM)" }), vim.inspect(names))
+
+  local test_eff = store.get("Go: Debug Test (LM)")
+  ok("test entry: mode=test → kind=test, type → runtime",
+    test_eff ~= nil and test_eff.kind == "test" and test_eff.runtime == "go",
+    vim.inspect(test_eff))
+  ok("test entry: buildFlags → build_flags (real tag set)",
+    test_eff.build_flags == "-tags=test,gold")
+  ok("test entry: program keeps the skill's ${fileDirname}",
+    test_eff.program == "${fileDirname}")
+  ok("test entry: envFile OUTSIDE the worktree → env_files verbatim",
+    type(test_eff.env_files) == "table"
+      and test_eff.env_files[1] == "${workspaceFolder}/../.config/test.env",
+    vim.inspect(test_eff.env_files))
+
+  local main_eff = store.get("Go: Debug Main (gold-http)")
+  ok("main entry: mode=debug → kind=debug + args + buildFlags",
+    main_eff ~= nil and main_eff.kind == "debug"
+      and main_eff.build_flags == "-buildvcs=false"
+      and type(main_eff.args) == "table" and main_eff.args[1] == "start",
+    vim.inspect(main_eff))
+  ok("main entry: ${workspaceFolder} program kept verbatim at rest",
+    main_eff.program == "${workspaceFolder}/cmd/gold-http")
+
+  -- Substitution shape: the outside-the-worktree envFile keeps its
+  -- `/../` hop after ${workspaceFolder} resolves (never normalized
+  -- away), and ${fileDirname} resolves to the buffer file's dir.
+  local env_mod = require("auto-run.env")
+  local ctx = env_mod.context({
+    worktree = lmfix, file = lmfix .. "/internal/dao/dao_test.go",
+  })
+  local sub_eff, _, unresolved = env_mod.substitute_deep(test_eff, ctx)
+  ok("${workspaceFolder}/../ envFile path survives substitution",
+    sub_eff.env_files[1] == lmfix .. "/../.config/test.env",
+    vim.inspect(sub_eff.env_files))
+  ok("${fileDirname} resolves to the test file's package dir",
+    sub_eff.program == lmfix .. "/internal/dao")
+  ok("no unresolved tokens in the substituted sample",
+    #unresolved == 0, vim.inspect(unresolved))
+
+  -- One-shot import of the real sample into the tracked tier.
+  local summary, imp_err = import.import(nil, { on_conflict = "skip" })
+  ok("real sample imports", summary ~= nil and #summary.imported == 2,
+    tostring(imp_err))
+  local imported = store.get("Go: Debug Test (LM)")
+  ok("imported real entry keeps kind/build_flags/env_files mapping",
+    imported ~= nil and imported.kind == "test"
+      and imported.build_flags == "-tags=test,gold"
+      and imported.env_files[1] == "${workspaceFolder}/../.config/test.env"
+      and imported.origin == "launch.json")
+  ok("read-through disabled after the import", import.read_through_active() == false)
+
+  -- The name pattern was widened for real-world entry names (colons,
+  -- parens); path separators must still be rejected.
+  local bad, bad_err = store.add({ name = "bad/name", kind = "run" })
+  ok("schema still rejects path separators in names",
+    bad == nil and tostring(bad_err):find("name", 1, true) ~= nil,
+    tostring(bad_err))
+end
+
+-- ── [31] go-test-env skill shape → dap-go merge payload ─────────
+print("\n[31] import + debug_test — go-test-env skill shape → dap-go merge")
+do
+  -- launch.json EXACTLY as the go-test-env skill documents its
+  -- emission (SKILL.md configuration template: version 0.2.0, type
+  -- go, mode test, program ${fileDirname}, buildFlags/env/envFile).
+  local skillfix = fx .. "/skillfix"
+  ok("skill fixture repo created", make_plain_repo(skillfix))
+  write_file(skillfix .. "/.env.test",
+    "FROM_ENV_FILE=yes\nDATABASE_URL=env-file-loses\n")
+  write_file(skillfix .. "/.vscode/launch.json", [[
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Go: Debug Test (current)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "buildFlags": "-tags=integration,gold",
+      "env": { "DATABASE_URL": "postgres://localhost/app_test" },
+      "envFile": "${workspaceFolder}/.env.test"
+    }
+  ]
+}
+]])
+  worktree.set_active(skillfix)
+
+  local shim = store.get("Go: Debug Test (current)")
+  ok("skill emission imports with full field mapping",
+    shim ~= nil and shim.kind == "test" and shim.runtime == "go"
+      and shim.program == "${fileDirname}"
+      and shim.build_flags == "-tags=integration,gold"
+      and shim.env.DATABASE_URL == "postgres://localhost/app_test"
+      and shim.env_files[1] == "${workspaceFolder}/.env.test",
+    vim.inspect(shim))
+  local summary = import.import(nil, { on_conflict = "skip" })
+  ok("skill entry lands in the tracked tier",
+    summary ~= nil and contains(summary.imported, "Go: Debug Test (current)"))
+
+  -- debug_test translation: the payload handed to dap_go.debug_test
+  -- (stubbed — real nvim-dap-go isn't on the headless rtp) must carry
+  -- buildFlags + composed env (envFile CONTENTS included, config env
+  -- winning over the env file — the pipeline's last-wins order).
+  local saved_dg = package.loaded["dap-go"]
+  local captured
+  package.loaded["dap-go"] = {
+    debug_test = function(cfg) captured = cfg end,
+    setup = function() end,
+  }
+  local okd, derr = require("auto-run.dap").debug_test("Go: Debug Test (current)")
+  ok("debug_test accepts the skill-shaped config", okd == true, tostring(derr))
+  ok("dap-go merge payload carries buildFlags",
+    captured ~= nil and captured.buildFlags == "-tags=integration,gold",
+    vim.inspect(captured))
+  ok("envFile contents reach the merge payload env",
+    captured.env ~= nil and captured.env.FROM_ENV_FILE == "yes")
+  ok("config env WINS over the envFile (last-wins pipeline)",
+    captured.env.DATABASE_URL == "postgres://localhost/app_test")
+
+  -- Same payload through the exec facade (`test_run` debug route).
+  captured = nil
+  local launched, lerr = P2.exec.test_run("Go: Debug Test (current)", { debug = true })
+  ok("exec.test_run debug=true routes to the same merge payload",
+    launched ~= nil and launched.strategy == "dap"
+      and captured ~= nil and captured.buildFlags == "-tags=integration,gold"
+      and captured.env.FROM_ENV_FILE == "yes",
+    tostring(lerr))
+  package.loaded["dap-go"] = saved_dg
+end
+
+-- ── [32] exec — pick_config filter + per-repo pick memory ───────
+print("\n[32] exec — pick_config kind filter + per-repo pick memory")
+do
+  local pickfix = fx .. "/pickfix"
+  ok("pick fixture repo created", make_plain_repo(pickfix))
+  worktree.set_active(pickfix)
+  store.add({ name = "t-one", kind = "test", program = "./..." }, { tier = "tracked" })
+  store.add({ name = "t-two", kind = "test", program = "./..." }, { tier = "tracked" })
+  store.add({ name = "d-only", kind = "debug", runtime = "go",
+    program = "./cmd/x" }, { tier = "tracked" })
+
+  -- Kind filtering.
+  local picked_d
+  P2.exec.pick_config("debug", function(n) picked_d = n end)
+  ok("single kind=debug match returns without prompting", picked_d == "d-only")
+  local nm_reason
+  P2.exec.pick_config("run", function(_, r) nm_reason = r end)
+  ok("kind with no configs → reason no_matches", nm_reason == "no_matches")
+
+  -- Multi-match prompts with ONLY the kind-filtered candidates.
+  local real_select = vim.ui.select
+  local prompt_items
+  vim.ui.select = function(items, _opts, cb)
+    prompt_items = items
+    cb("t-two")
+  end
+  local picked_t
+  P2.exec.pick_config("test", function(n) picked_t = n end)
+  ok("multi-match prompt is kind-filtered (no d-only)",
+    vim.deep_equal(prompt_items, { "t-one", "t-two" }), vim.inspect(prompt_items))
+  ok("prompt choice reaches the callback", picked_t == "t-two")
+
+  -- Pick memory: persisted per repo in the shared tier's state.json,
+  -- surviving a full state round-trip (disk + worktree switch).
+  P2.exec.remember_pick("test", "t-two")
+  local state_file = pickfix .. "/.auto-run/local/state.json"
+  local persisted = vim.fn.filereadable(state_file) == 1
+    and vim.json.decode(table.concat(vim.fn.readfile(state_file), "\n")) or {}
+  ok("pick persists to the shared tier state.json",
+    type(persisted.picks) == "table" and persisted.picks.test == "t-two",
+    vim.inspect(persisted))
+  ok("picks() diagnostic snapshot reads it back",
+    P2.exec.picks().test == "t-two", vim.inspect(P2.exec.picks()))
+  prompt_items = nil
+  local picked_mem
+  P2.exec.pick_config("test", function(n) picked_mem = n end)
+  ok("remembered pick short-circuits the prompt",
+    picked_mem == "t-two" and prompt_items == nil)
+  worktree.set_active(plain)
+  worktree.set_active(pickfix)
+  local picked_rt
+  P2.exec.pick_config("test", function(n) picked_rt = n end)
+  ok("pick survives a worktree round-trip (re-read from disk)",
+    picked_rt == "t-two" and prompt_items == nil)
+
+  -- A stale remembered pick (config gone) falls through to the prompt.
+  P2.exec.remember_pick("test", "ghost")
+  local picked_stale
+  P2.exec.pick_config("test", function(n) picked_stale = n end)
+  ok("stale remembered pick falls through to the prompt",
+    picked_stale == "t-two" and vim.deep_equal(prompt_items, { "t-one", "t-two" }))
+
+  -- clear_pick drops the memory.
+  P2.exec.remember_pick("test", "t-one")
+  P2.exec.clear_pick("test")
+  ok("clear_pick clears the persisted pick", P2.exec.picks().test == nil)
+  vim.ui.select = real_select
+end
+
+-- ── [33] keymaps — gobugger→auto-run remap audit (ADR §10) ──────
+print("\n[33] keymaps — gobugger→auto-run remap audit (programmatic)")
+do
+  -- gobugger's ACTUAL default_keymaps list is the source of truth:
+  -- capture every lhs it registers (sibling worktree preferred, lazy
+  -- install fallback) and assert each one is accounted for by the
+  -- ADR §10 disposition table — kept, remapped, or dropped-to-command.
+  local gob_root = workspace .. "/gobugger.nvim/main"
+  if vim.fn.isdirectory(gob_root) == 0 then gob_root = LAZY .. "/gobugger.nvim" end
+  ok("gobugger available for the audit probe",
+    vim.fn.isdirectory(gob_root) == 1, gob_root)
+  vim.opt.rtp:prepend(gob_root)
+
+  -- Stub the optional dap deps so EVERY dep-gated binding registers
+  -- on both sides (restored below).
+  local saved_dv, saved_dg = package.loaded["dap-view"], package.loaded["dap-go"]
+  package.loaded["dap-view"] = {
+    toggle = function() end, add_expr = function() end, eval = function() end,
+  }
+  package.loaded["dap-go"] = { debug_test = function() end, setup = function() end }
+
+  local gob_lhs = {}
+  local real_set = vim.keymap.set
+  vim.keymap.set = function(_, lhs, _, _)  -- capture-only: never binds
+    gob_lhs[#gob_lhs + 1] = lhs
+  end
+  local okg, gerr = pcall(function() require("gobugger").default_keymaps() end)
+  vim.keymap.set = real_set
+  ok("gobugger default_keymaps probe ran", okg, tostring(gerr))
+  ok("probe captured the full gobugger surface (24 bindings)",
+    #gob_lhs == 24, vim.inspect(gob_lhs))
+
+  -- ADR §10 disposition — every gobugger lhs maps here.
+  local REMAP = {  -- gobugger lhs → auto-run lhs (kept / renamed)
+    ["<F9>"] = "<F9>", ["<F8>"] = "<F8>", ["<F7>"] = "<F7>", ["<F10>"] = "<F10>",
+    ["<leader>db"] = "<leader>db", ["<leader>dB"] = "<leader>dB",
+    ["<leader>dC"] = "<leader>dC", ["<leader>dc"] = "<leader>dc",
+    ["<leader>dr"] = "<leader>rl",   -- run last → the run namespace
+    ["<leader>dq"] = "<leader>dq", ["<leader>dR"] = "<leader>dR",
+    ["<leader>dv"] = "<leader>dv", ["<leader>dw"] = "<leader>dw",
+    ["<leader>de"] = "<leader>de",
+    ["<leader>da"] = "<leader>da", ["<leader>dA"] = "<leader>dA",
+    ["<leader>dt"] = "<leader>dt", ["<leader>dm"] = "<leader>dm",
+    ["<leader>dM"] = "<leader>rc",   -- scaffold keys merged into rc
+    ["<leader>dN"] = "<leader>rc",
+    ["<leader>dD"] = "<leader>dD",
+  }
+  local DROPPED = {  -- moved to the command surface per §10
+    ["<leader>dL"] = "(store auto-reloads; :AutoRun list)",
+    ["<leader>dE"] = ":AutoRun last-error",
+    ["<leader>dF"] = ":AutoRun doctor --fix",
+  }
+
+  -- Register auto-run's set with the stubs live so the dep-gated
+  -- bindings (da / dv / dw / de) exist for the assertion.
+  auto_run.default_keymaps()
+
+  local missing, unaccounted = {}, {}
+  for _, lhs in ipairs(gob_lhs) do
+    local target = REMAP[lhs]
+    if target then
+      local m = vim.fn.maparg(target, "n", false, true)
+      local bound = type(m) == "table" and (m.callback ~= nil or (m.rhs or "") ~= "")
+      if not bound then missing[#missing + 1] = lhs .. " → " .. target end
+    elseif DROPPED[lhs] == nil then
+      unaccounted[#unaccounted + 1] = lhs
+    end
+  end
+  ok("every KEEP-listed gobugger lhs is registered by auto-run",
+    #missing == 0, vim.inspect(missing))
+  ok("every gobugger binding is accounted for (keep/remap/drop)",
+    #unaccounted == 0, vim.inspect(unaccounted))
+
+  -- The dropped bindings' replacement command surfaces exist.
+  local le_out = vim.api.nvim_exec2("AutoRun last-error", { output = true }).output
+  ok("dE replacement — :AutoRun last-error responds",
+    le_out:find("auto%-run") ~= nil, le_out)
+  ok("dF replacement — doctor completion offers --fix",
+    contains(vim.fn.getcompletion("AutoRun doctor ", "cmdline"), "--fix"))
+
+  -- Spot-check the remapped targets carry auto-run descs (not stale
+  -- gobugger bindings that happened to share the lhs).
+  local rl = vim.fn.maparg("<leader>rl", "n", false, true)
+  local rc = vim.fn.maparg("<leader>rc", "n", false, true)
+  ok("dr → <leader>rl is auto-run's Run Last",
+    type(rl) == "table" and rl.desc == "Run: Run Last", vim.inspect(rl.desc))
+  ok("dM/dN → <leader>rc is auto-run's scaffold",
+    type(rc) == "table" and rc.desc == "Run: New Run Config (scaffold)")
+
+  package.loaded["dap-view"] = saved_dv
+  package.loaded["dap-go"] = saved_dg
+end
+
+-- ── [34] doctor — gobugger parity rows + --fix repair ───────────
+print("\n[34] doctor — gobugger parity rows + --fix worktree repair")
+do
+  -- Parity rows on the go fixture: project root + marker, anchor
+  -- .git kind, git status, common dir, go module root, configs per
+  -- kind with the session-pick marker (gobugger doctor coverage).
+  worktree.set_active(gofix)
+  store.add({ name = "gofix-tests", kind = "test", runtime = "go",
+    build_flags = "-count=1", program = "./calc" }, { tier = "tracked" })
+  P2.exec.remember_pick("test", "gofix-tests")
+
+  local doc = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok("doctor renders the git/worktree section",
+    doc:find("git / worktree", 1, true) ~= nil)
+  ok("doctor shows the project root + marker",
+    doc:find("project root", 1, true) ~= nil
+      and doc:find(gofix .. "  [.git/ (regular repo)]", 1, true) ~= nil, doc)
+  ok("doctor shows the anchor .git kind",
+    doc:find("anchor .git", 1, true) ~= nil
+      and doc:find("directory", 1, true) ~= nil)
+  ok("doctor shows git status health", doc:find("git status", 1, true) ~= nil)
+  ok("doctor shows the git common dir",
+    doc:find("git common dir", 1, true) ~= nil
+      and doc:find(gofix .. "/.git", 1, true) ~= nil)
+  ok("doctor shows the go module root",
+    doc:find("go module root", 1, true) ~= nil
+      and doc:find(gofix .. "  [go.mod present]", 1, true) ~= nil)
+  ok("doctor lists configs per kind with the session pick",
+    doc:find("configs by kind", 1, true) ~= nil
+      and doc:find("kind=test", 1, true) ~= nil
+      and doc:find("gofix-tests  [session pick]", 1, true) ~= nil, doc)
+
+  -- --fix: a bare-container worktree with a DELIBERATELY broken
+  -- gitfile (the gobugger fix_worktree scenario).
+  local doctor_mod = require("auto-run.doctor")
+  local fixc = fx .. "/fixcontainer"
+  vim.fn.mkdir(fixc, "p")
+  ok("--fix fixture: bare clone",
+    git(fx, "clone", "-q", "--bare", src, fixc .. "/.bare"))
+  ok("--fix fixture: linked worktree",
+    git(fx, "--git-dir=" .. fixc .. "/.bare", "worktree", "add", "-q",
+      fixc .. "/wt", "main"))
+  write_file(fixc .. "/wt/.git", "gitdir: /nonexistent/worktrees/wt\n")
+  ok("--fix fixture: git is broken at the worktree",
+    git(fixc .. "/wt", "status", "--porcelain") == false)
+
+  worktree.set_active(fixc .. "/wt")
+  local ginfo = doctor_mod.git_info()
+  ok("git_info flags the broken gitfile",
+    ginfo.gitfile_broken == true and ginfo.status_ok == false
+      and type(ginfo.git_kind) == "string"
+      and ginfo.git_kind:find("MISSING", 1, true) ~= nil,
+    vim.inspect(ginfo))
+  ok("git_info resolves the common dir THROUGH the breakage",
+    ginfo.common_dir == fixc .. "/.bare", tostring(ginfo.common_dir))
+  ok("git_info project root = the .bare container",
+    ginfo.project_root == fixc and ginfo.root_marker == ".bare/")
+  local doc2 = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok("doctor surfaces the broken gitfile + --fix hint",
+    doc2:find("MISSING", 1, true) ~= nil
+      and doc2:find("doctor --fix", 1, true) ~= nil, doc2)
+
+  local result, ferr = doctor_mod.fix_worktree()
+  ok("fix_worktree repairs from the common dir",
+    result ~= nil and result.common == fixc .. "/.bare", tostring(ferr))
+  ok("worktree is healthy after the repair",
+    git(fixc .. "/wt", "status", "--porcelain") == true)
+  local ginfo2 = doctor_mod.git_info()
+  ok("git_info confirms the heal",
+    ginfo2.gitfile_broken == false and ginfo2.status_ok == true,
+    vim.inspect(ginfo2))
+  local fix_out = vim.api.nvim_exec2("AutoRun doctor --fix", { output = true }).output
+  ok(":AutoRun doctor --fix runs clean (idempotent when healthy)",
+    fix_out:find("worktree repair @ " .. fixc .. "/.bare", 1, true) ~= nil, fix_out)
+
+  -- Outside a repo: structured error, no crash.
+  local norepo = fx .. "/norepo"
+  vim.fn.mkdir(norepo, "p")
+  worktree.set_active(norepo)
+  local nres, nerr = doctor_mod.fix_worktree()
+  ok("fix outside a repo is a structured error",
+    nres == nil and tostring(nerr):find("cannot repair", 1, true) ~= nil,
+    tostring(nerr))
+  local nofix_out = vim.api.nvim_exec2("AutoRun doctor --fix", { output = true }).output
+  ok(":AutoRun doctor --fix outside a repo errors gracefully",
+    nofix_out:find("cannot repair", 1, true) ~= nil, nofix_out)
+end
+
+-- ── [35] keymaps — rt/rf/dt discovery-position routing ──────────
+print("\n[35] keymaps — rt/rf/dt discovery-position routing + fallback")
+do
+  worktree.set_active(gofix)
+  P3.discovery._reset_for_tests()
+  local disc = P3.discovery
+
+  -- nearest(): containment (deepest), func-line hit, file fallback.
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  local buf_lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+  local function line_of(pat)
+    for i, l in ipairs(buf_lines) do
+      if l:find(pat, 1, true) then return i end
+    end
+    error("fixture line not found: " .. pat)
+  end
+
+  vim.api.nvim_win_set_cursor(0, { line_of("if Add(2, 2)"), 0 })
+  local n1 = disc.nearest()
+  ok("nearest resolves the deepest containing subtest",
+    n1 ~= nil and n1.id == calc_test .. "::TestAdd::group::inner",
+    vim.inspect(n1 and n1.id))
+  vim.api.nvim_win_set_cursor(0, { line_of("func TestFail"), 0 })
+  local n2 = disc.nearest()
+  ok("nearest on a func line resolves that test",
+    n2 ~= nil and n2.id == calc_test .. "::TestFail", vim.inspect(n2 and n2.id))
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  local n3 = disc.nearest()
+  ok("cursor above every test → the file position",
+    n3 ~= nil and n3.type == "file" and n3.id == calc_test)
+
+  -- Structured fallback reasons.
+  vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
+  local nn, _, reason = disc.nearest()
+  ok("unclaimed buffer → reason no_adapter",
+    nn == nil and reason == "no_adapter", tostring(reason))
+
+  -- The bound callbacks, straight off the registered maps.
+  auto_run.default_keymaps()
+  local function cb_of(suffix)
+    local m = vim.fn.maparg("<leader>" .. suffix, "n", false, true)
+    return type(m) == "table" and m.callback or nil
+  end
+
+  -- <leader>rt: nearest position through the Phase 3 job engine
+  -- (real `go test -json` run; [34]'s gofix-tests config applies its
+  -- -count=1 build flag to the run).
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  vim.api.nvim_win_set_cursor(0, { line_of("func TestFail"), 0 })
+  local exited
+  local h1 = core.events.subscribe("run.job:exited", function(p) exited = p end)
+  local ok_rt, rt_err = pcall(cb_of("rt"))
+  wait_for(function() return exited end, 20000)
+  ok("<leader>rt launches the nearest discovered position",
+    ok_rt and exited ~= nil and exited.config == "test:go",
+    tostring(rt_err) .. " " .. vim.inspect(exited))
+  ok("…and the parsed result lands on that position",
+    (disc.results()[calc_test .. "::TestFail"] or {}).status == "failed",
+    vim.inspect(disc.results()[calc_test .. "::TestFail"]))
+
+  -- <leader>rf: the FILE position even with the cursor inside a test.
+  vim.api.nvim_win_set_cursor(0, { line_of("if Add(2, 2)"), 0 })
+  exited = nil
+  local ok_rf, rf_err = pcall(cb_of("rf"))
+  wait_for(function() return exited end, 20000)
+  ok("<leader>rf launches the current file's position",
+    ok_rf and exited ~= nil and exited.config == "test:go", tostring(rf_err))
+  local res = disc.results()
+  ok("file run parses per-test results (pass + fail)",
+    (res[calc_test .. "::TestAdd"] or {}).status == "passed"
+      and (res[calc_test .. "::TestFail"] or {}).status == "failed",
+    vim.inspect({ add = res[calc_test .. "::TestAdd"],
+      fail = res[calc_test .. "::TestFail"] }))
+  ok("file position aggregates failed",
+    (res[calc_test] or {}).status == "failed")
+
+  -- Fallback: an unclaimed buffer routes rt to the Phase 2 config
+  -- path (the repo's kind=test config launches instead).
+  vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
+  P2.exec.remember_pick("test", "gofix-tests")
+  exited = nil
+  local started
+  local h2 = core.events.subscribe("run.job:started", function(p) started = p end)
+  local ok_fb, fb_err = pcall(cb_of("rt"))
+  wait_for(function() return exited end, 20000)
+  ok("rt on an unclaimed buffer falls back to the kind=test config",
+    ok_fb and started ~= nil and started.config == "gofix-tests"
+      and exited ~= nil and exited.config == "gofix-tests",
+    tostring(fb_err) .. " " .. vim.inspect(started))
+  core.events.unsubscribe(h1)
+  core.events.unsubscribe(h2)
+
+  -- <leader>dt: nearest test routed through debug_position → the
+  -- dap-go merge payload (stubbed dap-go captures it).
+  local saved_dg = package.loaded["dap-go"]
+  local captured
+  package.loaded["dap-go"] = {
+    debug_test = function(cfg) captured = cfg end,
+    setup = function() end,
+  }
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  local sub_line = line_of('t.Run("sub one"')
+  vim.api.nvim_win_set_cursor(0, { sub_line, 0 })
+  local ok_dt, dt_err = pcall(cb_of("dt"))
+  ok("<leader>dt routes the nearest go test through debug_position",
+    ok_dt and captured ~= nil, tostring(dt_err))
+  ok("dt jumps the cursor to the resolved position",
+    vim.api.nvim_win_get_cursor(0)[1] == sub_line
+      and vim.api.nvim_buf_get_name(0) == calc_test)
+  ok("dt merges the repo's kind=test config into the payload",
+    captured ~= nil and captured.buildFlags == "-count=1", vim.inspect(captured))
+
+  -- dt fallback: unclaimed buffer → Phase 2 pick + debug_test.
+  captured = nil
+  vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
+  local ok_dtf, dtf_err = pcall(cb_of("dt"))
+  ok("dt on an unclaimed buffer falls back to the config path",
+    ok_dtf and captured ~= nil and captured.buildFlags == "-count=1",
+    tostring(dtf_err) .. " " .. vim.inspect(captured))
+  package.loaded["dap-go"] = saved_dg
 end
 
 -- ── summary ─────────────────────────────────────────────────────

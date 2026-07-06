@@ -16,10 +16,12 @@ local M = {}
 ---@type table<string, boolean>
 M.VALID_KIND = { run = true, test = true, debug = true }
 
----Filenames are `<name>.json`; keep names path-safe. Spaces are
----allowed (imported launch.json entries commonly carry them, e.g.
----"Debug Gold"); slashes and other separators are not.
-local NAME_PATTERN = "^[%w][%w%._%- ]*$"
+---Filenames are `<name>.json`; keep names path-safe. Spaces, colons
+---and parens are allowed — real-world launch.json entries carry all
+---three (e.g. "Go: Debug Test (LM)"; VSCode's own scaffolds use the
+---"<lang>: <verb>" convention) and the Phase 4 parity gate imports
+---them verbatim. Slashes and other path separators are not.
+local NAME_PATTERN = "^[%w][%w%._%- :%(%)]*$"
 
 -- ── field catalogs ──────────────────────────────────────────────
 

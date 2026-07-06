@@ -348,6 +348,23 @@ function M.remember_pick(kind, name)
   end)
 end
 
+---Snapshot of the remembered per-repo picks (`kind → config name`,
+---from the shared tier's state.json). Diagnostic surface for the
+---doctor's per-kind config listing. Best-effort — `{}` on any error.
+---@return table<string, string>
+function M.picks()
+  local out = {}
+  pcall(function()
+    local picks = read_state().picks
+    if type(picks) == "table" then
+      for k, v in pairs(picks) do
+        if type(k) == "string" and type(v) == "string" then out[k] = v end
+      end
+    end
+  end)
+  return out
+end
+
 ---Clear the remembered pick for one kind (nil clears all).
 ---@param kind string?
 function M.clear_pick(kind)

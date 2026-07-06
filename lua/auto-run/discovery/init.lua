@@ -909,6 +909,71 @@ function M.debug_position(id)
   return require("auto-run.dap").debug_test(cfg_name, {})
 end
 
+-- ── nearest-position resolution (rt/rf/dt keymaps) ──────────────
+
+---The discovered position nearest the cursor in a buffer: the
+---buffer's file is (re)parsed on demand, then the deepest position
+---whose `lnum..end_lnum` range CONTAINS the cursor line wins; with no
+---containing position, the last position starting at/above the line;
+---with none of those, the file node itself (runs the whole file).
+---
+---`(nil, err, reason)` when nothing resolves — `reason` is a
+---machine key so callers can fall back precisely:
+---`"no_file" | "no_adapter" | "outside_root" | "parse_failed" |
+---"no_positions"`. `"no_adapter"` is the keymaps' fall-back-to-
+---config-path trigger (ADR-0048 §10 / Phase 4 gate).
+---@param bufnr integer?  defaults to the current buffer
+---@return AutoRunTreeNode? node, string? err, string? reason
+function M.nearest(bufnr)
+  bufnr = bufnr or 0
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name == "" or name:match("^%w+://") then
+    return nil, "buffer has no file to discover tests in", "no_file"
+  end
+  local path = fs_path.normalize(name)
+  local adapter = adapters.adapter_for(path)
+  if not adapter then
+    return nil, "no test adapter claims " .. path, "no_adapter"
+  end
+  local tree = M.tree()
+  if not fs_path.is_under(path, tree.root.path) then
+    return nil, path .. " is outside the discovery root " .. tree.root.path,
+      "outside_root"
+  end
+  local _, perr = M.parse_file(path, adapter)
+  if perr then return nil, perr, "parse_failed" end
+  local file_node = tree:get(path)
+  if not file_node then
+    return nil, "no test positions discovered in " .. path, "no_positions"
+  end
+
+  -- Cursor line — only meaningful when the buffer is the current
+  -- window's; otherwise the file node is the honest answer.
+  if bufnr ~= 0 and bufnr ~= vim.api.nvim_get_current_buf() then
+    return file_node, nil, nil
+  end
+  local lnum = vim.api.nvim_win_get_cursor(0)[1]
+
+  local containing, preceding
+  local function visit(node)
+    for _, child in ipairs(node.children or {}) do
+      if (child.type == "test" or child.type == "namespace")
+          and type(child.lnum) == "number" then
+        if child.lnum <= lnum then
+          preceding = child  -- DFS document order → greatest lnum ≤ cursor
+          local end_l = child.end_lnum
+          if type(end_l) == "number" and lnum <= end_l then
+            containing = child  -- later (deeper) containing hit wins
+          end
+        end
+      end
+      visit(child)
+    end
+  end
+  visit(file_node)
+  return containing or preceding or file_node, nil, nil
+end
+
 -- ── setup (autocmds + re-anchor subscriptions) ──────────────────
 
 ---Wire the open-buffers default discovery (BufReadPost parse +

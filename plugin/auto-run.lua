@@ -1,8 +1,11 @@
 ---plugin/auto-run.lua — :AutoRun user command.
 ---
----Subcommands: list | show | validate | import | doctor | set-dir
----(Phase 1) + run | debug | test | stop | jobs | last-error
----(Phase 2) + tests | scan (Phase 3 discovery). Output goes through
+---Subcommands: list | show | validate | import | doctor [--fix] |
+---set-dir (Phase 1) + run | debug | test | stop | jobs | last-error
+---(Phase 2) + tests | scan (Phase 3 discovery). `doctor --fix` runs
+---`git worktree repair` from the repo common dir (gobugger
+---fix_worktree parity — interactive-only, never a mailbox verb).
+---Output goes through
 ---print()/nvim_echo (user-invoked, not a main path); errors are
 ---echoed, never vim.notify'd.
 
@@ -107,7 +110,23 @@ function HANDLERS.import(args)
   echo_lines(lines)
 end
 
-function HANDLERS.doctor()
+function HANDLERS.doctor(args)
+  -- `--fix`: gobugger fix_worktree port — `git worktree repair` from
+  -- the repo's common dir. Interactive-only (mutating): reachable
+  -- here and nowhere on the mailbox surface.
+  if args and args[1] == "--fix" then
+    local result, ferr = require("auto-run.doctor").fix_worktree()
+    if not result then
+      echo_err(ferr)
+      return
+    end
+    echo_lines({
+      "auto-run: git worktree repair @ " .. result.common
+        .. (result.output ~= "" and ("\n" .. result.output) or ""),
+    })
+    return
+  end
+
   local store = require("auto-run.store")
   local s = store.status()
   local function row(k, v) return ("%-16s %s"):format(k .. ":", tostring(v)) end
@@ -134,6 +153,53 @@ function HANDLERS.doctor()
       lines[#lines + 1] = "  " .. entry.dir
         .. (entry.last_touched and ("  (" .. entry.last_touched .. ")") or "")
     end
+  end
+
+  -- Phase 4 (§13/§14 gobugger doctor parity): git/worktree health +
+  -- go module root, from the resolver-anchored doctor module.
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "git / worktree"
+  lines[#lines + 1] = "──────────────"
+  local okg_info, g = pcall(function()
+    return require("auto-run.doctor").git_info()
+  end)
+  if okg_info then
+    lines[#lines + 1] = row("project root", g.project_root
+      and (g.project_root .. "  [" .. tostring(g.root_marker) .. "]")
+      or "<not found>")
+    lines[#lines + 1] = row("anchor .git", g.git_kind)
+    lines[#lines + 1] = row("git status", g.status_ok and "OK"
+      or (tostring(g.status_error) .. "  (:AutoRun doctor --fix)"))
+    lines[#lines + 1] = row("git common dir", g.common_dir or "<not in a git repo>")
+    lines[#lines + 1] = row("go module root",
+      g.go_module_root and (g.go_module_root .. "  [go.mod present]")
+      or "<no go.mod found>")
+  else
+    lines[#lines + 1] = row("git info", "unavailable (" .. tostring(g) .. ")")
+  end
+
+  -- Per-kind config listing with the remembered pick markers
+  -- (gobugger's "Configs: mode=…" block, generalized to the store's
+  -- three kinds).
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "configs by kind"
+  lines[#lines + 1] = "───────────────"
+  local okp, picks = pcall(function() return require("auto-run.exec").picks() end)
+  if not okp then picks = {} end
+  local by_kind = { run = {}, test = {}, debug = {} }
+  for _, c in ipairs(store.list()) do
+    if not c.error and by_kind[c.kind] then
+      table.insert(by_kind[c.kind], c.name)
+    end
+  end
+  for _, kind in ipairs({ "run", "test", "debug" }) do
+    local names = by_kind[kind]
+    local rendered = {}
+    for _, n in ipairs(names) do
+      rendered[#rendered + 1] = n .. (picks[kind] == n and "  [session pick]" or "")
+    end
+    lines[#lines + 1] = ("  kind=%-6s (%d): %s"):format(kind, #names,
+      #names > 0 and table.concat(rendered, ", ") or "<none>")
   end
 
   -- Phase 3 (§13): test-adapter roster + per-adapter root resolution
@@ -448,6 +514,11 @@ end, {
         end
       end
       return names
+    end
+    if sub == "doctor" then
+      return vim.tbl_filter(function(s)
+        return s:sub(1, #arglead) == arglead
+      end, { "--fix" })
     end
     if sub == "stop" then
       local ok, exec = pcall(require, "auto-run.exec")
