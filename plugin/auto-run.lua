@@ -2,8 +2,9 @@
 ---
 ---Subcommands: list | show | validate | import | doctor | set-dir
 ---(Phase 1) + run | debug | test | stop | jobs | last-error
----(Phase 2). Output goes through print()/nvim_echo (user-invoked,
----not a main path); errors are echoed, never vim.notify'd.
+---(Phase 2) + tests | scan (Phase 3 discovery). Output goes through
+---print()/nvim_echo (user-invoked, not a main path); errors are
+---echoed, never vim.notify'd.
 
 if vim.g.loaded_auto_run then
   return
@@ -13,6 +14,7 @@ vim.g.loaded_auto_run = 1
 local SUBCOMMANDS = {
   "list", "show", "validate", "import", "doctor", "set-dir",
   "run", "debug", "test", "stop", "jobs", "last-error",
+  "tests", "scan",
 }
 
 local function echo_lines(lines)
@@ -132,6 +134,39 @@ function HANDLERS.doctor()
       lines[#lines + 1] = "  " .. entry.dir
         .. (entry.last_touched and ("  (" .. entry.last_touched .. ")") or "")
     end
+  end
+
+  -- Phase 3 (§13): test-adapter roster + per-adapter root resolution
+  -- for the current anchor, plus the discovery snapshot.
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "test discovery"
+  lines[#lines + 1] = "──────────────"
+  local okd_disc, disc = pcall(function()
+    local adapters = require("auto-run.adapters")
+    local discovery = require("auto-run.discovery")
+    local anchor = s.root or s.anchor
+    local out = { adapters = {}, counts = discovery.tree():counts() }
+    for _, a in ipairs(adapters.list()) do
+      local okr_root, aroot = pcall(a.root, anchor)
+      out.adapters[#out.adapters + 1] = {
+        name = a.name,
+        root = (okr_root and aroot) and aroot or nil,
+      }
+    end
+    return out
+  end)
+  if okd_disc then
+    if #disc.adapters == 0 then
+      lines[#lines + 1] = row("adapters", "<none registered>")
+    end
+    for _, a in ipairs(disc.adapters) do
+      lines[#lines + 1] = row("adapter " .. a.name,
+        a.root and ("root " .. a.root) or "<no project root at anchor>")
+    end
+    lines[#lines + 1] = row("discovered", ("%d file(s), %d position(s)")
+      :format(disc.counts.files, disc.counts.positions))
+  else
+    lines[#lines + 1] = row("discovery", "unavailable (" .. tostring(disc) .. ")")
   end
 
   -- Phase 2 (§13): dap adapter health + breakpoint-store stats.
@@ -302,6 +337,62 @@ HANDLERS["last-error"] = function()
   if not require("auto-run.dap").open_last_error() then
     echo_lines({ "auto-run: no captured dap failure output yet" })
   end
+end
+
+-- ── Phase 3 subcommands ─────────────────────────────────────────
+
+local STATUS_GLYPH = {
+  passed = "✓", failed = "✗", skipped = "○", running = "●",
+}
+
+function HANDLERS.tests()
+  local discovery = require("auto-run.discovery")
+  discovery.refresh_open_buffers()
+  local results = discovery.results()
+  local tree = discovery.tree()
+  local counts = tree:counts()
+  local lines = { ("auto-run tests — %s (%d file(s), %d position(s))")
+    :format(tree.root.path, counts.files, counts.positions) }
+  if counts.files == 0 then
+    lines[#lines + 1] =
+      "  (none discovered — open a test file or run :AutoRun scan)"
+  end
+  local function render(node, indent)
+    for _, child in ipairs(node.children or {}) do
+      local r = results[child.id]
+      local glyph = r and (STATUS_GLYPH[r.status] or "?") or " "
+      local where = (child.type == "test" or child.type == "namespace")
+        and (":" .. tostring(child.lnum)) or ""
+      lines[#lines + 1] = ("  %s%s %s%s"):format(indent, glyph, child.name, where)
+      render(child, indent .. "  ")
+    end
+  end
+  render(tree.root, "")
+  echo_lines(lines)
+end
+
+function HANDLERS.scan()
+  local discovery = require("auto-run.discovery")
+  echo_lines({ "auto-run: scanning " .. discovery.tree().root.path .. " …" })
+  discovery.scan(nil, function(report)
+    if report.status == "canceled" then
+      echo_lines({ "auto-run: scan canceled (" .. tostring(report.reason) .. ")" })
+      return
+    end
+    local lines = {}
+    if report.status == "capped" then
+      lines[#lines + 1] = ("auto-run: scan hit the %s cap (%d ≥ %d) — %s")
+        :format(report.cap, report.seen, report.limit, report.hint)
+    end
+    lines[#lines + 1] = ("auto-run scan: %d candidate file(s), %d parsed, "
+      .. "%d cached, %d removed, %d root(s), %d error(s)")
+      :format(report.files, report.parsed, report.cached, report.removed,
+        report.roots, #report.errors)
+    for _, e in ipairs(report.errors) do
+      lines[#lines + 1] = "  error: " .. e.path .. ": " .. e.error
+    end
+    echo_lines(lines)
+  end)
 end
 
 HANDLERS["set-dir"] = function(args)

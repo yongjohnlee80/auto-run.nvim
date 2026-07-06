@@ -27,6 +27,15 @@
 --   [18] store — corrupt overrides.json is fatal (layer 6 must-fix)
 --   [19] exec — term strategy env-file cleanup lifecycle
 --   [20] breakpoints — corrupt breakpoints.json diagnostics
+--   [21] adapters — registry + AutoRunAdapter interface (§7)
+--   [22] discovery — go fixture, position tree, child-repo pruning
+--   [23] discovery — scan bounds (caps) + cancelation
+--   [24] discovery — per-file mtime cache
+--   [25] discovery — open-buffers default + BufWritePost re-parse
+--   [26] discovery — go END-TO-END (real `go test -json` runs)
+--   [27] adapters — jest fixture, build_spec, stubbed end-to-end
+--   [28] mailbox — run.tests_list / run.results / positional test_run
+--   [29] :AutoRun tests|scan + doctor adapter diagnostics
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -830,15 +839,15 @@ local commands = require("auto-core.mailbox.commands")
 local run_cmds = require("auto-run.mailbox.commands")
 
 local reg = run_cmds.register_all()
-ok("register_all registers all 15 verbs (idempotent)",
-  #reg.registered == 15 and #reg.skipped == 0, vim.inspect(reg))
+ok("register_all registers all 17 verbs (idempotent)",
+  #reg.registered == 17 and #reg.skipped == 0, vim.inspect(reg))
 local expected_verbs = {
   "run.add", "run.debug_start", "run.import", "run.jobs", "run.list",
-  "run.profiles_list", "run.remove", "run.set_dir", "run.show",
-  "run.start", "run.status", "run.stop", "run.test_run",
-  "run.update", "run.validate",
+  "run.profiles_list", "run.remove", "run.results", "run.set_dir",
+  "run.show", "run.start", "run.status", "run.stop", "run.test_run",
+  "run.tests_list", "run.update", "run.validate",
 }
-ok("verb roster matches the Phase 1+2 tiers exactly",
+ok("verb roster matches the Phase 1+2+3 tiers exactly",
   vim.deep_equal(reg.registered, expected_verbs), vim.inspect(reg.registered))
 local spec = commands.get("run.list")
 ok("registry entry owned by auto-run",
@@ -1696,6 +1705,799 @@ do
 
   -- Restore a valid empty store for a clean exit flush.
   write_file(bfile, vim.json.encode({ version = 1, breakpoints = {} }) .. "\n")
+end
+
+-- ═════════════════════════ Phase 3 ══════════════════════════════
+-- Cross-section carriers (same pattern as P2).
+local P3 = {}
+P3.adapters = require("auto-run.adapters")
+P3.discovery = require("auto-run.discovery")
+
+-- ── [21] adapters — registry + interface (§7) ───────────────────
+print("\n[21] adapters — registry, interface validation, third parties")
+do
+  local adapters = P3.adapters
+  adapters._reset_for_tests()
+
+  local names = {}
+  for _, a in ipairs(adapters.list()) do names[#names + 1] = a.name end
+  ok("builtin roster is go + jest (registration order)",
+    vim.deep_equal(names, { "go", "jest" }), vim.inspect(names))
+
+  local go = adapters.get("go")
+  local iface_ok = go ~= nil
+  for _, fname in ipairs({ "root", "is_test_file", "discover_positions",
+    "build_spec", "results", "filter_dir" }) do
+    if not go or type(go[fname]) ~= "function" then iface_ok = false end
+  end
+  ok("go adapter implements the AutoRunAdapter interface", iface_ok)
+
+  local bad_ok, bad_err = adapters.register_adapter({ name = "broken" })
+  ok("register_adapter rejects a shape missing the interface",
+    bad_ok == nil and tostring(bad_err):find("must be a function") ~= nil,
+    tostring(bad_err))
+  ok("register_adapter rejects non-tables",
+    select(2, adapters.register_adapter("nope")) ~= nil)
+
+  local fake = {
+    name = "fake",
+    root = function() return nil end,
+    is_test_file = function(p) return p:match("%.fake$") ~= nil end,
+    discover_positions = function() return nil end,
+    build_spec = function() return nil end,
+    results = function() return {} end,
+  }
+  ok("third-party register_adapter succeeds",
+    adapters.register_adapter(fake) == true)
+  ok("adapter_for routes to the third-party adapter",
+    adapters.adapter_for("/x/y.fake") == fake)
+  ok("adapter_for still routes go files to the go adapter",
+    adapters.adapter_for("/x/y_test.go") == adapters.get("go"))
+  ok("adapter_for is nil for unclaimed files",
+    adapters.adapter_for("/x/y.txt") == nil)
+
+  adapters._reset_for_tests()
+  ok("registry reset restores the builtin roster lazily",
+    adapters.get("go") ~= nil and adapters.get("fake") == nil)
+end
+
+-- ── [22] discovery — go fixture + position tree ─────────────────
+print("\n[22] discovery — go tree, ids, O(1) lookup, child-repo pruning")
+local gofix = fx .. "/gofix"
+local calc_test = gofix .. "/calc/calc_test.go"
+local nested_test = gofix .. "/nestedmod/n_test.go"
+do
+  ok("go fixture repo created", make_plain_repo(gofix))
+  write_file(gofix .. "/go.mod", "module example.com/gofix\n\ngo 1.21\n")
+  write_file(gofix .. "/calc/calc.go", [[
+package calc
+
+func Add(a, b int) int { return a + b }
+]])
+  write_file(calc_test, [[
+package calc
+
+import (
+	"fmt"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	m.Run()
+}
+
+func TestAdd(t *testing.T) {
+	t.Run("sub one", func(t *testing.T) {
+		if Add(1, 2) != 3 {
+			t.Fatal("nope")
+		}
+	})
+	t.Run("group", func(t *testing.T) {
+		t.Run("inner", func(t *testing.T) {
+			if Add(2, 2) != 4 {
+				t.Fatal("nope")
+			}
+		})
+	})
+}
+
+func TestFail(t *testing.T) {
+	t.Fatal("boom: intentional failure")
+}
+
+func TestSkipped(t *testing.T) {
+	t.Skip("not today")
+}
+
+func ExampleAdd() {
+	fmt.Println(Add(1, 1))
+	// Output: 2
+}
+
+func ExampleAdd_noOutput() {
+	_ = Add(0, 0)
+}
+]])
+  -- Nested go.mod module (primary-root cache exercise).
+  write_file(gofix .. "/nestedmod/go.mod", "module example.com/nested\n\ngo 1.21\n")
+  write_file(nested_test, [[
+package nested
+
+import "testing"
+
+func TestNested(t *testing.T) {
+	if 1+1 != 2 {
+		t.Fatal("math broke")
+	}
+}
+]])
+  -- Nested CHILD REPO (immediate child — list_child_repos sees it).
+  ok("nested child repo created", make_plain_repo(gofix .. "/childrepo"))
+  write_file(gofix .. "/childrepo/child_test.go", [[
+package child
+
+import "testing"
+
+func TestChild(t *testing.T) {}
+]])
+  -- DEEP nested repo (NOT an immediate child — only the walk's own
+  -- .git pruning can catch it).
+  ok("deep nested repo created", make_plain_repo(gofix .. "/deep/innerrepo"))
+  write_file(gofix .. "/deep/innerrepo/deep_test.go", [[
+package deep
+
+import "testing"
+
+func TestDeep(t *testing.T) {}
+]])
+  -- vendor/ (adapter filter_dir pruning).
+  write_file(gofix .. "/vendor/v_test.go", [[
+package v
+
+import "testing"
+
+func TestVendored(t *testing.T) {}
+]])
+
+  worktree.set_active(gofix)
+  P3.discovery._reset_for_tests()
+  require("auto-run.adapters.go")._reset_for_tests()
+
+  local report
+  P3.discovery.scan(nil, function(r) report = r end)
+  wait_for(function() return report end)
+  ok("scan completes", report ~= nil and report.status == "complete",
+    vim.inspect(report))
+  ok("scan parsed exactly the two module test files",
+    report.parsed == 2, vim.inspect(report))
+  ok("scan discovered two adapter roots (module + nested module)",
+    report.roots == 2, vim.inspect(report))
+  ok("scan reports zero parse errors", #report.errors == 0,
+    vim.inspect(report.errors))
+
+  local tree = P3.discovery.tree()
+  ok("tree anchors at the active worktree", tree.root.path == gofix)
+
+  -- O(1) id lookup on the flat _nodes map.
+  local file_node = tree:get(calc_test)
+  ok("file id = path (O(1) lookup)",
+    file_node ~= nil and file_node.type == "file" and file_node.adapter == "go")
+  local t_add = tree:get(calc_test .. "::TestAdd")
+  ok("test id = path::name", t_add ~= nil and t_add.type == "test"
+    and t_add.name == "TestAdd" and type(t_add.lnum) == "number")
+  local sub = tree:get(calc_test .. "::TestAdd::sub one")
+  ok("t.Run subtest id = path::TestAdd::sub one",
+    sub ~= nil and sub.type == "test" and sub.name == "sub one")
+  local inner = tree:get(calc_test .. "::TestAdd::group::inner")
+  ok("NESTED t.Run id = path::TestAdd::group::inner",
+    inner ~= nil and inner.type == "test")
+  ok("TestMain is excluded from discovery",
+    tree:get(calc_test .. "::TestMain") == nil)
+  ok("Example* funcs are discovered",
+    tree:get(calc_test .. "::ExampleAdd") ~= nil
+      and tree:get(calc_test .. "::ExampleAdd_noOutput") ~= nil)
+
+  -- Hierarchy: root dir → calc dir → file → test → subtest.
+  ok("dir chain hierarchy (root → calc → file)",
+    file_node.parent ~= nil and file_node.parent.id == gofix .. "/calc"
+      and file_node.parent.parent == tree.root)
+  ok("subtest hangs off its parent test",
+    sub.parent == t_add and inner.parent ~= nil
+      and inner.parent.id == calc_test .. "::TestAdd::group")
+
+  -- Pruning: child repos (immediate + deep) and vendor NEVER appear.
+  ok("immediate child repo pruned (list_child_repos + .git entry)",
+    tree:get(gofix .. "/childrepo/child_test.go") == nil
+      and tree:get(gofix .. "/childrepo") == nil)
+  ok("DEEP nested repo pruned by the walk's own .git check",
+    tree:get(gofix .. "/deep/innerrepo/deep_test.go") == nil)
+  ok("vendor/ pruned by adapter filter_dir",
+    tree:get(gofix .. "/vendor/v_test.go") == nil)
+
+  -- Nested module resolves its OWN root (primary-root cache).
+  local go = P3.adapters.get("go")
+  ok("go.root at calc → the umbrella module", go.root(gofix .. "/calc") == gofix)
+  ok("go.root at nestedmod → the nested module",
+    go.root(gofix .. "/nestedmod") == gofix .. "/nestedmod")
+  ok("nested module file discovered under its own dir",
+    tree:get(nested_test) ~= nil)
+
+  -- build_spec: ^-anchored slash-split -run regex per position type.
+  local spec = go.build_spec({ position = inner, tree = tree, root = gofix,
+    run_id = "spec-probe", run_dir = fx .. "/spec-probe" })
+  ok("test spec: slash-split ^-anchored -run regex (spaces → _)",
+    spec ~= nil and vim.deep_equal(spec.cmd,
+      { "go", "test", "-json", "-run", "^TestAdd$/^group$/^inner$", "./calc" }),
+    vim.inspect(spec and spec.cmd))
+  local sub_spec = go.build_spec({ position = sub, tree = tree, root = gofix,
+    run_id = "spec-probe", run_dir = fx .. "/spec-probe" })
+  ok("subtest with spaces maps to underscores in -run",
+    sub_spec ~= nil and sub_spec.cmd[5] == "^TestAdd$/^sub_one$",
+    vim.inspect(sub_spec and sub_spec.cmd))
+  local f_spec = go.build_spec({ position = file_node, tree = tree, root = gofix,
+    run_id = "spec-probe", run_dir = fx .. "/spec-probe" })
+  ok("file spec: top-level alternation regex",
+    f_spec ~= nil and f_spec.cmd[4] == "-run"
+      and f_spec.cmd[5]:match("^%^%(") ~= nil
+      and f_spec.cmd[5]:find("TestAdd", 1, true) ~= nil
+      and f_spec.cmd[5]:find("TestFail", 1, true) ~= nil
+      and f_spec.cmd[5]:find("TestMain", 1, true) == nil,
+    vim.inspect(f_spec and f_spec.cmd))
+  local d_spec = go.build_spec({
+    position = { type = "dir", id = gofix .. "/calc", path = gofix .. "/calc" },
+    tree = tree, root = gofix, run_id = "spec-probe", run_dir = fx .. "/spec-probe",
+  })
+  ok("dir spec: relative package pattern ./calc/...",
+    d_spec ~= nil and vim.deep_equal(d_spec.cmd,
+      { "go", "test", "-json", "./calc/..." }),
+    vim.inspect(d_spec and d_spec.cmd))
+  local root_spec = go.build_spec({
+    position = { type = "dir", id = gofix, path = gofix },
+    tree = tree, root = gofix, run_id = "spec-probe", run_dir = fx .. "/spec-probe",
+  })
+  ok("root dir spec: ./...",
+    root_spec ~= nil and root_spec.cmd[4] == "./...",
+    vim.inspect(root_spec and root_spec.cmd))
+
+  -- Serializable projection (the run.tests_list shape).
+  local plain_tree = P3.discovery.tree_plain()
+  local okj = pcall(vim.json.encode, plain_tree)
+  ok("tree_plain() is JSON-serializable (no parent refs)", okj)
+  ok("tree_plain() carries ids + types",
+    plain_tree.id == gofix and plain_tree.type == "dir"
+      and #plain_tree.children > 0)
+end
+
+-- ── [23] discovery — scan bounds + cancelation ──────────────────
+print("\n[23] discovery — bounded caps (structured, loud) + cancel")
+do
+  worktree.set_active(gofix)
+
+  -- files cap: structured report, never a silent degrade.
+  local capped
+  P3.discovery.scan({ max_files = 2 }, function(r) capped = r end)
+  wait_for(function() return capped end)
+  ok("tiny files cap → status=capped", capped ~= nil and capped.status == "capped",
+    vim.inspect(capped))
+  ok("cap report is structured (cap/limit/seen/hint)",
+    capped.cap == "files" and capped.limit == 2 and capped.seen == 3
+      and capped.hint == "scope narrowed?", vim.inspect(capped))
+
+  -- roots cap (two go roots in the fixture).
+  local rcapped
+  P3.discovery.scan({ max_roots = 1 }, function(r) rcapped = r end)
+  wait_for(function() return rcapped end)
+  ok("tiny roots cap → status=capped cap=roots",
+    rcapped ~= nil and rcapped.status == "capped" and rcapped.cap == "roots"
+      and rcapped.limit == 1 and rcapped.seen == 2, vim.inspect(rcapped))
+
+  -- A second scan() cancels the first (one in flight per repo).
+  local first, second
+  P3.discovery.scan({ chunk = 1 }, function(r) first = r end)
+  P3.discovery.scan(nil, function(r) second = r end)
+  wait_for(function() return first and second end)
+  ok("second scan cancels the first",
+    first ~= nil and first.status == "canceled"
+      and first.reason == "superseded", vim.inspect(first))
+  ok("…and the second completes", second ~= nil and second.status == "complete")
+
+  -- A worktree switch cancels the in-flight scan.
+  local switched
+  P3.discovery.scan({ chunk = 1 }, function(r) switched = r end)
+  worktree.set_active(plain)
+  wait_for(function() return switched end)
+  ok("worktree switch cancels the in-flight scan",
+    switched ~= nil and switched.status == "canceled", vim.inspect(switched))
+  worktree.set_active(gofix)
+  ok("re-anchored tree follows the active worktree",
+    P3.discovery.tree().root.path == gofix)
+end
+
+-- ── [24] discovery — per-file mtime cache ───────────────────────
+print("\n[24] discovery — mtime cache (re-scan skips unchanged files)")
+do
+  worktree.set_active(gofix)
+  local r1
+  P3.discovery.scan(nil, function(r) r1 = r end)
+  wait_for(function() return r1 end)
+  ok("baseline scan green", r1 ~= nil and r1.status == "complete")
+
+  local r2
+  P3.discovery.scan(nil, function(r) r2 = r end)
+  wait_for(function() return r2 end)
+  ok("re-scan parses NOTHING (all mtime-cached)",
+    r2 ~= nil and r2.parsed == 0 and r2.cached == 2, vim.inspect(r2))
+
+  -- Touch one file (content change → new mtime) → exactly one parse.
+  write_file(nested_test, [[
+package nested
+
+import "testing"
+
+func TestNested(t *testing.T) {
+	if 1+1 != 2 {
+		t.Fatal("math broke")
+	}
+}
+
+func TestMtime(t *testing.T) {}
+]])
+  local r3
+  P3.discovery.scan(nil, function(r) r3 = r end)
+  wait_for(function() return r3 end)
+  ok("changed file re-parses; unchanged file stays cached",
+    r3 ~= nil and r3.parsed == 1 and r3.cached == 1, vim.inspect(r3))
+  ok("re-parse picked up the new position",
+    P3.discovery.tree():get(nested_test .. "::TestMtime") ~= nil)
+end
+
+-- ── [25] discovery — open buffers + BufWritePost ────────────────
+print("\n[25] discovery — open-buffers default + BufWritePost re-parse")
+do
+  worktree.set_active(gofix)
+  P3.discovery._reset_for_tests()
+
+  -- Fresh read of a test file → BufReadPost parse (no scan needed).
+  pcall(vim.cmd, "silent! bwipeout! " .. vim.fn.fnameescape(calc_test))
+  local disco_ev
+  local h_ev = core.events.subscribe("run.discovery:changed",
+    function(p) disco_ev = p end)
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  local tree = P3.discovery.tree()
+  ok("BufReadPost parses an opened test file (open-buffers default)",
+    tree:get(calc_test .. "::TestAdd") ~= nil)
+  ok("only the open buffer is discovered (no implicit full scan)",
+    tree:counts().files == 1, vim.inspect(tree:counts()))
+  ok("run.discovery:changed published on parse",
+    disco_ev ~= nil and disco_ev.root == gofix
+      and disco_ev.files == 1 and disco_ev.positions > 0,
+    vim.inspect(disco_ev))
+
+  -- Edit the buffer, :write → BufWritePost re-parse.
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, -1, -1, false, {
+    "", "func TestBufAdded(t *testing.T) {", "\tt.Log(\"added\")", "}",
+  })
+  vim.cmd("silent write")
+  ok("BufWritePost re-parses the open test file",
+    P3.discovery.tree():get(calc_test .. "::TestBufAdded") ~= nil)
+
+  -- refresh_open_buffers covers buffers opened before setup.
+  P3.discovery._reset_for_tests()
+  local n = P3.discovery.refresh_open_buffers()
+  ok("refresh_open_buffers re-discovers loaded test buffers",
+    n >= 1 and P3.discovery.tree():get(calc_test .. "::TestAdd") ~= nil,
+    tostring(n))
+  core.events.unsubscribe(h_ev)
+end
+
+-- ── [26] discovery — go END-TO-END (real go test runs) ──────────
+print("\n[26] discovery — real `go test -json` → per-position results")
+do
+  worktree.set_active(gofix)
+  P3.discovery._reset_for_tests()
+  local scanned
+  P3.discovery.scan(nil, function(r) scanned = r end)
+  wait_for(function() return scanned end)
+  ok("fixture rescanned for the run", scanned ~= nil and scanned.status == "complete")
+  local tree = P3.discovery.tree()
+
+  -- gobugger parity: a kind=test config's build_flags + env apply.
+  store.add({ name = "gofix-tests", kind = "test", runtime = "go",
+    build_flags = "-count=1", env = { SMOKE_GO_MARKER = "yes" } },
+    { tier = "shared" })
+  local go = P3.adapters.get("go")
+  ok("kind=test config picked for adapter runs",
+    go.test_config_name() == "gofix-tests")
+  local cfg_spec = go.build_spec({
+    position = tree:get(calc_test .. "::TestFail"), tree = tree, root = gofix,
+    run_id = "cfg-probe", run_dir = fx .. "/cfg-probe",
+  })
+  ok("effective config's build_flags land in the argv",
+    cfg_spec ~= nil and cfg_spec.cmd[4] == "-count=1", vim.inspect(cfg_spec and cfg_spec.cmd))
+  ok("effective config's env rides the spec (composed, not logged)",
+    cfg_spec ~= nil and cfg_spec.env ~= nil
+      and cfg_spec.env.SMOKE_GO_MARKER == "yes")
+
+  -- FILE run: pass/fail/skip + subtests + missing-fill + aggregation.
+  local results_ev
+  local h_ev = core.events.subscribe("run.results:changed",
+    function(p) results_ev = p end)
+  local batch
+  local launched, lerr = P3.discovery.run_position(calc_test, {
+    on_done = function(b) batch = b end,
+  })
+  ok("run_position(file) launches", launched ~= nil, tostring(lerr))
+  ok("one spec for a single-package file run",
+    launched and #launched.runs == 1 and launched.runs[1].adapter == "go",
+    vim.inspect(launched))
+  local running_now = P3.discovery.results()
+  ok("scope marked running immediately (glyph feed)",
+    running_now[calc_test .. "::TestFail"] ~= nil
+      and running_now[calc_test .. "::TestFail"].status == "running")
+  ok("running status aggregates upward while in flight",
+    running_now[calc_test] ~= nil and running_now[calc_test].status == "running")
+
+  wait_for(function() return batch end, 60000)
+  ok("go test run completed (on_done fired)", batch ~= nil)
+  local res = P3.discovery.results()
+  local function status_of(id) return res[id] and res[id].status end
+  ok("TestAdd passed", status_of(calc_test .. "::TestAdd") == "passed",
+    vim.inspect(res[calc_test .. "::TestAdd"]))
+  ok("subtest 'sub one' passed (slash-split name mapping)",
+    status_of(calc_test .. "::TestAdd::sub one") == "passed")
+  ok("NESTED subtest 'inner' passed",
+    status_of(calc_test .. "::TestAdd::group::inner") == "passed")
+  ok("TestFail FAILED and maps back to its position id",
+    status_of(calc_test .. "::TestFail") == "failed")
+  ok("failure output captured from the -json stream",
+    res[calc_test .. "::TestFail"].output ~= nil
+      and res[calc_test .. "::TestFail"].output:find("boom", 1, true) ~= nil)
+  ok("TestSkipped skipped (runner-reported)",
+    status_of(calc_test .. "::TestSkipped") == "skipped")
+  ok("ExampleAdd (with Output) passed",
+    status_of(calc_test .. "::ExampleAdd") == "passed")
+  ok("no-output Example (compiled, never run) missing-result FILLED as skipped",
+    status_of(calc_test .. "::ExampleAdd_noOutput") == "skipped")
+  ok("upward aggregation: file failed",
+    status_of(calc_test) == "failed")
+  ok("upward aggregation: dir failed", status_of(gofix .. "/calc") == "failed")
+  ok("upward aggregation: worktree root failed", status_of(gofix) == "failed")
+  ok("run.results:changed published with the positions map",
+    results_ev ~= nil and results_ev.root == gofix
+      and results_ev.positions[calc_test .. "::TestFail"] ~= nil,
+    vim.inspect(results_ev and results_ev.positions and "map-present"))
+  ok("durations parsed from Elapsed",
+    type(res[calc_test .. "::TestAdd"].duration_ms) == "number")
+
+  -- SINGLE nested-subtest run.
+  batch = nil
+  local one, oerr = P3.discovery.run_position(
+    calc_test .. "::TestAdd::group::inner", { on_done = function(b) batch = b end })
+  ok("run_position(nested subtest) launches", one ~= nil, tostring(oerr))
+  wait_for(function() return batch end, 60000)
+  ok("nested subtest run resolves to passed",
+    batch ~= nil and batch[calc_test .. "::TestAdd::group::inner"] ~= nil
+      and batch[calc_test .. "::TestAdd::group::inner"].status == "passed",
+    vim.inspect(batch))
+
+  -- WORKTREE-ROOT dir run: umbrella module via ./... + the nested
+  -- module via its own per-file spec (two specs, one batch).
+  batch = nil
+  local all, aerr = P3.discovery.run_position(gofix, {
+    on_done = function(b) batch = b end,
+  })
+  ok("run_position(root dir) launches", all ~= nil, tostring(aerr))
+  ok("root run decomposes into umbrella + nested-module specs",
+    all and #all.runs == 2, vim.inspect(all))
+  wait_for(function() return batch end, 60000)
+  local res2 = P3.discovery.results()
+  ok("nested module's test ran and passed (own module root)",
+    res2[nested_test .. "::TestNested"] ~= nil
+      and res2[nested_test .. "::TestNested"].status == "passed")
+  ok("root aggregation stays failed (TestFail)",
+    res2[gofix] ~= nil and res2[gofix].status == "failed")
+
+  -- Structured errors on the execution surface.
+  local missing, merr = P3.discovery.run_position("no::such::position")
+  ok("run_position unknown id is a structured error",
+    missing == nil and tostring(merr):find("not found", 1, true) ~= nil)
+  local dbg, dbg_err = P3.discovery.debug_position(calc_test)
+  ok("debug_position refuses non-test positions",
+    dbg == nil and tostring(dbg_err):find("test position", 1, true) ~= nil)
+  local dbg2, dbg2_err = P3.discovery.debug_position(calc_test .. "::TestFail")
+  ok("debug_position degrades structured without dap-go",
+    dbg2 == nil and tostring(dbg2_err):find("dap%-go") ~= nil
+      or (dbg2 == nil and tostring(dbg2_err):find("not installed", 1, true) ~= nil),
+    tostring(dbg2_err))
+
+  core.events.unsubscribe(h_ev)
+  store.remove("gofix-tests")
+end
+
+-- ── [27] adapters — jest fixture + stubbed end-to-end ───────────
+print("\n[27] jest — per-package roots, query, argv, results parse")
+local jestfix = fx .. "/jestfix"
+local foo_test = jestfix .. "/pkg-a/src/foo.test.js"
+local bar_test = jestfix .. "/pkg-b/__tests__/bar.test.ts"
+do
+  ok("jest fixture repo created", make_plain_repo(jestfix))
+  write_file(jestfix .. "/package.json", '{ "name": "umbrella", "private": true }\n')
+  write_file(jestfix .. "/pkg-a/package.json", '{ "name": "pkg-a" }\n')
+  write_file(jestfix .. "/pkg-b/package.json", '{ "name": "pkg-b" }\n')
+  write_file(foo_test, [[
+describe("math", () => {
+  it("adds", () => {
+    expect(1 + 1).toBe(2);
+  });
+  it.skip("skips", () => {});
+});
+
+test("standalone", () => {
+  expect(true).toBe(false);
+});
+]])
+  write_file(bar_test, [[
+describe("bar", () => {
+  test("works", () => {
+    expect(true).toBe(true);
+  });
+});
+]])
+  -- node_modules DECOY: a test file that must never be discovered.
+  write_file(jestfix .. "/pkg-a/node_modules/decoy/decoy.test.js",
+    'test("decoy", () => {});\n')
+
+  -- Stub jest binaries: real executables that honor --outputFile= and
+  -- emit canned jest --json output (a trivially-provisioned runner —
+  -- no npm install in the smoke). pkg-a gets a local one; pkg-b
+  -- resolves the HOISTED umbrella binary.
+  local canned = vim.json.encode({
+    numTotalTests = 3,
+    testResults = {
+      {
+        name = foo_test,
+        assertionResults = {
+          { ancestorTitles = { "math" }, title = "adds",
+            status = "passed", duration = 5 },
+          { ancestorTitles = { "math" }, title = "skips",
+            status = "pending" },
+          { ancestorTitles = {}, title = "standalone", status = "failed",
+            failureMessages = { "expected true to be false" } },
+        },
+      },
+    },
+  })
+  write_file(jestfix .. "/pkg-a/canned.json", canned)
+  local stub = table.concat({
+    "#!/bin/sh",
+    'out=""',
+    'for a in "$@"; do',
+    '  case "$a" in',
+    '    --outputFile=*) out="${a#--outputFile=}" ;;',
+    "  esac",
+    "done",
+    'cat "' .. jestfix .. '/pkg-a/canned.json" > "$out"',
+    "exit 1",  -- jest exits 1 when any test failed
+    "",
+  }, "\n")
+  write_file(jestfix .. "/pkg-a/node_modules/.bin/jest", stub)
+  vim.uv.fs_chmod(jestfix .. "/pkg-a/node_modules/.bin/jest", tonumber("755", 8))
+  write_file(jestfix .. "/node_modules/.bin/jest", stub)
+  vim.uv.fs_chmod(jestfix .. "/node_modules/.bin/jest", tonumber("755", 8))
+
+  worktree.set_active(jestfix)
+  P3.discovery._reset_for_tests()
+  require("auto-run.adapters.jest")._reset_for_tests()
+
+  local report
+  P3.discovery.scan(nil, function(r) report = r end)
+  wait_for(function() return report end)
+  ok("jest scan completes", report ~= nil and report.status == "complete",
+    vim.inspect(report))
+  ok("both packages' test files parsed (js + ts)",
+    report.parsed == 2, vim.inspect(report))
+  ok("two per-package roots discovered under one worktree",
+    report.roots == 2, vim.inspect(report))
+
+  local tree = P3.discovery.tree()
+  local jest = P3.adapters.get("jest")
+  ok("node_modules decoy is NOT discovered",
+    tree:get(jestfix .. "/pkg-a/node_modules/decoy/decoy.test.js") == nil)
+  ok("jest.root resolves the nearest package.json",
+    jest.root(jestfix .. "/pkg-a/src") == jestfix .. "/pkg-a"
+      and jest.root(jestfix .. "/pkg-b/__tests__") == jestfix .. "/pkg-b")
+
+  local ns = tree:get(foo_test .. "::math")
+  local adds = tree:get(foo_test .. "::math::adds")
+  local skips = tree:get(foo_test .. "::math::skips")
+  local standalone = tree:get(foo_test .. "::standalone")
+  ok("describe → namespace position", ns ~= nil and ns.type == "namespace")
+  ok("it → test position under the namespace",
+    adds ~= nil and adds.type == "test" and adds.parent == ns)
+  ok("it.skip alias discovered", skips ~= nil and skips.type == "test")
+  ok("top-level test() discovered", standalone ~= nil and standalone.type == "test")
+  ok("ts file parsed with the typescript grammar",
+    tree:get(bar_test .. "::bar::works") ~= nil)
+
+  -- build_spec: binary resolution + regex-escaped testNamePattern.
+  local a_spec = jest.build_spec({ position = adds, tree = tree,
+    root = jestfix .. "/pkg-a", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("package-local jest binary picked",
+    a_spec ~= nil and a_spec.cmd[1] == jestfix .. "/pkg-a/node_modules/.bin/jest",
+    vim.inspect(a_spec and a_spec.cmd))
+  ok("test spec: --json --outputFile into the per-run dir",
+    a_spec ~= nil and a_spec.cmd[2] == "--json"
+      and a_spec.cmd[3] == "--outputFile=" .. fx .. "/jest-probe/jest-output.json")
+  ok("test spec: anchored ancestor-joined --testNamePattern",
+    a_spec ~= nil and a_spec.cmd[4] == "--testNamePattern=^math adds$",
+    vim.inspect(a_spec and a_spec.cmd))
+  local ns_spec = jest.build_spec({ position = ns, tree = tree,
+    root = jestfix .. "/pkg-a", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("namespace pattern is prefix-anchored only (no trailing $)",
+    ns_spec ~= nil and ns_spec.cmd[4] == "--testNamePattern=^math",
+    vim.inspect(ns_spec and ns_spec.cmd))
+  local b_spec = jest.build_spec({
+    position = tree:get(bar_test .. "::bar::works"), tree = tree,
+    root = jestfix .. "/pkg-b", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("hoisted umbrella binary resolves for the bare package",
+    b_spec ~= nil and b_spec.cmd[1] == jestfix .. "/node_modules/.bin/jest",
+    vim.inspect(b_spec and b_spec.cmd))
+
+  -- Regex-escaping probe on a hostile name.
+  local hostile = { type = "test", path = foo_test,
+    id = foo_test .. "::a.b (c) [d]" }
+  local h_spec = jest.build_spec({ position = hostile, tree = tree,
+    root = jestfix .. "/pkg-a", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("testNamePattern regex-escapes metacharacters",
+    h_spec ~= nil
+      and h_spec.cmd[4] == "--testNamePattern=^a\\.b \\(c\\) \\[d\\]$",
+    vim.inspect(h_spec and h_spec.cmd))
+
+  -- END-TO-END with the STUB runner (spawn → outputFile → parse).
+  -- Note: canned output, real process — an npm-installed jest is not
+  -- provisioned in the smoke environment.
+  local batch
+  local launched, lerr = P3.discovery.run_position(foo_test, {
+    on_done = function(b) batch = b end,
+  })
+  ok("run_position(jest file) launches the stub runner",
+    launched ~= nil and #launched.runs == 1, tostring(lerr))
+  wait_for(function() return batch end, 30000)
+  local res = P3.discovery.results()
+  ok("jest results parse keyed to position ids",
+    res[foo_test .. "::math::adds"] ~= nil
+      and res[foo_test .. "::math::adds"].status == "passed"
+      and res[foo_test .. "::math::adds"].duration_ms == 5)
+  ok("pending maps to skipped", res[foo_test .. "::math::skips"] ~= nil
+    and res[foo_test .. "::math::skips"].status == "skipped")
+  ok("failed test carries failureMessages output",
+    res[foo_test .. "::standalone"] ~= nil
+      and res[foo_test .. "::standalone"].status == "failed"
+      and tostring(res[foo_test .. "::standalone"].output)
+        :find("expected true", 1, true) ~= nil)
+  ok("namespace aggregates from its own children only",
+    res[foo_test .. "::math"] ~= nil
+      and res[foo_test .. "::math"].status == "passed")
+  ok("file aggregates failed (exit 1 + parsed results ≠ runner death)",
+    res[foo_test] ~= nil and res[foo_test].status == "failed")
+end
+
+-- ── [28] mailbox — Phase 3 verbs live (§11) ─────────────────────
+print("\n[28] mailbox — run.tests_list, run.results, positional test_run")
+do
+  worktree.set_active(jestfix)
+  local h_tests_list = commands.get("run.tests_list").handler
+  local h_results = commands.get("run.results").handler
+  local h_test_run = commands.get("run.test_run").handler
+
+  local env_t = h_tests_list({})
+  ok("run.tests_list envelope: {root, files, positions, tree}",
+    env_t.ok == true and env_t.value.root == jestfix
+      and env_t.value.files == 2 and env_t.value.positions > 0,
+    vim.inspect(env_t.ok and {
+      root = env_t.value.root, files = env_t.value.files } or env_t))
+  local function find_node(node, id)
+    if node.id == id then return node end
+    for _, child in ipairs(node.children or {}) do
+      local hit = find_node(child, id)
+      if hit then return hit end
+    end
+    return nil
+  end
+  local node = find_node(env_t.value.tree, foo_test .. "::math::adds")
+  ok("tree payload is the serializable position shape",
+    node ~= nil and node.type == "test" and node.adapter == "jest"
+      and type(node.lnum) == "number")
+  ok("tree payload JSON-encodes",
+    pcall(vim.json.encode, env_t.value.tree))
+
+  local env_r = h_results({})
+  ok("run.results envelope keyed by position id",
+    env_r.ok == true and env_r.value.count > 0
+      and env_r.value.results[foo_test .. "::standalone"] ~= nil
+      and env_r.value.results[foo_test .. "::standalone"].status == "failed",
+    vim.inspect(env_r.ok and env_r.value.count or env_r))
+
+  -- Positional test_run: same run.exec trust gate as every
+  -- execution-starting verb ([12] left trust ack'd but DISABLED).
+  local env_gate = h_test_run({ position = foo_test .. "::math::adds" })
+  ok("positional run.test_run is trust-gated",
+    env_gate.ok == false and env_gate.code == "trust_required",
+    vim.inspect(env_gate))
+  ok("run.test_run schema still carries NO force/bypass flag", (function()
+    for k in pairs(commands.get("run.test_run").schema or {}) do
+      local lk = tostring(k):lower()
+      if lk:find("force") or lk:find("bypass") then return false end
+    end
+    return true
+  end)())
+
+  trust.set("run.exec", { enabled = true })
+  local env_both = h_test_run({ name = "x", position = "y" })
+  ok("name + position are mutually exclusive → invalid_args",
+    env_both.ok == false and env_both.code == "invalid_args")
+  local env_ghost = h_test_run({ position = "no::such" })
+  ok("unknown position → not_found",
+    env_ghost.ok == false and env_ghost.code == "not_found", vim.inspect(env_ghost))
+
+  local exited
+  local h_ev = core.events.subscribe("run.job:exited", function(p) exited = p end)
+  local env_run = h_test_run({ position = foo_test .. "::math::adds" })
+  ok("trusted positional run.test_run launches",
+    env_run.ok == true and env_run.value.position == foo_test .. "::math::adds"
+      and #env_run.value.runs == 1, vim.inspect(env_run))
+  wait_for(function() return exited and exited.id == env_run.value.runs[1].id end)
+  ok("positional run's job exits (results flow via run.results)",
+    exited ~= nil)
+  core.events.unsubscribe(h_ev)
+  trust.set("run.exec", { enabled = false })
+
+  -- Phase 2 config form still works through the same verb (regression
+  -- guard for the extension).
+  trust.set("run.exec", { enabled = true })
+  worktree.set_active(plain)
+  local exited2
+  local h_ev2 = core.events.subscribe("run.job:exited", function(p) exited2 = p end)
+  local env_cfg = h_test_run({ name = "pkg-tests", test_name = "TestNope" })
+  ok("config-name form still runs (Phase 2 compatibility)",
+    env_cfg.ok == true and contains(env_cfg.value.cmd, "^TestNope$"),
+    vim.inspect(env_cfg))
+  wait_for(function() return exited2 and exited2.id == env_cfg.value.id end)
+  core.events.unsubscribe(h_ev2)
+  trust.set("run.exec", { enabled = false })
+end
+
+-- ── [29] :AutoRun {tests|scan} + doctor diagnostics ─────────────
+print("\n[29] :AutoRun — tests/scan subcommands, doctor adapter rows")
+do
+  worktree.set_active(jestfix)
+  local out = vim.api.nvim_exec2("AutoRun tests", { output = true }).output
+  ok(":AutoRun tests renders the position tree",
+    out:find("auto-run tests", 1, true) ~= nil
+      and out:find("math", 1, true) ~= nil
+      and out:find("adds", 1, true) ~= nil, out:sub(1, 200))
+  ok(":AutoRun tests shows result glyphs",
+    out:find("✗", 1, true) ~= nil and out:find("✓", 1, true) ~= nil)
+
+  local scan_done
+  local h_ev = core.events.subscribe("run.discovery:changed",
+    function(p) scan_done = p end)
+  ok(":AutoRun scan runs clean", pcall(vim.cmd, "AutoRun scan"))
+  wait_for(function() return scan_done end)
+  ok(":AutoRun scan completes and republishes discovery",
+    scan_done ~= nil and scan_done.root == jestfix, vim.inspect(scan_done))
+  core.events.unsubscribe(h_ev)
+
+  local doc = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok("doctor renders the test-discovery section",
+    doc:find("test discovery", 1, true) ~= nil)
+  ok("doctor lists adapter roots for the anchor",
+    doc:find("adapter go", 1, true) ~= nil
+      and doc:find("adapter jest", 1, true) ~= nil
+      and doc:find("root " .. jestfix, 1, true) ~= nil, doc)
+  ok("doctor reports the discovery snapshot",
+    doc:find("discovered", 1, true) ~= nil)
 end
 
 -- ── summary ─────────────────────────────────────────────────────

@@ -47,6 +47,17 @@ M.defaults = {
     ---auto-agents term-strategy provider (T1..T4).
     term_slot = 1,
   },
+  ---Test discovery (ADR-0048 §7).
+  discovery = {
+    ---Full-scan hard caps (Lector should-fix #4). Hitting either cap
+    ---aborts the scan with a structured cap report + warn log —
+    ---never a silent degrade.
+    max_files = 5000,   ---candidate files visited
+    max_roots = 200,    ---distinct adapter roots discovered
+    ---Parse open test buffers by default (BufReadPost) and re-parse
+    ---on BufWritePost. false → discovery only via explicit scans.
+    open_buffers = true,
+  },
   ---DAP bridge (ADR-0048 §6).
   dap = {
     ---dap-view wiring: `true` → opinionated layout + auto open/close

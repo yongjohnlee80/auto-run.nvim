@@ -11,7 +11,13 @@
 ---wiring), breakpoint persistence + reconcile sweep
 ---(`auto-run.dap.breakpoints`), the §10 keymaps
 ---(`auto-run.keymaps`), and the trust-gated execution verbs.
----Discovery, adapters, and the auto-finder panels are Phase 3.
+---
+---Phase 3 surface (auto-run half): the test-adapter registry
+---(`auto-run.adapters` — go + jest baseline, `register_adapter()`
+---for third parties) and the discovery core (`auto-run.discovery` —
+---position tree, bounded cancelable scans, results aggregation,
+---position execution). The auto-finder tests/debug views live in
+---auto-finder.nvim.
 ---
 ---auto-run consumes auto-core primitives ONLY (`fs.atomic`, `state`,
 ---`events`, `git.worktree`/`git.repo`, `trust`, `log`,
@@ -145,6 +151,10 @@ function M.setup(opts)
   require("auto-run.dap").setup()
   require("auto-run.dap.breakpoints").setup()
 
+  -- Phase 3: test discovery — open-buffer parse autocmds + scan
+  -- cancelation on worktree/workspace switches (§7).
+  require("auto-run.discovery").setup()
+
   M._initialized = true
   return true
 end
@@ -165,6 +175,8 @@ setmetatable(M, {
     if key == "env" then return require("auto-run.env") end
     if key == "import" then return require("auto-run.import") end
     if key == "exec" then return require("auto-run.exec") end
+    if key == "adapters" then return require("auto-run.adapters") end
+    if key == "discovery" then return require("auto-run.discovery") end
     if key == "dap" then return require("auto-run.dap") end
     if key == "breakpoints" then return require("auto-run.dap.breakpoints") end
     if key == "keymaps" then return require("auto-run.keymaps") end

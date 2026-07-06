@@ -9,6 +9,8 @@
 ---    run.status         — resolver + store status + LIVE jobs
 ---    run.validate       — whole-store schema/merge inspection
 ---    run.jobs           — session job inventory (live + exited)
+---    run.tests_list     — discovered position tree (Phase 3, §7)
+---    run.results        — last test results keyed by position id
 ---
 ---  Store mutations (data, not execution — always allowed):
 ---    run.add            — create a config
@@ -30,7 +32,8 @@
 ---    schema carries a force/bypass flag, handlers never call
 ---    trust.set, and unknown args can't smuggle one in — an agent can
 ---    never bootstrap execution trust remotely (ADR-0035 §4.5
----    wiring). run.test_run is Phase 2 scoped to kind=test CONFIGS.
+---    wiring). run.test_run runs kind=test CONFIGS (Phase 2 form) or
+---    a discovered POSITION id (Phase 3 extension — args.position).
 ---
 ---Secret values NEVER appear in verb responses — configs carry refs
 ---only, job records carry no env at all, and this module never
@@ -232,6 +235,48 @@ local function h_import(args)
   return wrap_two_value(summary, err, "import_failed")
 end
 
+-- ── discovery handlers (Phase 3, ADR-0048 §7/§11) ───────────────
+
+---@return table? discovery, table? errenv
+local function discovery_or_err()
+  local ok, mod = pcall(require, "auto-run.discovery")
+  if not ok or type(mod) ~= "table" then
+    return nil, err_response("dependency_unavailable",
+      "auto-run.discovery is not available")
+  end
+  return mod
+end
+
+local function h_tests_list(_args)
+  local discovery, errenv = discovery_or_err(); if not discovery then return errenv end
+  local okr, err = pcall(discovery.refresh_open_buffers)
+  if not okr then
+    return err_response("internal_error", tostring(err))
+  end
+  local okt, tree = pcall(discovery.tree_plain)
+  if not okt then return err_response("internal_error", tostring(tree)) end
+  local okc, counts = pcall(function() return discovery.tree():counts() end)
+  return ok_response({
+    root      = tree.path,
+    files     = okc and counts.files or 0,
+    positions = okc and counts.positions or 0,
+    tree      = tree,
+  })
+end
+
+local function h_results(_args)
+  local discovery, errenv = discovery_or_err(); if not discovery then return errenv end
+  local okr, results = pcall(discovery.results)
+  if not okr then return err_response("internal_error", tostring(results)) end
+  local count = 0
+  for _ in pairs(results) do count = count + 1 end
+  return ok_response({
+    root    = discovery.tree().root.path,
+    count   = count,
+    results = results,
+  })
+end
+
 -- ── execution handlers (Phase 2, ADR-0048 §11) ──────────────────
 
 ---@return table? exec, table? errenv
@@ -309,6 +354,29 @@ end
 
 local function h_test_run(args)
   local exec, errenv = exec_or_err(); if not exec then return errenv end
+
+  -- Phase 3 extension: a discovered position id (mutually exclusive
+  -- with the Phase 2 config-name form). Same run.exec trust gate —
+  -- checked against the position id.
+  if args.position ~= nil then
+    if type(args.position) ~= "string" or args.position == "" then
+      return err_response("invalid_args", "args.position must be a non-empty string")
+    end
+    if args.name ~= nil then
+      return err_response("invalid_args",
+        "args.name and args.position are mutually exclusive")
+    end
+    local trust_err = check_exec_trust(args.position)
+    if trust_err then return trust_err end
+    local discovery, derr = discovery_or_err(); if not discovery then return derr end
+    local launched, err = discovery.run_position(args.position)
+    if not launched then
+      local code = tostring(err):match("not found") and "not_found" or "exec_failed"
+      return err_response(code, tostring(err))
+    end
+    return ok_response(launched)
+  end
+
   if type(args.name) ~= "string" or args.name == "" then
     return err_response("invalid_args", "args.name must be a non-empty string")
   end
@@ -411,6 +479,19 @@ local SPECS = {
     handler     = h_validate,
   },
 
+  ["run.tests_list"] = {
+    owner       = OWNER,
+    description = "Discovered test-position tree for the current worktree (ADR-0048 §7): {root, files, positions, tree}. Nodes are {id, type=dir|file|namespace|test, name, path, lnum, adapter, children}; ids are `path` / `path::ns::name`. Covers open buffers by default — a prior full scan (:AutoRun scan / the tests panel) widens it. Read-only; never launches anything.",
+    schema      = {},
+    handler     = h_tests_list,
+  },
+  ["run.results"] = {
+    owner       = OWNER,
+    description = "Last test results keyed by position id: {root, count, results = {<id> = {status=passed|failed|skipped|running, duration_ms?, output?}}}. Container positions (namespace/file/dir) carry upward-aggregated statuses. Never includes env values.",
+    schema      = {},
+    handler     = h_results,
+  },
+
   ["run.add"] = {
     owner       = OWNER,
     description = "Create a run config. `config` is the full record (name + kind required). `tier` defaults to tracked when inside a git repo; `overwrite=true` replaces a same-tier file. Data mutation only — never starts anything.",
@@ -453,8 +534,8 @@ local SPECS = {
   },
   ["run.test_run"] = {
     owner       = OWNER,
-    description = "TRUST-GATED (run.exec). Phase 2 scope: kind=test CONFIGS only (plain `go test` on the configured package; discovered positions are Phase 3). Optional `package` overrides the package under test, `test_name` adds -run ^name$.",
-    schema      = { name = "string", profile = "string?", package = "string?", test_name = "string?" },
+    description = "TRUST-GATED (run.exec). Two forms: `name` runs a kind=test CONFIG (optional `package` overrides the package under test, `test_name` adds -run ^name$ — Phase 2 form); `position` runs a DISCOVERED position id from run.tests_list (test/file/namespace/dir — Phase 3 form). The forms are mutually exclusive. Results arrive asynchronously via run.results / run.results:changed.",
+    schema      = { name = "string?", position = "string?", profile = "string?", package = "string?", test_name = "string?" },
     handler     = h_test_run,
   },
   ["run.debug_start"] = {

@@ -1,5 +1,71 @@
 # Changelog
 
+## [Unreleased]
+
+ADR-0048 Phase 3 (auto-run half) — test discovery + adapters. The
+auto-finder `tests`/`debug` views are the separate auto-finder half
+of this phase. Smoke 441/0.
+
+### Added (Phase 3 — discovery + adapters)
+
+- **Adapter registry** (`auto-run.adapters`, ADR §7): the
+  `AutoRunAdapter` interface as plain functions — `root`,
+  `filter_dir`, `is_test_file`, `discover_positions`, `build_spec`,
+  `results` (no subprocess RPC in v1); `register_adapter()` for
+  third parties (validated, replace-by-name); go + jest baseline
+  adapters self-register lazily.
+- **Go adapter** (`auto-run.adapters.go`): treesitter discovery
+  (injections disabled) of `func Test*`/`Example*` (excluding
+  `TestMain`) plus `t.Run` subtests nested arbitrarily; primary-root
+  policy for nested modules (nearest `go.mod`, promoted to an
+  enclosing `go.work`, memoized); `go test -json` runs with
+  `^`-anchored slash-split `-run` regexes (test), top-level
+  alternation (file), and `./rel/...` package patterns (dir); the
+  `-json` stream lands in the per-run `stdout` file and parses back
+  to position ids via `(import path, reported name)`; an existing
+  kind=test config's effective `build_flags` + composed env apply to
+  every adapter run (gobugger `run_test` parity).
+- **Jest adapter** (`auto-run.adapters.jest`): treesitter discovery
+  of `describe` (namespace) and `it`/`test` (+ `fdescribe`/`xit`/…
+  aliases and `.only`/`.skip`/`.todo`/`.failing` modifiers) across
+  js/jsx/ts/tsx; one root per `package.json` (memoized); runs the
+  project-local `node_modules/.bin/jest` (package dir first, hoisted
+  parents up to the worktree) with `--json --outputFile=<per-run
+  file>` and a regex-escaped ancestor-joined `--testNamePattern`;
+  results parse from the output file via `ancestorTitles` + `title`.
+- **Discovery core** (`auto-run.discovery`, ADR §7): position tree
+  `dir → file → namespace → test` with ids `path::ns::name` and a
+  flat `_nodes` map (O(1) lookup); worktree-anchored via
+  `resolve_run_dirs()` (never getcwd); the walk prunes hidden dirs,
+  `list_child_repos()`'s known child repos AND any dir carrying a
+  `.git` entry (dir or gitfile) independently; open-buffers default
+  discovery (BufReadPost parse + BufWritePost re-parse) plus a
+  bounded, cancelable, chunked full `scan()` — caps (default 5,000
+  candidate files / 200 roots, `discovery.max_*` config) abort with
+  a structured cap report + warn log, a second scan / worktree
+  switch / `cancel()` supersedes the in-flight walk, and re-scans
+  skip unchanged files via a per-file mtime cache; core-side upward
+  status aggregation + missing-result filling (unreported scope
+  positions fill `skipped`, or `failed` when the runner died without
+  reporting) and fallback decomposition (`build_spec` nil → dir →
+  files → tests); `run_position()` routes through the exec job
+  engine, `debug_position()` through the Phase 2 `dap.debug_test`
+  path.
+- **Events live**: `run.discovery:changed` (parse/scan) and
+  `run.results:changed` (running marks + parsed results) now publish
+  on the topics registered in Phase 1.
+- **Mailbox** (ADR §11): `run.tests_list` (serializable position
+  tree) and `run.results` (last results keyed by position id) go
+  live; `run.test_run` gains the trust-gated `position` form
+  (mutually exclusive with the Phase 2 `name` form, same `run.exec`
+  capability, still force-incapable).
+- **:AutoRun** gains `tests` (rendered position tree with status
+  glyphs) and `scan` (bounded full scan with a printed report);
+  `doctor` gains the test-discovery section (adapter roster,
+  per-adapter root at the anchor, discovery snapshot).
+- **Config**: `discovery = { max_files = 5000, max_roots = 200,
+  open_buffers = true }`.
+
 ## [v0.1.0] — 2026-07-06
 
 ADR-0048 Phases 1–2 — core store + env engine, execution + DAP.
