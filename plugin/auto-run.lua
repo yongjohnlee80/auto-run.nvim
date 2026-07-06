@@ -162,6 +162,9 @@ function HANDLERS.doctor()
   if okb then
     lines[#lines + 1] = row("file", bp.file)
     lines[#lines + 1] = row("breakpoints", ("%d across %d file(s)"):format(bp.count, bp.files))
+    if bp.error then
+      lines[#lines + 1] = row("store error", tostring(bp.error))
+    end
   else
     lines[#lines + 1] = row("store", "unavailable (" .. tostring(bp) .. ")")
   end

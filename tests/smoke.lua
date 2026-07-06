@@ -23,6 +23,10 @@
 --   [14] breakpoints — reconcile sweep + sync tunables
 --   [15] breakpoints — stale-line drop on restore
 --   [16] breakpoints — worktree-relative rehydration (two worktrees)
+--   [17] :AutoRun Phase 2 subcommands
+--   [18] store — corrupt overrides.json is fatal (layer 6 must-fix)
+--   [19] exec — term strategy env-file cleanup lifecycle
+--   [20] breakpoints — corrupt breakpoints.json diagnostics
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -600,6 +604,28 @@ ok("required=false command failure degrades with a warning",
   res ~= nil and res.env.SOFT == nil and #res.warnings > 0,
   res and vim.inspect(res.warnings))
 
+-- command_env timeout policy (env.command_timeout_ms knob).
+do
+  require("auto-run.config").setup({ env = { command_timeout_ms = 100 } })
+  local tres, terr = envmod.compose(
+    { name = "slow", kind = "run",
+      command_env = { { key = "SLOW", command = "sleep 5", required = true } } },
+    { ctx = ctx })
+  ok("command_env timeout fails composition (100ms vs sleep 5)", tres == nil)
+  ok("…with code=command_env_timeout naming key + command",
+    terr and terr.code == "command_env_timeout" and terr.key == "SLOW"
+      and terr.command == "sleep 5", vim.inspect(terr))
+  local sres = envmod.compose(
+    { name = "slow-soft", kind = "run",
+      command_env = { { key = "SLOW", command = "sleep 5", required = false } } },
+    { ctx = ctx })
+  ok("required=false timeout degrades with a warning (skip, no abort)",
+    sres ~= nil and sres.env.SLOW == nil and #sres.warnings > 0
+      and tostring(sres.warnings[1]):find("timed out", 1, true) ~= nil,
+    sres and vim.inspect(sres.warnings))
+  require("auto-run.config").setup({})
+end
+
 -- Missing env file aborts composition.
 res, cerr = envmod.compose(
   { name = "x", kind = "run", env_files = { envfx .. "/missing.env" } },
@@ -623,10 +649,66 @@ ok("materialized file is 0600",
 ok("parent dir is 0700",
   dir_st and bit.band(dir_st.mode, 511) == 448,
   dir_st and ("mode=%o"):format(bit.band(dir_st.mode, 511)))
-ok("materialized content is KEY=VALUE lines",
-  table.concat(vim.fn.readfile(mat_path), "\n") == "KEY_A=va\nKEY_B=vb")
+ok("materialized content is KEY='VALUE' lines (shell-quoted values)",
+  table.concat(vim.fn.readfile(mat_path), "\n") == "KEY_A='va'\nKEY_B='vb'")
 local bad_id = envmod.materialize("../escape", { A = "1" })
 ok("path-unsafe run ids refused", bad_id == nil)
+
+-- Shell-safety: hostile values must round-trip LITERALLY through the
+-- sourced env file (the term-strategy consumption path) and can never
+-- execute; invalid keys fail composition/materialization up front.
+do
+  local marker = fx .. "/env-cache-pwn-marker"
+  local hostile = {
+    name = "hostile", kind = "run",
+    env = {
+      V_SPACES   = "hello world",
+      V_DQUOTE   = 'say "hi"',
+      V_SQUOTE   = "it's a value",
+      V_DOLLAR   = "$HOME literal",
+      V_BACKTICK = "`id`",
+      V_SUBST    = "$(touch " .. marker .. ")",
+    },
+  }
+  local hres, herr = envmod.compose(hostile, { ctx = ctx })
+  ok("hostile values compose", hres ~= nil, vim.inspect(herr))
+  local hpath, hmerr = envmod.materialize("run-hostile", hres.env)
+  ok("hostile env materializes", hpath ~= nil, tostring(hmerr))
+  local script = ("set -a; . %s; set +a; "
+    .. "printf '%%s\\n' \"$V_SPACES\" \"$V_DQUOTE\" \"$V_SQUOTE\""
+    .. " \"$V_DOLLAR\" \"$V_BACKTICK\" \"$V_SUBST\"")
+    :format(vim.fn.shellescape(hpath))
+  local sres = vim.system({ "sh", "-c", script }, { text = true }):wait()
+  ok("sourcing the materialized file succeeds",
+    sres.code == 0, tostring(sres.stderr))
+  local got = vim.split(sres.stdout or "", "\n")
+  ok("spaces round-trip literally", got[1] == "hello world", got[1])
+  ok("double quotes round-trip literally", got[2] == 'say "hi"', got[2])
+  ok("single quotes round-trip literally", got[3] == "it's a value", got[3])
+  ok("$VAR stays literal (no expansion)", got[4] == "$HOME literal", got[4])
+  ok("backticks stay literal", got[5] == "`id`", got[5])
+  ok("command substitution stays literal",
+    got[6] == "$(touch " .. marker .. ")", got[6])
+  ok("marker file was NOT created (no code execution)",
+    vim.fn.filereadable(marker) == 0)
+  envmod.discard("run-hostile")
+
+  -- Invalid keys: composition fails structured, materialize refuses.
+  write_file(envfx .. "/badkey.env", "BAD-KEY=1\n")
+  local bres, berr = envmod.compose(
+    { name = "x", kind = "run", env_files = { envfx .. "/badkey.env" } },
+    { ctx = ctx })
+  ok("invalid env key fails composition", bres == nil)
+  ok("…with code=invalid_env_key naming the key",
+    berr and berr.code == "invalid_env_key" and berr.key == "BAD-KEY",
+    vim.inspect(berr))
+  local mpath, mkerr = envmod.materialize("run-badkey", { ["BAD KEY"] = "x" })
+  ok("materialize refuses invalid keys (structured error names the key)",
+    mpath == nil and tostring(mkerr):find("BAD KEY", 1, true) ~= nil,
+    tostring(mkerr))
+  ok("nothing written for the refused materialization",
+    vim.fn.filereadable(fx .. "/env-cache/run-badkey.env") == 0)
+end
 
 -- Startup sweep: >24h-old files removed, fresh ones kept.
 local old_path = envmod.materialize("run-old", { A = "1" })
@@ -1433,6 +1515,187 @@ do
     pcall(vim.cmd, "AutoRun doctor"))
   local okc = pcall(vim.cmd, "AutoRun stop not-a-job")
   ok(":AutoRun stop unknown id errors gracefully", okc)
+end
+
+-- ── [18] store — corrupt overrides.json is FATAL (layer 6) ──────
+print("\n[18] store — corrupt overrides.json fails get/show/validate/start")
+do
+  worktree.set_active(plain)
+  local ofile = plain .. "/.auto-run/local/overrides.json"
+  local original = table.concat(vim.fn.readfile(ofile), "\n")
+  write_file(ofile, "{ this is not json !!")
+
+  -- get() of ANY config fails — the overlay is meaningful config.
+  local eff, gerr = store.get("go-base")
+  ok("store.get fails on a corrupt overrides layer", eff == nil)
+  ok("…with structured code=overrides_corrupt + file",
+    type(gerr) == "table" and gerr.code == "overrides_corrupt"
+      and gerr.file == ofile, vim.inspect(gerr))
+  ok("…that stringifies to a readable message",
+    tostring(gerr):find("overrides layer unreadable", 1, true) ~= nil,
+    tostring(gerr))
+
+  -- list() annotates every entry rather than aborting the listing.
+  local inv = store.list()
+  local annotated = #inv > 0
+  for _, c in ipairs(inv) do
+    if not (type(c.error) == "table" and c.error.code == "overrides_corrupt") then
+      annotated = false
+    end
+  end
+  ok("store.list annotates every config with the overrides error",
+    annotated, vim.inspect(inv))
+
+  -- run.show surfaces the code through the envelope.
+  local env_show = commands.get("run.show").handler({ name = "go-base" })
+  ok("run.show surfaces code=overrides_corrupt",
+    env_show.ok == false and env_show.code == "overrides_corrupt",
+    vim.inspect(env_show))
+
+  -- validate() reports the file (parse issue).
+  local report = store.validate()
+  local flagged = false
+  for _, issue in ipairs(report.issues) do
+    if issue.file == ofile then flagged = true end
+  end
+  ok("validate() reports the overrides.json file",
+    report.ok == false and flagged, vim.inspect(report.issues))
+  local env_val = commands.get("run.validate").handler({})
+  local verb_flagged = false
+  for _, issue in ipairs(env_val.value and env_val.value.issues or {}) do
+    if issue.file == ofile then verb_flagged = true end
+  end
+  ok("run.validate reports the file too",
+    env_val.ok == true and verb_flagged, vim.inspect(env_val))
+
+  -- exec refuses to launch on a corrupt overrides layer.
+  local launched, lerr, detail = P2.exec.start("go-base")
+  ok("exec.start refuses to launch",
+    launched == nil and type(detail) == "table"
+      and detail.code == "overrides_corrupt", tostring(lerr))
+
+  -- …and the trust-gated mailbox verb maps the code ([12] ack'd).
+  trust.set("run.exec", { enabled = true })
+  local env_start = commands.get("run.start").handler({ name = "go-base" })
+  ok("run.start refuses with code=overrides_corrupt",
+    env_start.ok == false and env_start.code == "overrides_corrupt",
+    vim.inspect(env_start))
+  trust.set("run.exec", { enabled = false })
+
+  -- Shape issues (valid JSON, non-object entry) surface in validate().
+  write_file(ofile, '{ "go-base": "not-an-object" }')
+  report = store.validate()
+  local shape_flagged = false
+  for _, issue in ipairs(report.issues) do
+    if issue.file == ofile then
+      for _, e in ipairs(issue.errors) do
+        if e:find("must be a JSON object", 1, true) then shape_flagged = true end
+      end
+    end
+  end
+  ok("validate() flags a non-object overrides entry",
+    shape_flagged, vim.inspect(report.issues))
+
+  write_file(ofile, original .. "\n")
+  ok("restored overrides → get() recovers",
+    store.get("go-base") ~= nil)
+end
+
+-- ── [19] exec — term strategy env-file cleanup lifecycle ────────
+print("\n[19] exec — term env-file cleanup (should-fix, §4.1)")
+do
+  worktree.set_active(plain)
+  local strategies = P2.strategies
+
+  -- Provider failure → the materialized file is discarded NOW.
+  local failed_spec
+  strategies.register_terminal_provider(function(spec)
+    failed_spec = spec
+    return nil, "provider exploded"
+  end)
+  local launched, lerr = P2.exec.start("term-cfg", { strategy = "term" })
+  ok("provider failure fails the launch",
+    launched == nil and tostring(lerr):find("provider exploded", 1, true) ~= nil,
+    tostring(lerr))
+  ok("provider saw a materialized env file",
+    failed_spec ~= nil and failed_spec.env_file ~= nil)
+  ok("env file discarded immediately on provider failure",
+    failed_spec and vim.fn.filereadable(failed_spec.env_file) == 0)
+
+  -- Provider success: the cleanup hook rides in the spec; invoking it
+  -- (terminal session end) discards the file.
+  local live_spec
+  strategies.register_terminal_provider(function(spec)
+    live_spec = spec
+    return true
+  end)
+  local launched2, lerr2 = P2.exec.start("term-cfg", { strategy = "term" })
+  ok("term launch succeeds", launched2 ~= nil, tostring(lerr2))
+  ok("cleanup hook handed to the provider (spec.on_exit)",
+    live_spec ~= nil and type(live_spec.on_exit) == "function")
+  ok("env file live while the session runs",
+    vim.fn.filereadable(live_spec.env_file) == 1)
+  live_spec.on_exit()
+  ok("provider-invoked cleanup discards the env file",
+    vim.fn.filereadable(live_spec.env_file) == 0)
+  ok("cleanup hook is idempotent", pcall(live_spec.on_exit) == true)
+
+  strategies.register_terminal_provider(nil)
+end
+
+-- ── [20] breakpoints — corrupt breakpoints.json diagnostics ─────
+print("\n[20] breakpoints — corrupt store surfaces, never overwritten")
+do
+  worktree.set_active(container .. "/main")
+  local bfile = container .. "/.auto-run/breakpoints.json"
+  local corrupt = "{ definitely not json ]]"
+  write_file(bfile, corrupt)
+  local function slurp(p)
+    local f = assert(io.open(p, "r"))
+    local s = f:read("*a")
+    f:close()
+    return s
+  end
+
+  local stats = P2.bps.stats()
+  ok("stats() surfaces the read error",
+    type(stats.error) == "string"
+      and stats.error:find("invalid JSON", 1, true) ~= nil, vim.inspect(stats))
+  ok("stats() reports zero counts alongside the error",
+    stats.count == 0 and stats.files == 0)
+
+  -- restore(): applies nothing, writes nothing.
+  vim.cmd.edit(container .. "/main/src/app.lua")
+  local buf = vim.api.nvim_get_current_buf()
+  local applied = P2.bps.restore(buf)
+  ok("restore() skips a corrupt store (applies nothing)", applied == 0)
+  ok("restore() left the corrupt file byte-identical",
+    slurp(bfile) == corrupt)
+
+  -- reconcile(): live registry untouched, store never overwritten.
+  local live_before = vim.deepcopy(require("dap.breakpoints").get())
+  local changed, count = P2.bps.reconcile()
+  ok("reconcile() refuses to write over a corrupt store",
+    changed == false and count == 0)
+  ok("reconcile() left the corrupt file byte-identical",
+    slurp(bfile) == corrupt)
+  ok("live registry untouched by the skipped reconcile",
+    vim.deep_equal(require("dap.breakpoints").get(), live_before))
+
+  -- Diagnostics render it: doctor + run.status.
+  local doc = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok(":AutoRun doctor mentions the corrupt breakpoint store",
+    doc:find("invalid JSON", 1, true) ~= nil)
+  local env_status = commands.get("run.status").handler({})
+  ok("run.status carries breakpoint stats with the error",
+    env_status.ok == true
+      and type(env_status.value.breakpoints) == "table"
+      and tostring(env_status.value.breakpoints.error)
+        :find("invalid JSON", 1, true) ~= nil,
+    vim.inspect(env_status.value and env_status.value.breakpoints))
+
+  -- Restore a valid empty store for a clean exit flush.
+  write_file(bfile, vim.json.encode({ version = 1, breakpoints = {} }) .. "\n")
 end
 
 -- ── summary ─────────────────────────────────────────────────────

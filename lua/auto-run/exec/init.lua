@@ -71,7 +71,11 @@ local function prepare(name, opts)
   end
   local store = require("auto-run.store")
   local eff, gerr = store.get(name, { profile = opts.profile, args = opts.args })
-  if not eff then return nil, gerr end
+  if not eff then
+    -- Structured store errors (e.g. overrides_corrupt) ride along as
+    -- `detail` so mailbox handlers can map their code.
+    return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+  end
 
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()
@@ -157,7 +161,9 @@ function M.start(name, opts)
   -- env composition (the dap bridge composes on its own path).
   local store = require("auto-run.store")
   local eff0, gerr = store.get(name, { profile = opts.profile, args = opts.args })
-  if not eff0 then return nil, gerr end
+  if not eff0 then
+    return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+  end
 
   local strategy, serr = strategies.resolve(eff0.kind, opts)
   if not strategy then return nil, serr end
@@ -198,6 +204,14 @@ function M.start(name, opts)
       if not path then return nil, m_err end
       env_file = path
     end
+    -- §4.1 cleanup hook: handed to the provider as `spec.on_exit` so
+    -- the materialized env file dies with the terminal session; also
+    -- invoked directly when the provider refuses the launch.
+    -- Idempotent (discard is best-effort). A provider that accepts
+    -- but never calls it leaves the file to the startup sweep.
+    local function cleanup()
+      if env_file then env_mod.discard(run_id) end
+    end
     local provider, source = strategies.terminal_provider()
     local spec = {
       cmd      = argv,
@@ -207,9 +221,13 @@ function M.start(name, opts)
       env_file = env_file,
       config   = name,
       run_id   = run_id,
+      on_exit  = cleanup,
     }
     local okp, p_err = provider(spec)
-    if not okp then return nil, p_err or "terminal provider failed" end
+    if not okp then
+      cleanup()  -- provider failure: the env file is discarded NOW
+      return nil, p_err or "terminal provider failed"
+    end
     M.remember_pick(prep.eff.kind, name)
     _last_launch = { name = name, opts = replay_opts }
     log.debug("exec", ("term launch %s via %s provider"):format(run_id, source))
@@ -264,7 +282,9 @@ function M.test_run(name, opts)
   opts = opts or {}
   local store = require("auto-run.store")
   local eff, gerr = store.get(name, { profile = opts.profile, args = opts.args })
-  if not eff then return nil, gerr end
+  if not eff then
+    return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+  end
   if eff.kind ~= "test" then
     return nil, "run.test_run supports kind=test configs only in Phase 2 "
       .. "(config '" .. name .. "' is kind=" .. tostring(eff.kind) .. ")"

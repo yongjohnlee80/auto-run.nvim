@@ -98,6 +98,33 @@ Phase 2 test scope: `test_run` drives **kind=test configs** (plain
 the config's buildFlags/env merged in). Position-level discovery is
 Phase 3.
 
+### Env materialization lifecycle (ADR §4.1)
+
+Env is re-composed per launch and only leaves the process as a `0600`
+file under `stdpath("cache")/auto-run/env/` when the `term` strategy
+needs it. Composed keys must be valid environment-variable names
+(`[A-Za-z_][A-Za-z0-9_]*` — anything else fails composition with
+`invalid_env_key`), and values in the materialized file are
+single-quoted (`'\''`-escaped) so sourcing the file can never execute
+value text as shell code. The `run`/`dap` strategies pass env
+programmatically (unquoted table) and never touch a file unless
+materialized for `term`.
+
+File retention:
+
+- **`run` strategy** — the per-run env file (when any) is deleted on
+  job exit.
+- **`term` strategy** — deleted immediately when the provider refuses
+  the launch; accepted launches hand the provider a `spec.on_exit`
+  cleanup hook to call when the terminal session ends (the builtin
+  fallback wires it to the terminal job's exit). A provider that
+  accepts but never signals exit leaves the file to the startup sweep
+  (`env.sweep_max_age_hours`, default 24h).
+- **`command_env` entries** run with a per-entry budget of
+  `env.command_timeout_ms` (default 10000 ms): a timeout fails
+  composition with `command_env_timeout` for required entries and
+  warns + skips entries with `required = false`.
+
 ### Breakpoint persistence
 
 Breakpoints persist per repo at

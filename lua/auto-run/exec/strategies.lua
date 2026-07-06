@@ -58,6 +58,7 @@ end
 ---@field env_file string?             materialized 0600 env file (path reference only)
 ---@field config string                config name
 ---@field run_id string
+---@field on_exit fun()?               cleanup hook — providers SHOULD call it when the terminal session ends (discards the materialized env file; idempotent)
 
 ---@type (fun(spec: AutoRunTermSpec): boolean?, string?)|nil
 local _provider = nil
@@ -94,7 +95,8 @@ end
 
 ---Builtin fallback: bottom split + terminal job. env is passed
 ---programmatically (jobstart `env` opt), so nothing sensitive is
----rendered anywhere.
+---rendered anywhere. The spec's cleanup hook fires when the terminal
+---job exits (env-file lifecycle, §4.1).
 ---@param spec AutoRunTermSpec
 ---@return boolean? ok, string? err
 local function builtin_provider(spec)
@@ -104,6 +106,9 @@ local function builtin_provider(spec)
     local job_opts = { term = true }
     if spec.cwd then job_opts.cwd = spec.cwd end
     if spec.env and next(spec.env) then job_opts.env = spec.env end
+    if type(spec.on_exit) == "function" then
+      job_opts.on_exit = function() pcall(spec.on_exit) end
+    end
     local jid = vim.fn.jobstart(spec.cmd, job_opts)
     if jid <= 0 then error("jobstart failed (" .. tostring(jid) .. ")") end
   end)

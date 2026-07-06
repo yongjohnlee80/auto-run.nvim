@@ -46,6 +46,22 @@ local function publish(topic, payload)
   if ok and events then pcall(events.publish, topic, payload) end
 end
 
+-- ── structured errors ───────────────────────────────────────────
+
+---A structured store error: a table carrying `code` (+ context
+---fields) that stringifies to its message, so every existing
+---`tostring(err)` / string-format call site keeps working while
+---mailbox handlers can map `err.code` onto envelope codes.
+---@param code string
+---@param message string
+---@param fields table?
+---@return table
+local function structured_err(code, message, fields)
+  local e = vim.tbl_extend("force", { code = code, message = message },
+    fields or {})
+  return setmetatable(e, { __tostring = function(self) return self.message end })
+end
+
 -- ── strict-JSON IO ──────────────────────────────────────────────
 
 ---Read + decode one strict-JSON file. `(nil, nil)` when the file
@@ -226,11 +242,19 @@ end
 
 -- ── overrides.json (merge layer 6) ──────────────────────────────
 
+---Parse the shared tier's overrides.json. A corrupt file is FATAL
+---for every effective-config read that depends on layer 6 —
+---tombstones in overrides are meaningful config, so this never
+---degrades to "empty overlay" (ADR-0048 §3.1 hard diagnostics).
 ---@param dirs AutoRunDirs
----@return table entries, string? err
+---@return table? entries, table? err  structured {code="overrides_corrupt", file=...}
 local function read_overrides(dirs)
-  local data, err = read_json(paths.overrides_file(dirs.shared))
-  if err then return {}, err end
+  local file = paths.overrides_file(dirs.shared)
+  local data, err = read_json(file)
+  if err then
+    return nil, structured_err("overrides_corrupt",
+      "overrides layer unreadable: " .. tostring(err), { file = file })
+  end
   return data or {}, nil
 end
 
@@ -344,10 +368,12 @@ end
 ---Effective config for `name`. Layers per §3.1; `meta` (third return)
 ---carries `layers` (source labels applied, in order) and `provenance`
 ---(field → last source). Errors are structured strings — extends
----cycles include the full path.
+---cycles include the full path. A corrupt overrides.json is a
+---structured TABLE error ({code="overrides_corrupt", file=...}) that
+---stringifies to its message.
 ---@param name string
 ---@param opts AutoRunGetOpts?
----@return table? effective, string? err, { layers: string[], provenance: table<string,string> }? meta
+---@return table? effective, (string|table)? err, { layers: string[], provenance: table<string,string> }? meta
 function M.get(name, opts)
   opts = opts or {}
   if type(name) ~= "string" or name == "" then
@@ -373,8 +399,10 @@ function M.get(name, opts)
 
   -- Overrides entry (layer 6) + invocation args (layer 7) are known
   -- up front; the profile NAME may come from any of them, so resolve
-  -- the name against a preview merge before inserting layer 5.
-  local overrides = read_overrides(dirs)
+  -- the name against a preview merge before inserting layer 5. A
+  -- corrupt overrides layer is fatal here — never silently empty.
+  local overrides, ov_err = read_overrides(dirs)
+  if not overrides then return nil, ov_err end
   local override_layer = type(overrides[name]) == "table"
     and { data = overrides[name], source = "overrides" } or nil
   local invocation_layer = type(opts.args) == "table"
@@ -626,12 +654,13 @@ function M.remove(name, opts)
   local unlinked, derr = vim.uv.fs_unlink(target)
   if not unlinked then return false, "unlink: " .. tostring(derr) end
 
-  -- Drop the overlay entry once the name is gone from both tiers.
+  -- Drop the overlay entry once the name is gone from both tiers
+  -- (best-effort: a corrupt overrides file is left for validate()).
   local still_tracked = tracked_path and fs_path.is_file(tracked_path)
   local still_shared = fs_path.is_file(shared_path)
   if not still_tracked and not still_shared then
     local entries = read_overrides(dirs)
-    if entries[name] ~= nil then
+    if entries and entries[name] ~= nil then
       entries[name] = nil
       write_overrides(dirs, entries)
     end
@@ -658,9 +687,11 @@ end
 
 -- ── validate (whole-store inspection) ───────────────────────────
 
----Schema-check every config + profile file in both tiers, then run
----extends resolution for every config name (cycles, dangling
----targets). Backs `:AutoRun validate` and the `run.validate` verb.
+---Schema-check every config + profile file in both tiers, inspect
+---the shared tier's overrides.json (parse + per-entry fragment
+---shape), then run extends resolution for every config name (cycles,
+---dangling targets). Backs `:AutoRun validate` and the `run.validate`
+---verb.
 ---@return { ok: boolean, checked: integer, issues: { file: string?, name: string, tier: string?, errors: string[] }[] }
 function M.validate()
   local dirs = paths.resolve_run_dirs()
@@ -692,6 +723,37 @@ function M.validate()
 
   check_tier(dirs.tracked, "tracked")
   check_tier(dirs.shared, "shared")
+
+  -- overrides.json (merge layer 6): parse + per-entry shape. A corrupt
+  -- overlay silently disabling local overrides is the ADR's explicit
+  -- hard-diagnostics case, so it surfaces here with the file path.
+  local overrides_path = paths.overrides_file(dirs.shared)
+  if fs_path.is_file(overrides_path) then
+    checked = checked + 1
+    local odata, oerr = read_json(overrides_path)
+    if oerr then
+      issues[#issues + 1] = { file = overrides_path, name = "overrides.json",
+        tier = "shared", errors = { oerr } }
+    else
+      for oname, entry in pairs(odata or {}) do
+        if type(entry) ~= "table" or entry == vim.NIL then
+          issues[#issues + 1] = { file = overrides_path, name = "overrides.json",
+            tier = "shared",
+            errors = { "entry '" .. tostring(oname) .. "' must be a JSON object" } }
+        else
+          local v = schema.validate_config_fragment(entry)
+          if not v.ok then
+            local errs = {}
+            for _, e in ipairs(v.errors) do
+              errs[#errs + 1] = "entry '" .. tostring(oname) .. "': " .. e
+            end
+            issues[#issues + 1] = { file = overrides_path, name = "overrides.json",
+              tier = "shared", errors = errs }
+          end
+        end
+      end
+    end
+  end
 
   -- Cross-file checks: extends resolution over the union of names.
   local shims = shim_layer(dirs)

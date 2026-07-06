@@ -27,12 +27,44 @@
 ---swept at startup when older than 24h. Secret VALUES never enter
 ---logs, events, or return envelopes reachable from the mailbox —
 ---composition results stay in-process.
+---
+---Shell hygiene: composed keys must be valid environment-variable
+---names (`[A-Za-z_][A-Za-z0-9_]*` — composition fails otherwise), and
+---the materialized file — the ONLY serialization ever sourced by a
+---shell (`. <file>` in the term strategy) — single-quotes every value
+---with `'\''` escaping so values can never execute as program text.
+---The run-strategy path hands the composed table to vim.system
+---UNquoted; the two serializations are deliberately separate.
 ---@module 'auto-run.env'
 
 local fs_path = require("auto-core.fs.path")
 local log = require("auto-run.log")
 
 local M = {}
+
+-- ── env-key / shell-value hygiene ───────────────────────────────
+
+---POSIX environment-variable name: letters/digits/underscore, no
+---leading digit. Anything else cannot be represented safely in a
+---shell-sourced env file, so composition refuses it up front.
+local ENV_KEY_PATTERN = "^[A-Za-z_][A-Za-z0-9_]*$"
+
+---Is `key` a valid environment-variable name?
+---@param key any
+---@return boolean
+function M.valid_env_key(key)
+  return type(key) == "string" and key:match(ENV_KEY_PATTERN) ~= nil
+end
+
+---Single-quote a value for POSIX shell sourcing (`'` → `'\''`).
+---ONLY for the materialized-file serialization consumed via
+---`. <file>` — the run-strategy path passes env as a vim.system
+---table and must never receive quoted values.
+---@param value string
+---@return string
+local function shell_single_quote(value)
+  return "'" .. value:gsub("'", "'\\''") .. "'"
+end
 
 -- ── substitution engine ─────────────────────────────────────────
 
@@ -249,7 +281,7 @@ end
 ---@field unresolved string[]
 
 ---@class AutoRunComposeError
----@field code string      "trust_required"|"command_env_failed"|"env_file_missing"|"manifest_missing"|"secret_resolver_failed"
+---@field code string      "trust_required"|"command_env_failed"|"command_env_timeout"|"env_file_missing"|"manifest_missing"|"secret_resolver_failed"|"invalid_env_key"
 ---@field message string
 ---@field capability string?
 ---@field command string?
@@ -351,8 +383,28 @@ function M.compose(cfg, opts)
           .. "acknowledge + enable it interactively first",
       }
     end
-    local res = vim.system({ "sh", "-c", cmd }, { text = true }):wait()
-    if res.code ~= 0 then
+    -- Timeout policy: composition sits on interactive + mailbox
+    -- launch paths, so a hung command must never block the UI
+    -- indefinitely (env.command_timeout_ms, default 10000).
+    local timeout_ms = require("auto-run.config").options.env.command_timeout_ms
+      or 10000
+    local res = vim.system({ "sh", "-c", cmd },
+      { text = true, timeout = timeout_ms }):wait()
+    local timed_out = res.code == 124 and (res.signal == 15 or res.signal == 9)
+    if timed_out then
+      if entry.required == false then
+        warnings[#warnings + 1] = "command_env '" .. entry.key
+          .. "' timed out after " .. timeout_ms .. "ms; skipped (required=false)"
+      else
+        return nil, {
+          code    = "command_env_timeout",
+          key     = entry.key,
+          command = cmd,
+          message = "command_env '" .. entry.key .. "' timed out after "
+            .. timeout_ms .. "ms (env.command_timeout_ms)",
+        }
+      end
+    elseif res.code ~= 0 then
       if entry.required == false then
         warnings[#warnings + 1] = "command_env '" .. entry.key
           .. "' failed (exit " .. tostring(res.code) .. "); skipped (required=false)"
@@ -380,6 +432,21 @@ function M.compose(cfg, opts)
   -- 6. config-level inline env (non-secret; per-key, last wins).
   for k, v in pairs(cfg.env or {}) do
     if type(v) == "string" then composed[k] = sub(v) end
+  end
+
+  -- Key hygiene: every composed name must be a valid environment
+  -- variable name — anything else cannot be materialized safely and
+  -- fails composition up front (never written anywhere).
+  for k in pairs(composed) do
+    if not M.valid_env_key(k) then
+      return nil, {
+        code    = "invalid_env_key",
+        key     = tostring(k),
+        message = "composed env key '" .. tostring(k)
+          .. "' is not a valid environment variable name"
+          .. " ([A-Za-z_][A-Za-z0-9_]*)",
+      }
+    end
   end
 
   local keys = {}
@@ -427,6 +494,12 @@ end
 ---`<materialize_dir>/<run-id>.env`, mode 0600 (parent 0700), written
 ---atomically (temp + rename, both inside the private dir). One file
 ---per run id; every launch re-composes.
+---
+---This file is consumed by POSIX `. <file>` sourcing (term strategy):
+---keys are validated as env-var names and values are single-quoted
+---with `'\''` escaping, so values can never be read as shell program
+---text. Do NOT reuse this serializer for the run-strategy path — that
+---one hands the composed table to vim.system unquoted.
 ---@param run_id string
 ---@param env table<string, string>
 ---@return string? path, string? err
@@ -438,16 +511,23 @@ function M.materialize(run_id, env)
     return nil, "materialize: env must be a table"
   end
 
+  local keys = {}
+  for k in pairs(env) do
+    if not M.valid_env_key(k) then
+      return nil, "materialize: invalid env key '" .. tostring(k)
+        .. "' (must match [A-Za-z_][A-Za-z0-9_]*); nothing written"
+    end
+    keys[#keys + 1] = k
+  end
+  table.sort(keys)
+
   local dir = M.materialize_dir()
   local okd, derr = ensure_private_dir(dir)
   if not okd then return nil, derr end
 
-  local keys = {}
-  for k in pairs(env) do keys[#keys + 1] = k end
-  table.sort(keys)
   local lines = {}
   for _, k in ipairs(keys) do
-    lines[#lines + 1] = k .. "=" .. tostring(env[k])
+    lines[#lines + 1] = k .. "=" .. shell_single_quote(tostring(env[k]))
   end
   local text = table.concat(lines, "\n") .. (#lines > 0 and "\n" or "")
 

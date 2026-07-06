@@ -247,7 +247,9 @@ function M.translate(name, opts)
   opts = opts or {}
   local store = require("auto-run.store")
   local eff, gerr = store.get(name, { profile = opts.profile, args = opts.args })
-  if not eff then return nil, gerr end
+  if not eff then
+    return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+  end
 
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()
@@ -375,7 +377,9 @@ function M.debug_test(name, opts)
   if name ~= nil then
     local store = require("auto-run.store")
     local eff, gerr = store.get(name, { profile = opts.profile, args = opts.args })
-    if not eff then return nil, gerr end
+    if not eff then
+      return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+    end
     if eff.kind ~= "test" then
       return nil, "debug_test needs a kind=test config (got kind="
         .. tostring(eff.kind) .. ")"

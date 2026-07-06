@@ -15,8 +15,17 @@ M.defaults = {
     ---to `stdpath("cache") .. "/auto-run/env"` — NEVER inside a repo.
     dir = nil,
     ---Startup sweep removes materialized files older than this many
-    ---hours (crash leftovers; per-run files are deleted on job exit).
+    ---hours. run-strategy files are deleted on job exit and
+    ---term-strategy files on provider failure or via the provider's
+    ---`spec.on_exit` cleanup hook — a term provider that accepts a
+    ---launch but never signals exit leaves its file to this sweep
+    ---(crash-leftover safety net, ADR-0048 §4.1).
     sweep_max_age_hours = 24,
+    ---Per-entry timeout (ms) for trust-gated `command_env` commands
+    ---during composition. A timeout fails composition with
+    ---code=command_env_timeout for required entries and warns +
+    ---skips for `required = false`.
+    command_timeout_ms = 10000,
   },
   ---launch.json interop (ADR-0048 §5).
   import = {

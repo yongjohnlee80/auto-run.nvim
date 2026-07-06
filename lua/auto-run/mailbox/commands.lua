@@ -99,7 +99,13 @@ local function h_show(args)
     opts.profile = args.profile
   end
   local eff, err, meta = store.get(args.name, opts)
-  if not eff then return err_response("not_found", tostring(err)) end
+  if not eff then
+    -- Structured store errors (e.g. overrides_corrupt) carry their
+    -- own envelope code; everything else is a lookup failure.
+    local code = (type(err) == "table" and type(err.code) == "string")
+      and err.code or "not_found"
+    return err_response(code, tostring(err))
+  end
   return ok_response({
     config     = eff,
     layers     = meta and meta.layers or {},
@@ -125,6 +131,12 @@ local function h_status(_args)
     local okl, jobs = pcall(exec.list, { active_only = true })
     if okl then status.jobs = jobs end
   end
+  -- Breakpoint-store stats (§9) — `error` carries the read failure
+  -- when the persisted file is corrupt (never masked as 0 records).
+  local okb, bstats = pcall(function()
+    return require("auto-run.dap.breakpoints").stats()
+  end)
+  if okb then status.breakpoints = bstats end
   return ok_response(status)
 end
 
@@ -163,7 +175,8 @@ local function h_update(args)
   end
   local result, err = store.update(args.name, args.patch)
   if not result then
-    local code = tostring(err):match("launch%.json shim") and "import_required"
+    local code = (type(err) == "table" and type(err.code) == "string") and err.code
+      or (tostring(err):match("launch%.json shim") and "import_required")
       or (tostring(err):match("not found") and "not_found" or "invalid_args")
     return err_response(code, tostring(err))
   end
@@ -387,7 +400,7 @@ local SPECS = {
   },
   ["run.status"] = {
     owner       = OWNER,
-    description = "Resolver + store status for the current anchor: both tier paths, origin (override|derived), launch.json read-through state, config/profile counts, known dirs, plus `jobs` — the LIVE (still-running) job projections (no env values).",
+    description = "Resolver + store status for the current anchor: both tier paths, origin (override|derived), launch.json read-through state, config/profile counts, known dirs, `jobs` — the LIVE (still-running) job projections (no env values) — and `breakpoints` (store stats; `error` set when the persisted file is corrupt).",
     schema      = {},
     handler     = h_status,
   },

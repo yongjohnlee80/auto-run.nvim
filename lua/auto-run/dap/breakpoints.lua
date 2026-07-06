@@ -194,7 +194,14 @@ function M.reconcile()
   local live, loaded_paths = snapshot()
   if live == nil then return false, 0 end
 
-  local persisted = M.read()
+  local persisted, rerr = M.read()
+  if rerr then
+    -- Never rebuild the store from loaded-buffer state when the
+    -- persisted file failed to parse — that would overwrite entries
+    -- for unloaded files. Surfaces via stats()/doctor instead.
+    log.warn("breakpoints", "reconcile skipped: " .. tostring(rerr))
+    return false, 0
+  end
   local next_records = {}
   for _, rec in ipairs(persisted) do
     if type(rec.path) == "string" and not loaded_paths[rec.path] then
@@ -256,17 +263,19 @@ function M.clear_all()
   return true, nil
 end
 
----Store stats for `:AutoRun doctor` / `run.status`.
----@return { file: string, count: integer, files: integer }
+---Store stats for `:AutoRun doctor` / `run.status`. `error` carries
+---the read failure (e.g. invalid JSON) so a corrupt store never
+---masquerades as "0 breakpoints".
+---@return { file: string, count: integer, files: integer, error: string? }
 function M.stats()
-  local records = M.read()
+  local records, rerr = M.read()
   local files = {}
   for _, r in ipairs(records) do
     if type(r.path) == "string" then files[r.path] = true end
   end
   local nfiles = 0
   for _ in pairs(files) do nfiles = nfiles + 1 end
-  return { file = store_file(), count = #records, files = nfiles }
+  return { file = store_file(), count = #records, files = nfiles, error = rerr }
 end
 
 -- ── restore (BufReadPost) ───────────────────────────────────────
@@ -284,7 +293,13 @@ function M.restore(bufnr)
   local bname = vim.api.nvim_buf_get_name(bufnr)
   if bname == "" or bname:match("^%w+://") then return 0 end
 
-  local records = M.read()
+  local records, rerr = M.read()
+  if rerr then
+    -- A corrupt store must never be applied OR rewritten here (the
+    -- stale-drop path below writes); leave the file untouched.
+    log.warn("breakpoints", "restore skipped: " .. tostring(rerr))
+    return 0
+  end
   if #records == 0 then return 0 end
   local root = worktree_root()
   local abs = fs_path.normalize(bname)
