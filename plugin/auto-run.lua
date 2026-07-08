@@ -2,7 +2,8 @@
 ---
 ---Subcommands: list | show | validate | import | doctor [--fix] |
 ---set-dir (Phase 1) + run | debug | test | stop | jobs | last-error
----(Phase 2) + tests | scan (Phase 3 discovery). `doctor --fix` runs
+---(Phase 2) + tests | scan (Phase 3 discovery) + env [select
+---<path>|clear] (§4.2 r5 env-file selection). `doctor --fix` runs
 ---`git worktree repair` from the repo common dir (gobugger
 ---fix_worktree parity — interactive-only, never a mailbox verb).
 ---Output goes through
@@ -17,7 +18,7 @@ vim.g.loaded_auto_run = 1
 local SUBCOMMANDS = {
   "list", "show", "validate", "import", "doctor", "set-dir",
   "run", "debug", "test", "stop", "jobs", "last-error",
-  "tests", "scan",
+  "tests", "scan", "env",
 }
 
 local function echo_lines(lines)
@@ -147,6 +148,13 @@ function HANDLERS.doctor(args)
     row("profiles", ("tracked=%d shared=%d"):format(
       s.counts.tracked_profiles, s.counts.shared_profiles)),
   }
+  -- §4.2 (r5): the per-repo selected env file (highest-precedence
+  -- env_files entry on every launch; `:AutoRun env` manages it).
+  local oke_sel, sel = pcall(function()
+    return require("auto-run.env").get_selected()
+  end)
+  lines[#lines + 1] = row("selected env",
+    (oke_sel and sel) and sel or "<none — :AutoRun env select <path>>")
   if #s.known_dirs > 0 then
     lines[#lines + 1] = "known dirs:"
     for _, entry in ipairs(s.known_dirs) do
@@ -461,6 +469,54 @@ function HANDLERS.scan()
   end)
 end
 
+-- ── env-file selection (§4.2, r5) ───────────────────────────────
+
+function HANDLERS.env(args)
+  local envmod = require("auto-run.env")
+  local action = args[1]
+  if action == nil or action == "" then
+    local files = envmod.files_list()
+    if #files == 0 then
+      echo_lines({ "auto-run: no candidate env files (referenced or discovered)" })
+      return
+    end
+    local lines = {
+      "auto-run env files ('*' = selected — applied to every launch):",
+    }
+    for _, f in ipairs(files) do
+      lines[#lines + 1] = ("  %s %-48s %s%s"):format(
+        f.selected and "*" or " ", f.path, f.source,
+        f.exists and "" or "  [missing]")
+    end
+    echo_lines(lines)
+    return
+  end
+  if action == "select" then
+    local path = args[2]
+    if not path or path == "" then
+      echo_err("usage: :AutoRun env select <path>")
+      return
+    end
+    local oks, err = envmod.set_selected(path)
+    if not oks then
+      echo_err(err)
+      return
+    end
+    echo_lines({ "auto-run: selected env file " .. envmod.get_selected() })
+    return
+  end
+  if action == "clear" then
+    local oks, err = envmod.set_selected(nil)
+    if not oks then
+      echo_err(err)
+      return
+    end
+    echo_lines({ "auto-run: env-file selection cleared" })
+    return
+  end
+  echo_err("usage: :AutoRun env [select <path>|clear]")
+end
+
 HANDLERS["set-dir"] = function(args)
   local store = require("auto-run.store")
   local path = args[1]
@@ -519,6 +575,22 @@ end, {
       return vim.tbl_filter(function(s)
         return s:sub(1, #arglead) == arglead
       end, { "--fix" })
+    end
+    if sub == "env" then
+      if words[3] == "select" and (#words == 3 or #words >= 4) then
+        local ok, envmod = pcall(require, "auto-run.env")
+        if not ok then return {} end
+        local paths = {}
+        for _, f in ipairs(envmod.files_list()) do
+          if f.exists and f.path:sub(1, #arglead) == arglead then
+            paths[#paths + 1] = f.path
+          end
+        end
+        return paths
+      end
+      return vim.tbl_filter(function(s)
+        return s:sub(1, #arglead) == arglead
+      end, { "select", "clear" })
     end
     if sub == "stop" then
       local ok, exec = pcall(require, "auto-run.exec")

@@ -11,6 +11,7 @@
 ---    run.jobs           — session job inventory (live + exited)
 ---    run.tests_list     — discovered position tree (Phase 3, §7)
 ---    run.results        — last test results keyed by position id
+---    run.env_list       — candidate env files + KEY NAMES only (§4.2)
 ---
 ---  Store mutations (data, not execution — always allowed):
 ---    run.add            — create a config
@@ -18,6 +19,7 @@
 ---    run.remove         — delete a config file
 ---    run.set_dir        — shared-tier dir override
 ---    run.import         — launch.json → tracked tier
+---    run.env_select     — per-repo env-file selection (§4.2, r5)
 ---
 ---  Control (always allowed):
 ---    run.stop           — UNGATED per §11: stopping a live job is a
@@ -233,6 +235,65 @@ local function h_import(args)
   end
   local summary, err = import.import(args.name, { on_conflict = args.on_conflict })
   return wrap_two_value(summary, err, "import_failed")
+end
+
+-- ── env-file handlers (§4.2, r5) ────────────────────────────────
+-- HARD masking boundary: neither verb ever returns an env VALUE —
+-- run.env_list serializes file paths + sorted KEY NAMES only, and
+-- run.env_select carries paths only. Value display is panel-local
+-- (auto-finder views over env.read_file), never a mailbox surface.
+
+---@return table? env, table? errenv
+local function env_or_err()
+  local ok, mod = pcall(require, "auto-run.env")
+  if not ok or type(mod) ~= "table" then
+    return nil, err_response("dependency_unavailable",
+      "auto-run.env is not available")
+  end
+  return mod
+end
+
+local function h_env_list(_args)
+  local env, errenv = env_or_err(); if not env then return errenv end
+  local okl, files = pcall(env.files_list)
+  if not okl then return err_response("internal_error", tostring(files)) end
+  local out = {}
+  for _, f in ipairs(files) do
+    local entry = {
+      path = f.path, source = f.source,
+      exists = f.exists, selected = f.selected,
+    }
+    if f.exists then
+      local parsed = env.parse_env_file(f.path)
+      if parsed then
+        local keys = {}
+        for k in pairs(parsed) do keys[#keys + 1] = k end
+        table.sort(keys)
+        entry.keys = keys
+      end
+    end
+    out[#out + 1] = entry
+  end
+  return ok_response({
+    count = #out, files = out, selected = env.get_selected(),
+  })
+end
+
+local function h_env_select(args)
+  local env, errenv = env_or_err(); if not env then return errenv end
+  local path = args.path
+  if path == vim.NIL then path = nil end   -- JSON null clears
+  if path ~= nil and type(path) ~= "string" then
+    return err_response("invalid_args",
+      "args.path, when provided, must be a string (null/absent clears)")
+  end
+  local oks, err = env.set_selected(path)
+  if not oks then
+    local code = (type(err) == "table" and type(err.code) == "string")
+      and err.code or "invalid_args"
+    return err_response(code, tostring(err))
+  end
+  return ok_response({ selected = env.get_selected() })
 end
 
 -- ── discovery handlers (Phase 3, ADR-0048 §7/§11) ───────────────
@@ -490,6 +551,19 @@ local SPECS = {
     description = "Last test results keyed by position id: {root, count, results = {<id> = {status=passed|failed|skipped|running, duration_ms?, output?}}}. Container positions (namespace/file/dir) carry upward-aggregated statuses. Never includes env values.",
     schema      = {},
     handler     = h_results,
+  },
+
+  ["run.env_list"] = {
+    owner       = OWNER,
+    description = "Candidate env files for the current repo (§4.2): config/profile-referenced entries + the bounded non-recursive glob (<container>/.config/*.env, <worktree>/{.env,.env.*,*.env}), each {path, source, exists, selected, keys?}. `keys` are sorted KEY NAMES ONLY — env VALUES never cross the mailbox (value display is panel-local). Ungated read.",
+    schema      = {},
+    handler     = h_env_list,
+  },
+  ["run.env_select"] = {
+    owner       = OWNER,
+    description = "Select the per-repo env file applied to every launch as the highest-precedence env_files entry (config-level `env` keys still win last, §3.1). `path` must exist; null/absent clears. Selection is data, not execution — ungated. Publishes run.env:changed. Responses carry paths only, NEVER env values.",
+    schema      = { path = "string?" },
+    handler     = h_env_select,
   },
 
   ["run.add"] = {

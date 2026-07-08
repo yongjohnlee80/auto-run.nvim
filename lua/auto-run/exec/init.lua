@@ -311,26 +311,17 @@ end
 
 -- ── pick memory (gobugger session-pick parity, per repo) ────────
 
+---Shared-tier state.json accessors — the store owns the one
+---read/write pair (the env module's selection memory shares the same
+---file; [[shared-resolver-single-source-of-truth]]).
 ---@return table state
 local function read_state()
-  local paths = require("auto-run.store.paths")
-  local file = paths.state_file(paths.resolve_run_dirs().shared)
-  local f = io.open(file, "r")
-  if not f then return {} end
-  local content = f:read("*a")
-  f:close()
-  local okd, data = pcall(vim.json.decode, content)
-  return (okd and type(data) == "table") and data or {}
+  return require("auto-run.store").read_state()
 end
 
 ---@param state table
 local function write_state(state)
-  local paths = require("auto-run.store.paths")
-  local fs_atomic = require("auto-core.fs.atomic")
-  local file = paths.state_file(paths.resolve_run_dirs().shared)
-  local okw, werr = fs_atomic.write(file, vim.json.encode(state) .. "\n",
-    { mkdir = true })
-  if not okw then log.debug("exec", "state.json write failed: " .. tostring(werr)) end
+  require("auto-run.store").write_state(state)
 end
 
 ---Remember the last-picked config for a kind (persisted per repo in

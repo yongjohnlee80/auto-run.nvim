@@ -43,7 +43,7 @@ M._initialized = false
 
 -- ── event topics (ADR-0048 §12) ────────────────────────────────
 
----The seven run.* topics auto-run owns. Registered via
+---The eight run.* topics auto-run owns. Registered via
 ---`auto-core.events.register_topics` on setup (idempotent).
 M.TOPICS = {
   ["run.config:changed"] = {
@@ -73,6 +73,10 @@ M.TOPICS = {
   ["run.discovery:changed"] = {
     doc     = "Test discovery produced/updated a position tree (Phase 3).",
     payload = "{ root: string, files: integer, positions: integer }",
+  },
+  ["run.env:changed"] = {
+    doc     = "The env-file selection or an env file's contents changed (§4.2, r5). Payloads carry the path + KEY name only — env VALUES never enter events.",
+    payload = "{ action: 'selected'|'updated'|'added', path?: string, key?: string }",
   },
 }
 

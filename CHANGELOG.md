@@ -3,9 +3,61 @@
 ## [Unreleased]
 
 ADR-0048 Phase 3 (auto-run half) — test discovery + adapters — plus
-the Phase 4 gobugger-parity gate (§14.2). The auto-finder
-`tests`/`debug` views are the separate auto-finder half of Phase 3.
-Smoke 520/0.
+the Phase 4 gobugger-parity gate (§14.2) and the §4.2 (r5) env-file
+selection surface (auto-run half). The auto-finder `tests`/`debug`
+views (including the r5 Env section UI) are the separate auto-finder
+half. Smoke 576/0.
+
+### Added (§4.2 r5 — env-file selection, auto-run half)
+
+- **Per-repo env-file selection** (`auto-run.env`, ADR §4.2):
+  `env.set_selected(path|nil)` / `env.get_selected()` persist a
+  selected env file in the shared-local tier's `state.json` (key
+  `selected_env_file` — same mechanism as exec's pick memory),
+  worktree-relative when the file sits under the worktree root so
+  the pick survives a worktree switch within the same container.
+  `set_selected` validates existence (structured `not_found`).
+- **Composition applies the selection on EVERY launch**: `compose()`
+  merges the selected file as the final, highest-precedence
+  `env_files` entry (step 2.5) — every launch path (exec `prepare`,
+  dap `translate`/`debug_test`, the go adapter's discovery
+  `test_config`) funnels through compose, so interactive, mailbox,
+  debug-test and discovery-position launches all see it; the later
+  §3.1 stages (secret manifests, command_env, runtime_env,
+  config-level `env`) still win last. A selection whose file
+  vanished fails composition (`env_file_missing`) — never a silent
+  skip. `opts.no_selected` opts a caller out.
+- **Candidate listing**: `env.files_list()` — env files referenced
+  by any config's effective `env_files` / any profile's
+  `base_env_files` (substituted with the current anchor, deduped by
+  normalized path, `exists` flagged) plus a bounded NON-recursive
+  glob over `<container>/.config/*.env` and
+  `<worktree>/{.env,.env.*,*.env}` (dirs skipped, node_modules never
+  entered); referenced first, discovered alphabetical; `selected`
+  marks the pick.
+- **Env-file inspection/editing** (panel surfaces for the
+  auto-finder Env section): `env.read_file(path)` — dotenv-semantics
+  entries WITH line numbers (+ per-line parse errors; values are for
+  interactive display only — callers must never log/forward them);
+  `env.update_var(path, key, value)` / `env.add_var(path, key,
+  value)` — atomic rewrite (fs.atomic + mode restore) preserving
+  comments, blanks, entry order and each entry's quoting style (new
+  entries quote only when the value needs it); structured
+  `not_found` / `already_exists` / `invalid_key` / `invalid_value`
+  errors.
+- **`run.env:changed` topic** (eighth run.* topic): `{action =
+  "selected"|"updated"|"added", path?, key?}` — KEY names only,
+  VALUES never enter events.
+- **Mailbox verbs** (ungated — selection is data, not execution):
+  `run.env_list` (candidates + per-file sorted KEY NAMES only —
+  values never cross the mailbox) and `run.env_select` (path
+  selects, null clears).
+- **`:AutoRun env [select <path>|clear]`**: candidate listing with
+  the `*` selected marker (+ tab completion); doctor gains a
+  `selected env` row.
+- **`store.read_state()` / `store.write_state()`**: the shared-tier
+  `state.json` accessor pair moved into the store (exec's pick
+  memory now delegates — one owner for the mechanism).
 
 ### Added (Phase 4 — parity gate)
 

@@ -58,7 +58,7 @@ lua/auto-run/
 └── mailbox/commands.lua -- run.* verb SPECS + register_all()
 
 plugin/auto-run.lua      -- :AutoRun {list|show|validate|import|doctor|set-dir
-                         --          |run|debug|test|stop|jobs|last-error|tests|scan}
+                         --          |run|debug|test|stop|jobs|last-error|tests|scan|env}
 tests/smoke.lua          -- nvim -n -i NONE --headless -u tests/smoke.lua -c 'qa!'
 ```
 
@@ -93,6 +93,8 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   a scratch buffer.
 - `:AutoRun import` — one-shot launch.json migration into the
   tracked tier (`origin = "launch.json"` provenance).
+- `:AutoRun env [select <path>|clear]` — list/manage the per-repo
+  selected env file (§4.2 below); `*` marks the selection.
 - Mailbox verbs register automatically when the auto-core mailbox
   surface is present. `run.start` / `run.test_run` /
   `run.debug_start` are gated behind the `run.exec` trust capability
@@ -100,7 +102,9 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   `run.stop` is ungated. `run.tests_list` / `run.results` expose the
   position tree and the last per-position results read-only;
   `run.test_run` accepts either a config `name` or a discovered
-  `position` id.
+  `position` id. `run.env_list` / `run.env_select` manage the §4.2
+  env-file selection (ungated — selection is data, not execution)
+  and only ever carry file paths + KEY names, never values.
 
 ### Execution model
 
@@ -224,6 +228,43 @@ File retention:
   `env.command_timeout_ms` (default 10000 ms): a timeout fails
   composition with `command_env_timeout` for required entries and
   warns + skips entries with `required = false`.
+
+### Env-file selection (ADR §4.2, r5)
+
+A per-repo **selected env file** applies to every subsequent launch
+as the highest-precedence `env_files` entry — it wins over every
+config/profile env file, while the later §3.1 stages (secret
+manifests, `command_env`, `runtime_env`, config-level `env`) still
+win last. Every launch path (interactive, mailbox, debug-test,
+discovery positions) composes through the same pipeline, so the
+selection reaches all of them; a selection whose file vanished fails
+composition (`env_file_missing`), never a silent skip.
+
+```
+:AutoRun env                  " list candidates ('*' = selected)
+:AutoRun env select <path>    " select (file must exist; tab-completes)
+:AutoRun env clear            " clear the selection
+```
+
+Candidates are the env files referenced by configs/profiles plus a
+bounded **non-recursive** glob over `<container>/.config/*.env` and
+`<worktree>/{.env,.env.*,*.env}`. The selection persists in the
+shared-local tier's `state.json`, worktree-relative when the file
+sits under the worktree root — switching worktrees within the same
+container re-anchors the pick to the new worktree's copy. `:AutoRun
+doctor` shows a `selected env` row.
+
+Lua surface (consumed by the auto-finder Env section):
+`env.files_list()`, `env.get_selected()` /
+`env.set_selected(path|nil)`, `env.read_file(path)` (entries with
+line numbers — panel display only; callers must never log values),
+and `env.update_var(path, key, value)` / `env.add_var(path, key,
+value)` (atomic rewrites preserving comments, blank lines, entry
+order and each entry's quoting style; structured
+`not_found`/`already_exists`/`invalid_key`/`invalid_value` errors).
+Changes publish `run.env:changed` carrying the path + KEY name only —
+env **values** never enter logs, events, or mailbox responses
+(`run.env_list` returns file paths + sorted key names only).
 
 ### Breakpoint persistence
 

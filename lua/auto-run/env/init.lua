@@ -1,6 +1,7 @@
 ---auto-run.env — substitution engine + layered env-profile
----composition pipeline + materialization lifecycle
----(ADR-0048 §3 substitution, §4 pipeline, §4.1 lifecycle).
+---composition pipeline + materialization lifecycle + env-file
+---selection/editing (ADR-0048 §3 substitution, §4 pipeline,
+---§4.1 lifecycle, §4.2 selection — r5).
 ---
 ---Substitution is UNIFORM across all string fields (unlike VSCode's
 ---partial application). Tokens:
@@ -15,11 +16,13 @@
 ---                       structured `needs_params` marker
 ---
 ---Composition pipeline (last wins):
----   base_env_files → config env_files → secret_manifests (Phase 1:
----   parse + surface names only; materialization via a pluggable
----   resolver hook) → command_env (trust-gated `run.command_env`;
----   untrusted entries FAIL composition — never skip) → runtime_env
----   templates → config-level env.
+---   base_env_files → config env_files → SELECTED env file (§4.2 r5
+---   per-repo pick — the final, highest-precedence env_files entry)
+---   → secret_manifests (Phase 1: parse + surface names only;
+---   materialization via a pluggable resolver hook) → command_env
+---   (trust-gated `run.command_env`; untrusted entries FAIL
+---   composition — never skip) → runtime_env templates →
+---   config-level env.
 ---
 ---Lifecycle (§4.1): one materialized file per run id under
 ---`stdpath("cache")/auto-run/env/<run-id>.env`, mode 0600 in a 0700
@@ -41,6 +44,27 @@ local fs_path = require("auto-core.fs.path")
 local log = require("auto-run.log")
 
 local M = {}
+
+-- ── events + structured errors ──────────────────────────────────
+
+local function publish(topic, payload)
+  local ok, events = pcall(require, "auto-core.events")
+  if ok and events then pcall(events.publish, topic, payload) end
+end
+
+---A structured env error: a table carrying `code` (+ context fields)
+---that stringifies to its message (store-module convention), so
+---`tostring(err)` call sites keep working while mailbox handlers map
+---`err.code` onto envelope codes.
+---@param code string
+---@param message string
+---@param fields table?
+---@return table
+local function structured_err(code, message, fields)
+  local e = vim.tbl_extend("force", { code = code, message = message },
+    fields or {})
+  return setmetatable(e, { __tostring = function(self) return self.message end })
+end
 
 -- ── env-key / shell-value hygiene ───────────────────────────────
 
@@ -232,6 +256,384 @@ function M.parse_secret_manifest(path)
   return out, nil
 end
 
+-- ── env-file selection (ADR-0048 §4.2, r5) ──────────────────────
+-- A per-repo "selected env file" persisted in the shared-local
+-- tier's state.json (key `selected_env_file` — same mechanism as
+-- exec's pick memory). The selection is applied to EVERY launch as
+-- the highest-precedence env_files entry inside `compose()` — every
+-- launch path funnels through compose, so that is the one
+-- invocation-layer chokepoint (see the compose step 2.5 note).
+-- Persistence is worktree-relative when the file sits under the
+-- active worktree root (so the selection survives a worktree switch
+-- within the same container), absolute otherwise.
+
+---The absolute path of the selected env file for the current repo,
+---or nil when none is selected. Relative persistence resolves
+---against the CURRENT worktree root.
+---@return string? path
+function M.get_selected()
+  local store = require("auto-run.store")
+  local stored = store.read_state().selected_env_file
+  if type(stored) ~= "string" or stored == "" then return nil end
+  if stored:sub(1, 1) == "/" then return fs_path.normalize(stored) end
+  local dirs = store.resolve_run_dirs()
+  return fs_path.normalize(fs_path.join(dirs.root or dirs.anchor, stored))
+end
+
+---Select (or clear with nil/"") the env file applied to every
+---subsequent launch. The file must exist. Publishes
+---`run.env:changed` {action="selected", path} — the path only, never
+---file contents.
+---@param path string?  absolute or ~-expandable path; nil clears
+---@return boolean? ok, table? err  structured {code=...}
+function M.set_selected(path)
+  local store = require("auto-run.store")
+  if path == nil or path == "" then
+    local state = store.read_state()
+    if state.selected_env_file ~= nil then
+      state.selected_env_file = nil
+      local okw, werr = store.write_state(state)
+      if not okw then
+        return nil, structured_err("write_failed",
+          "set_selected: state.json write failed: " .. tostring(werr))
+      end
+    end
+    publish("run.env:changed", { action = "selected", path = nil })
+    return true, nil
+  end
+  if type(path) ~= "string" then
+    return nil, structured_err("invalid_args",
+      "set_selected: path must be a string or nil, got " .. type(path))
+  end
+  local abs = fs_path.normalize(vim.fn.expand(path))
+  if not fs_path.is_file(abs) then
+    return nil, structured_err("not_found",
+      "set_selected: no such env file: " .. abs)
+  end
+  local dirs = store.resolve_run_dirs()
+  local root = dirs.root or dirs.anchor
+  local stored = abs
+  if root and fs_path.is_under(abs, root) then
+    stored = abs:sub(#root + 2)   -- worktree-relative (container-portable)
+  end
+  local state = store.read_state()
+  state.selected_env_file = stored
+  local okw, werr = store.write_state(state)
+  if not okw then
+    return nil, structured_err("write_failed",
+      "set_selected: state.json write failed: " .. tostring(werr))
+  end
+  publish("run.env:changed", { action = "selected", path = abs })
+  log.debug("env", "selected env file changed")  -- never the path/keys
+  return true, nil
+end
+
+---@class AutoRunEnvCandidate
+---@field path string      absolute normalized path
+---@field source string    "config:<name>" | "profile:<name>" | "discovered"
+---@field exists boolean
+---@field selected boolean
+
+---Ordered candidate env files for the current repo (§4.2):
+---
+---  1. files referenced by any config's effective `env_files` and
+---     any profile's `base_env_files`, resolved through substitution
+---     with the current anchor (paths still carrying unresolved
+---     `${...}` tokens are skipped — they cannot be selected);
+---  2. a bounded NON-recursive glob: `<container>/.config/*.env` and
+---     `<worktree>/{.env,.env.*,*.env}` (dirs skipped; node_modules
+---     never entered — the glob does not recurse).
+---
+---Deterministic order: referenced first (store listing order), then
+---discovered alphabetically; deduped by normalized path (first
+---source wins). The `selected` flag marks the per-repo pick.
+---@return AutoRunEnvCandidate[]
+function M.files_list()
+  local store = require("auto-run.store")
+  local ctx = M.context()
+  local out, seen = {}, {}
+
+  local function add_referenced(raw, source)
+    if type(raw) ~= "string" or raw == "" then return end
+    local sub = M.substitute(raw, ctx)
+    if sub:find("${", 1, true) then return end
+    local abs = fs_path.normalize(vim.fn.expand(sub))
+    if seen[abs] then return end
+    seen[abs] = true
+    out[#out + 1] = { path = abs, source = source, exists = fs_path.is_file(abs) }
+  end
+
+  for _, c in ipairs(store.list()) do
+    if not c.error then
+      local eff = store.get(c.name)
+      if eff then
+        for _, p in ipairs(eff.env_files or {}) do
+          add_referenced(p, "config:" .. c.name)
+        end
+      end
+    end
+  end
+  for _, pr in ipairs(store.list_profiles()) do
+    local prof = store.get_profile(pr.name)
+    if prof then
+      for _, p in ipairs(prof.base_env_files or {}) do
+        add_referenced(p, "profile:" .. pr.name)
+      end
+    end
+  end
+
+  -- Bounded non-recursive glob (top-level readdir only).
+  local dirs = store.resolve_run_dirs()
+  local found = {}
+  local function scan_dir(dir, match)
+    if not dir or not fs_path.is_dir(dir) then return end
+    for _, f in ipairs(vim.fn.readdir(dir) or {}) do
+      if match(f) then
+        local full = fs_path.join(dir, f)
+        if fs_path.is_file(full) and not seen[full] then
+          seen[full] = true
+          found[#found + 1] = full
+        end
+      end
+    end
+  end
+  if dirs.container then
+    scan_dir(fs_path.join(dirs.container, ".config"), function(f)
+      return f:match("%.env$") ~= nil
+    end)
+  end
+  scan_dir(dirs.root or dirs.anchor, function(f)
+    return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
+  end)
+  table.sort(found)
+  for _, p in ipairs(found) do
+    out[#out + 1] = { path = p, source = "discovered", exists = true }
+  end
+
+  local selected = M.get_selected()
+  for _, e in ipairs(out) do
+    e.selected = selected ~= nil and e.path == selected
+  end
+  return out
+end
+
+-- ── env-file inspection + editing (ADR-0048 §4.2, r5) ───────────
+-- Panel-local surfaces: read_file returns VALUES (with line numbers)
+-- for interactive display ONLY — equivalent to `:e`-ing the file.
+-- Callers must never log values or put them in events / mailbox
+-- responses; the masking boundary (§4.2 r5) is unchanged.
+
+---@class AutoRunEnvFileEntry
+---@field key string
+---@field value string   for panel display only — never log/forward
+---@field lnum integer   1-based line number in the file
+
+---Parse an env file for panel display, RETAINING line numbers. Same
+---dotenv semantics as `parse_env_file` (leading `export ` tolerated,
+---surrounding quotes stripped, `#` comment lines skipped). Non-blank
+---non-comment lines that don't parse land in `errors`.
+---@param path string
+---@return { entries: AutoRunEnvFileEntry[], errors: { lnum: integer, message: string }[] }? result, table? err
+function M.read_file(path)
+  if type(path) ~= "string" or path == "" then
+    return nil, structured_err("invalid_args",
+      "read_file: path must be a non-empty string")
+  end
+  local f = io.open(path, "r")
+  if not f then
+    return nil, structured_err("not_found", "read_file: cannot open " .. path)
+  end
+  local entries, errors = {}, {}
+  local lnum = 0
+  for line in f:lines() do
+    lnum = lnum + 1
+    local s = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if s ~= "" and s:sub(1, 1) ~= "#" then
+      s = s:gsub("^export%s+", "")
+      local key, val = s:match("^([%a_][%w_%-%.]*)%s*=%s*(.*)$")
+      if key then
+        local q = val:sub(1, 1)
+        if (q == '"' or q == "'") and #val >= 2 and val:sub(-1) == q then
+          val = val:sub(2, -2)
+        end
+        entries[#entries + 1] = { key = key, value = val, lnum = lnum }
+      else
+        errors[#errors + 1] = { lnum = lnum, message = "unparseable entry" }
+      end
+    end
+  end
+  f:close()
+  return { entries = entries, errors = errors }, nil
+end
+
+---Parse one raw line as a dotenv entry for REWRITING: `head` is
+---everything before the value text (leading whitespace, optional
+---`export `, the key, `=` with its surrounding spacing) and `quote`
+---is the entry's current quoting style (`'` | `"` | "" for bare).
+---@param line string
+---@return { key: string, head: string, quote: string }?
+local function parse_entry_line(line)
+  local head, key, val =
+    line:match("^(%s*export%s+([%a_][%w_%-%.]*)%s*=%s*)(.*)$")
+  if not head then
+    head, key, val = line:match("^(%s*([%a_][%w_%-%.]*)%s*=%s*)(.*)$")
+  end
+  if not head then return nil end
+  local trimmed = val:gsub("%s+$", "")
+  local q = trimmed:sub(1, 1)
+  local quote = ""
+  if (q == '"' or q == "'") and #trimmed >= 2 and trimmed:sub(-1) == q then
+    quote = q
+  end
+  return { key = key, head = head, quote = quote }
+end
+
+---Render `value` preserving `prefer`red quote style ("'" | '"' | ""
+---for bare/new): a quoted entry stays in its quote style (falling
+---back to the other quote char when the value contains it); bare/new
+---entries are quoted only when the value needs it (empty, spaces,
+---`#`, quotes). nil when the value contains BOTH quote characters —
+---the quote-stripping parser cannot round-trip that.
+---@param value string
+---@param prefer string
+---@return string? rendered
+local function render_entry_value(value, prefer)
+  local function wrap(q)
+    if value:find(q, 1, true) ~= nil then return nil end
+    return q .. value .. q
+  end
+  if prefer == "'" or prefer == '"' then
+    return wrap(prefer) or wrap(prefer == "'" and '"' or "'")
+  end
+  if value ~= "" and not value:match("[%s#'\"]") then return value end
+  return wrap('"') or wrap("'")
+end
+
+---Rewrite one env file atomically, preserving every untouched line
+---byte-for-byte (comments, blanks, entry order) and the original
+---file mode. `mutate(lines) → true|nil, err` edits the line array in
+---place.
+---@param path string
+---@param mutate fun(lines: string[]): boolean?, table?
+---@return boolean? ok, table? err
+local function rewrite_env_file(path, mutate)
+  local f = io.open(path, "r")
+  if not f then
+    return nil, structured_err("not_found", "cannot open " .. path)
+  end
+  local content = f:read("*a") or ""
+  f:close()
+  local lines = vim.split(content, "\n", { plain = true })
+  if lines[#lines] == "" then table.remove(lines) end
+
+  local okm, merr = mutate(lines)
+  if not okm then return nil, merr end
+
+  local st = vim.uv.fs_stat(path)
+  local fs_atomic = require("auto-core.fs.atomic")
+  local text = table.concat(lines, "\n") .. (#lines > 0 and "\n" or "")
+  local okw, werr = fs_atomic.write(path, text)
+  if not okw then
+    return nil, structured_err("write_failed",
+      "atomic write failed: " .. tostring(werr))
+  end
+  if st then  -- fs.atomic's rename resets the mode; restore it
+    pcall(vim.uv.fs_chmod, path, require("bit").band(st.mode, 511))
+  end
+  return true, nil
+end
+
+---Update an existing KEY's value in an env file. Preserves comment
+---lines, blank lines, entry order and the entry's quoting style;
+---when the file holds duplicate keys, the LAST occurrence (the
+---effective one under dotenv last-wins parsing) is updated. Publishes
+---`run.env:changed` {action="updated", path, key} — the KEY name
+---only, NEVER the value.
+---@param path string
+---@param key string
+---@param value string
+---@return boolean? ok, table? err  structured {code="invalid_key"|"invalid_args"|"not_found"|"invalid_value"|"write_failed"}
+function M.update_var(path, key, value)
+  if not M.valid_env_key(key) then
+    return nil, structured_err("invalid_key",
+      "update_var: '" .. tostring(key)
+      .. "' is not a valid environment variable name"
+      .. " ([A-Za-z_][A-Za-z0-9_]*)", { key = tostring(key) })
+  end
+  if type(path) ~= "string" or path == "" or type(value) ~= "string" then
+    return nil, structured_err("invalid_args",
+      "update_var: path and value must be strings")
+  end
+  path = fs_path.normalize(path)
+  local ok, err = rewrite_env_file(path, function(lines)
+    local idx, entry
+    for i, line in ipairs(lines) do
+      local e = parse_entry_line(line)
+      if e and e.key == key then idx, entry = i, e end
+    end
+    if not idx then
+      return nil, structured_err("not_found",
+        "update_var: key '" .. key .. "' not found in " .. path,
+        { key = key })
+    end
+    local rendered = render_entry_value(value, entry.quote)
+    if not rendered then
+      return nil, structured_err("invalid_value",
+        "update_var: the value contains both quote characters — "
+        .. "not representable in a dotenv file", { key = key })
+    end
+    lines[idx] = entry.head .. rendered
+    return true
+  end)
+  if not ok then return nil, err end
+  publish("run.env:changed", { action = "updated", path = path, key = key })
+  return true, nil
+end
+
+---Append a NEW KEY=VALUE entry to an env file. The key must not
+---already exist (structured already_exists otherwise — the caller
+---decides to update instead). New entries are quoted only when the
+---value needs it. Publishes `run.env:changed` {action="added", path,
+---key} — the KEY name only, NEVER the value.
+---@param path string
+---@param key string
+---@param value string
+---@return boolean? ok, table? err  structured {code="invalid_key"|"invalid_args"|"not_found"|"already_exists"|"invalid_value"|"write_failed"}
+function M.add_var(path, key, value)
+  if not M.valid_env_key(key) then
+    return nil, structured_err("invalid_key",
+      "add_var: '" .. tostring(key)
+      .. "' is not a valid environment variable name"
+      .. " ([A-Za-z_][A-Za-z0-9_]*)", { key = tostring(key) })
+  end
+  if type(path) ~= "string" or path == "" or type(value) ~= "string" then
+    return nil, structured_err("invalid_args",
+      "add_var: path and value must be strings")
+  end
+  path = fs_path.normalize(path)
+  local ok, err = rewrite_env_file(path, function(lines)
+    for _, line in ipairs(lines) do
+      local e = parse_entry_line(line)
+      if e and e.key == key then
+        return nil, structured_err("already_exists",
+          "add_var: key '" .. key .. "' already exists in " .. path
+          .. " (use update_var)", { key = key })
+      end
+    end
+    local rendered = render_entry_value(value, "")
+    if not rendered then
+      return nil, structured_err("invalid_value",
+        "add_var: the value contains both quote characters — "
+        .. "not representable in a dotenv file", { key = key })
+    end
+    lines[#lines + 1] = key .. "=" .. rendered
+    return true
+  end)
+  if not ok then return nil, err end
+  publish("run.env:changed", { action = "added", path = path, key = key })
+  return true, nil
+end
+
 -- ── pluggable secret resolver (Phase 1 hook) ────────────────────
 
 ---@type (fun(refs: AutoRunSecretRef[]): table<string, string>?, string?)|nil
@@ -294,7 +696,7 @@ end
 ---structured error; composition failures are hard per §4 — a missing
 ---required piece aborts, it never silently skips.
 ---@param cfg table              effective config (from store.get)
----@param opts { ctx: AutoRunSubstCtx? }?
+---@param opts { ctx: AutoRunSubstCtx?, no_selected: boolean? }?
 ---@return AutoRunComposeResult? result, AutoRunComposeError? err
 function M.compose(cfg, opts)
   opts = opts or {}
@@ -321,6 +723,31 @@ function M.compose(cfg, opts)
         return nil, {
           code = "env_file_missing",
           message = field .. ": " .. tostring(perr),
+        }
+      end
+      for k, v in pairs(parsed) do composed[k] = v end
+    end
+  end
+
+  -- 2.5. The per-repo SELECTED env file (§4.2, r5) — applied as the
+  -- final, highest-precedence env_files entry. Every launch path
+  -- (exec.prepare, dap.translate / debug_test, the go adapter's
+  -- test_config for discovery run_position) funnels through
+  -- compose(), so this is the one invocation-layer chokepoint. The
+  -- later pipeline stages (secret_manifests, command_env,
+  -- runtime_env, config-level `env`) still win per §3.1 —
+  -- config-level env keys beat the selection. A selection whose file
+  -- vanished is a hard error, never a silent skip.
+  -- `opts.no_selected = true` opts a caller out (raw composition).
+  if not opts.no_selected then
+    local selected = M.get_selected()
+    if selected then
+      local parsed, perr = M.parse_env_file(selected)
+      if not parsed then
+        return nil, {
+          code = "env_file_missing",
+          message = "selected env file: " .. tostring(perr)
+            .. " (clear with :AutoRun env clear)",
         }
       end
       for k, v in pairs(parsed) do composed[k] = v end

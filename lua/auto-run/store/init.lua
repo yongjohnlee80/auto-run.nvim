@@ -150,6 +150,39 @@ local function write_json(path, data)
   return fs_atomic.write(path, encode_pretty(data) .. "\n", { mkdir = true })
 end
 
+-- ── per-repo session state (shared tier's state.json) ──────────
+-- The ONE accessor pair for `<shared>/state.json` (pick memory,
+-- env-file selection, …). Callers read the whole table, mutate their
+-- key, and write it back — the file is tiny and single-writer per
+-- session.
+
+---Parsed shared-tier state.json for the current anchor's repo.
+---`{}` when absent or unreadable (best-effort session state — never
+---fatal, unlike overrides.json).
+---@return table state
+function M.read_state()
+  local file = paths.state_file(paths.resolve_run_dirs().shared)
+  local f = io.open(file, "r")
+  if not f then return {} end
+  local content = f:read("*a")
+  f:close()
+  local okd, data = pcall(vim.json.decode, content)
+  return (okd and type(data) == "table") and data or {}
+end
+
+---Atomically persist the shared-tier state table.
+---@param state table
+---@return boolean ok, string? err
+function M.write_state(state)
+  local file = paths.state_file(paths.resolve_run_dirs().shared)
+  local okw, werr = fs_atomic.write(file, vim.json.encode(state) .. "\n",
+    { mkdir = true })
+  if not okw then
+    log.debug("store", "state.json write failed: " .. tostring(werr))
+  end
+  return okw, werr
+end
+
 -- ── tier scaffolding ────────────────────────────────────────────
 
 ---Ensure the plain-repo shared tier is gitignored: when the shared

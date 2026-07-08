@@ -42,6 +42,7 @@
 --   [33] keymaps — gobugger→auto-run remap audit (ADR §10, programmatic)
 --   [34] doctor — gobugger parity rows + `--fix` worktree repair
 --   [35] keymaps — rt/rf/dt discovery-position routing + fallback
+--   [36] env — §4.2 (r5) selection, candidates, var editing, masking
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -158,20 +159,21 @@ local setup_ok, setup_err = auto_run.setup()
 ok("setup() returns true", setup_ok == true, tostring(setup_err))
 ok("M._initialized true after setup", auto_run._initialized == true)
 
-local SEVEN_TOPICS = {
+local RUN_TOPICS = {
   "run.config:changed", "run.job:started", "run.job:exited",
   "run.results:changed", "run.session:changed",
   "run.breakpoints:changed", "run.discovery:changed",
+  "run.env:changed",
 }
 local all_registered = true
-for _, topic in ipairs(SEVEN_TOPICS) do
+for _, topic in ipairs(RUN_TOPICS) do
   local spec = core.events.topic_spec(topic)
   if not (spec and spec.registered_by == "auto-run.nvim") then
     all_registered = false
     ok("topic registered: " .. topic, false, vim.inspect(spec))
   end
 end
-ok("all seven run.* topics registered by auto-run.nvim", all_registered)
+ok("all eight run.* topics registered by auto-run.nvim", all_registered)
 
 local setup2_ok = auto_run.setup()
 ok("second setup() is idempotent (returns true)", setup2_ok == true)
@@ -845,15 +847,16 @@ local commands = require("auto-core.mailbox.commands")
 local run_cmds = require("auto-run.mailbox.commands")
 
 local reg = run_cmds.register_all()
-ok("register_all registers all 17 verbs (idempotent)",
-  #reg.registered == 17 and #reg.skipped == 0, vim.inspect(reg))
+ok("register_all registers all 19 verbs (idempotent)",
+  #reg.registered == 19 and #reg.skipped == 0, vim.inspect(reg))
 local expected_verbs = {
-  "run.add", "run.debug_start", "run.import", "run.jobs", "run.list",
+  "run.add", "run.debug_start", "run.env_list", "run.env_select",
+  "run.import", "run.jobs", "run.list",
   "run.profiles_list", "run.remove", "run.results", "run.set_dir",
   "run.show", "run.start", "run.status", "run.stop", "run.test_run",
   "run.tests_list", "run.update", "run.validate",
 }
-ok("verb roster matches the Phase 1+2+3 tiers exactly",
+ok("verb roster matches the Phase 1+2+3 (+§4.2 env) tiers exactly",
   vim.deep_equal(reg.registered, expected_verbs), vim.inspect(reg.registered))
 local spec = commands.get("run.list")
 ok("registry entry owned by auto-run",
@@ -3066,6 +3069,320 @@ do
     tostring(dtf_err) .. " " .. vim.inspect(captured))
   package.loaded["dap-go"] = saved_dg
 end
+
+-- ── [36] env — §4.2 (r5) selection, candidates, var editing ─────
+-- Runs inside a FUNCTION (not a plain do-block): the section carries
+-- ~50 locals and the main chunk is close to Lua's 200-local cap.
+print("\n[36] env — §4.2 (r5) selection, candidates, var editing, masking")
+local section36 = function()
+  require("auto-run.config").setup({
+    env  = { dir = fx .. "/env-cache" },
+    exec = { runs_dir = fx .. "/runs" },
+  })
+
+  -- Linked-worktree fixture: one container, two worktrees — the
+  -- selection must survive a worktree switch within the container.
+  local envsrc = fx .. "/env-src"
+  ok("env fixture source repo created", make_plain_repo(envsrc))
+  local envc = fx .. "/env-container"
+  vim.fn.mkdir(envc, "p")
+  ok("env fixture bare clone",
+    git(fx, "clone", "-q", "--bare", envsrc, envc .. "/.bare"))
+  ok("env fixture worktree A", git(fx, "--git-dir=" .. envc .. "/.bare",
+    "worktree", "add", "-q", envc .. "/wt-a", "main"))
+  ok("env fixture worktree B", git(fx, "--git-dir=" .. envc .. "/.bare",
+    "worktree", "add", "-q", "-b", "alt", envc .. "/wt-b"))
+  local wta, wtb = envc .. "/wt-a", envc .. "/wt-b"
+  worktree.set_active(wta)
+
+  -- Candidate surface: referenced (config env_files + profile
+  -- base_env_files) + the bounded NON-recursive glob.
+  write_file(wta .. "/.env", "DOT=1\n")
+  write_file(wta .. "/.env.local", "DOTLOCAL=1\n")
+  write_file(wta .. "/gold.env", table.concat({
+    "# gold test env",
+    "SEL_VAR=from-selected",
+    "CONF_KEY=from-selected-file",
+    "SECRET_TOKEN='sekrit-env-value-xyz'",
+    "",
+  }, "\n"))
+  write_file(wta .. "/referenced.env", "REF=1\n")
+  write_file(wta .. "/sub/deep.env", "DEEP=1\n")           -- below top level
+  vim.fn.mkdir(wta .. "/fake.env", "p")                    -- a DIRECTORY
+  write_file(wta .. "/node_modules/pkg/x.env", "NM=1\n")   -- never entered
+  write_file(envc .. "/.config/app.env", "APP=1\n")
+  write_file(envc .. "/.config/notes.txt", "not an env file\n")
+
+  store.add({ name = "env-echo", kind = "run", program = "sh",
+    args = { "-c", "echo sel=$SEL_VAR conf=$CONF_KEY" },
+    env = { CONF_KEY = "config-wins" } }, { tier = "tracked" })
+  store.add({ name = "ref-cfg", kind = "run", program = "sh",
+    env_files = { "${worktree}/referenced.env", "${worktree}/missing-ref.env" },
+  }, { tier = "tracked" })
+  store.add({ name = "p-base",
+    base_env_files = { "${containerRoot}/.config/app.env" } },
+    { kind = "profiles", tier = "tracked" })
+
+  local cands = envmod.files_list()
+  local cand_paths = {}
+  for _, c in ipairs(cands) do cand_paths[#cand_paths + 1] = c.path end
+  ok("candidates: referenced first (source order), then discovered alphabetical",
+    vim.deep_equal(cand_paths, {
+      wta .. "/referenced.env",
+      wta .. "/missing-ref.env",
+      envc .. "/.config/app.env",
+      wta .. "/.env",
+      wta .. "/.env.local",
+      wta .. "/gold.env",
+    }), vim.inspect(cand_paths))
+  ok("config-referenced candidate: source config:<name>, exists=true",
+    cands[1].source == "config:ref-cfg" and cands[1].exists == true)
+  ok("missing referenced file listed with exists=false",
+    cands[2].exists == false and cands[2].source == "config:ref-cfg")
+  ok("profile base_env_files candidate: source profile:<name>",
+    cands[3].source == "profile:p-base" and cands[3].exists == true)
+  local app_seen = 0
+  for _, c in ipairs(cands) do
+    if c.path == envc .. "/.config/app.env" then app_seen = app_seen + 1 end
+  end
+  ok("glob hit deduped under its referencing source (listed once)",
+    app_seen == 1)
+  ok("bounded glob does NOT recurse (sub/deep.env, node_modules absent)",
+    not contains(cand_paths, wta .. "/sub/deep.env")
+      and not contains(cand_paths, wta .. "/node_modules/pkg/x.env"))
+  ok("a DIRECTORY named *.env is skipped",
+    not contains(cand_paths, wta .. "/fake.env"))
+  local none_selected = true
+  for _, c in ipairs(cands) do
+    if c.selected then none_selected = false end
+  end
+  ok("no candidate selected before any pick", none_selected)
+
+  -- Composition BEFORE any selection: config's own env only.
+  local exited_ev
+  local h_exit = core.events.subscribe("run.job:exited",
+    function(p) exited_ev = p end)
+  local run1, r1err = P2.exec.start("env-echo")
+  ok("baseline run launches", run1 ~= nil, tostring(r1err))
+  wait_for(function() return exited_ev and exited_ev.id == run1.id end)
+  local out1 = table.concat(
+    vim.fn.readfile(fx .. "/runs/" .. run1.id .. "/stdout"), "\n")
+  ok("without a selection the file's var is absent (conf = config env)",
+    out1:find("sel= conf=config-wins", 1, true) ~= nil, out1)
+
+  -- Selection: validation, event, persistence shape.
+  local env_events = {}
+  local h_env = core.events.subscribe("run.env:changed", function(p)
+    env_events[#env_events + 1] = vim.deepcopy(p)
+  end)
+
+  local bad_sel, bad_sel_err = envmod.set_selected(wta .. "/nope.env")
+  ok("set_selected on a missing file is a structured not_found",
+    bad_sel == nil and type(bad_sel_err) == "table"
+      and bad_sel_err.code == "not_found", vim.inspect(bad_sel_err))
+  ok("…that stringifies to its message",
+    tostring(bad_sel_err):find("no such env file", 1, true) ~= nil)
+
+  local sel_ok, sel_err = envmod.set_selected(wta .. "/gold.env")
+  ok("set_selected picks an existing file", sel_ok == true, tostring(sel_err))
+  ok("get_selected returns the absolute path",
+    envmod.get_selected() == wta .. "/gold.env",
+    tostring(envmod.get_selected()))
+  ok("run.env:changed published {action=selected, path}",
+    #env_events == 1 and env_events[1].action == "selected"
+      and env_events[1].path == wta .. "/gold.env", vim.inspect(env_events))
+
+  local sfile = envc .. "/.auto-run/state.json"
+  local sdata = vim.fn.filereadable(sfile) == 1
+    and vim.json.decode(table.concat(vim.fn.readfile(sfile), "\n")) or {}
+  ok("selection persists WORKTREE-RELATIVE in the shared tier's state.json",
+    sdata.selected_env_file == "gold.env", vim.inspect(sdata))
+
+  local cands2 = envmod.files_list()
+  local marked
+  for _, c in ipairs(cands2) do
+    if c.selected then marked = (marked == nil) and c.path or "multiple" end
+  end
+  ok("files_list marks exactly the selected candidate",
+    marked == wta .. "/gold.env", tostring(marked))
+
+  -- Composition WITH the selection: the selected file is the
+  -- highest-precedence env_files entry; config-level env wins last.
+  exited_ev = nil
+  local run2, r2err = P2.exec.start("env-echo")
+  ok("re-run launches with the selection", run2 ~= nil, tostring(r2err))
+  wait_for(function() return exited_ev and exited_ev.id == run2.id end)
+  local out2 = table.concat(
+    vim.fn.readfile(fx .. "/runs/" .. run2.id .. "/stdout"), "\n")
+  ok("selected env file reaches the process on re-run",
+    out2:find("sel=from-selected", 1, true) ~= nil, out2)
+  ok("config-level env key still beats the selected file (§3.1)",
+    out2:find("conf=config-wins", 1, true) ~= nil, out2)
+
+  -- A selection whose file vanished is a HARD compose error.
+  write_file(wta .. "/victim.env", "V=1\n")
+  envmod.set_selected(wta .. "/victim.env")
+  vim.uv.fs_unlink(wta .. "/victim.env")
+  local cres, ccerr = envmod.compose({ name = "x", kind = "run" }, {})
+  ok("vanished selected file fails composition (never silently skipped)",
+    cres == nil and ccerr and ccerr.code == "env_file_missing"
+      and tostring(ccerr.message):find("selected env file", 1, true) ~= nil,
+    vim.inspect(ccerr))
+  ok("opts.no_selected opts raw composition out",
+    (envmod.compose({ name = "x", kind = "run" }, { no_selected = true })) ~= nil)
+
+  -- Worktree switch WITHIN the container re-resolves the relative pick.
+  envmod.set_selected(wta .. "/gold.env")
+  write_file(wtb .. "/gold.env", "SEL_VAR=from-wtb\n")
+  worktree.set_active(wtb)
+  ok("selection survives a worktree switch (re-anchored to the new worktree)",
+    envmod.get_selected() == wtb .. "/gold.env",
+    tostring(envmod.get_selected()))
+  worktree.set_active(wta)
+  ok("…and re-anchors back", envmod.get_selected() == wta .. "/gold.env")
+
+  -- read_file: lnum fidelity + parse errors (panel display surface).
+  local display = wta .. "/edit.env"
+  write_file(display, table.concat({
+    "# header comment",
+    'export API_URL="https://example.com"',
+    "",
+    "PLAIN=hello",
+    "SINGLE='keep me'",
+    "not a valid line !!",
+    "# trailing comment",
+    "",
+  }, "\n"))
+  local rf, rf_err = envmod.read_file(display)
+  ok("read_file parses entries", rf ~= nil, vim.inspect(rf_err))
+  ok("entries retain 1-based line numbers",
+    rf and vim.deep_equal(
+      { { rf.entries[1].key, rf.entries[1].lnum },
+        { rf.entries[2].key, rf.entries[2].lnum },
+        { rf.entries[3].key, rf.entries[3].lnum } },
+      { { "API_URL", 2 }, { "PLAIN", 4 }, { "SINGLE", 5 } }),
+    vim.inspect(rf and rf.entries))
+  ok("quote stripping matches the dotenv parser",
+    rf and rf.entries[1].value == "https://example.com"
+      and rf.entries[3].value == "keep me")
+  ok("unparseable lines land in errors with their lnum",
+    rf and #rf.errors == 1 and rf.errors[1].lnum == 6,
+    vim.inspect(rf and rf.errors))
+  local _, rf_missing = envmod.read_file(wta .. "/nope.env")
+  ok("read_file on a missing file is structured not_found",
+    type(rf_missing) == "table" and rf_missing.code == "not_found")
+
+  -- update_var / add_var: atomic rewrite preserving layout + quoting.
+  ok("update_var rewrites a bare entry (stays bare)",
+    envmod.update_var(display, "PLAIN", "world") == true)
+  ok("update_var preserves double-quote style + export prefix",
+    envmod.update_var(display, "API_URL", "https://new.example/a b") == true)
+  ok("update_var preserves single-quote style",
+    envmod.update_var(display, "SINGLE", "sekrit-var-value-abc") == true)
+  ok("add_var appends bare when no quoting is needed",
+    envmod.add_var(display, "NEW_PLAIN", "simple") == true)
+  ok("add_var quotes only when the value needs it",
+    envmod.add_var(display, "NEW_SPACED", "a b") == true)
+  ok("add_var falls to single quotes when the value carries double quotes",
+    envmod.add_var(display, "QUOTEY", 'say "hi"') == true)
+
+  local after = vim.fn.readfile(display)
+  ok("edited file — byte-level line asserts (comments/blanks/order intact)",
+    vim.deep_equal(after, {
+      "# header comment",
+      'export API_URL="https://new.example/a b"',
+      "",
+      "PLAIN=world",
+      "SINGLE='sekrit-var-value-abc'",
+      "not a valid line !!",
+      "# trailing comment",
+      "NEW_PLAIN=simple",
+      'NEW_SPACED="a b"',
+      "QUOTEY='say \"hi\"'",
+    }), vim.inspect(after))
+  local reparsed = envmod.parse_env_file(display)
+  ok("edited file round-trips through the dotenv parser",
+    reparsed ~= nil and reparsed.PLAIN == "world"
+      and reparsed.API_URL == "https://new.example/a b"
+      and reparsed.SINGLE == "sekrit-var-value-abc"
+      and reparsed.NEW_PLAIN == "simple"
+      and reparsed.NEW_SPACED == "a b"
+      and reparsed.QUOTEY == 'say "hi"', vim.inspect(reparsed))
+
+  local up_missing, up_missing_err = envmod.update_var(display, "GHOST", "x")
+  ok("update_var on a missing key → structured not_found",
+    up_missing == nil and up_missing_err.code == "not_found",
+    vim.inspect(up_missing_err))
+  local add_dup, add_dup_err = envmod.add_var(display, "PLAIN", "x")
+  ok("add_var on an existing key → structured already_exists",
+    add_dup == nil and add_dup_err.code == "already_exists",
+    vim.inspect(add_dup_err))
+  local bad_key, bad_key_err = envmod.update_var(display, "BAD-KEY", "x")
+  ok("invalid key → structured invalid_key",
+    bad_key == nil and bad_key_err.code == "invalid_key")
+  local both, both_err = envmod.add_var(display, "BOTH_QUOTES", [[a 'x' "y"]])
+  ok("value with BOTH quote chars → structured invalid_value",
+    both == nil and both_err.code == "invalid_value", vim.inspect(both_err))
+
+  -- Event masking: payloads carry paths + KEY names, never values.
+  local ev_dump = vim.inspect(env_events)
+  ok("run.env:changed payloads carry NO values (keys/paths only)",
+    ev_dump:find("sekrit-var-value-abc", 1, true) == nil
+      and ev_dump:find("sekrit-env-value-xyz", 1, true) == nil
+      and ev_dump:find("SINGLE", 1, true) ~= nil, ev_dump)
+
+  -- Mailbox verbs: run.env_list (names only) + run.env_select.
+  local h_env_list = commands.get("run.env_list").handler
+  local h_env_select = commands.get("run.env_select").handler
+  local list_env = h_env_list({})
+  ok("run.env_list envelope lists candidates with the selection",
+    list_env.ok == true and list_env.value.count >= 6
+      and list_env.value.selected == wta .. "/gold.env",
+    vim.inspect(list_env.value and list_env.value.selected))
+  local gold_entry
+  for _, fentry in ipairs(list_env.value.files) do
+    if fentry.path == wta .. "/gold.env" then gold_entry = fentry end
+  end
+  ok("env_list carries per-file KEY NAMES (sorted)",
+    gold_entry ~= nil and vim.deep_equal(gold_entry.keys,
+      { "CONF_KEY", "SECRET_TOKEN", "SEL_VAR" }), vim.inspect(gold_entry))
+  ok("env_list NEVER serializes values (secret-looking string absent)",
+    vim.inspect(list_env):find("sekrit-env-value-xyz", 1, true) == nil)
+
+  local clear_env = h_env_select({ path = vim.NIL })
+  ok("run.env_select null clears the selection",
+    clear_env.ok == true and clear_env.value.selected == nil
+      and envmod.get_selected() == nil, vim.inspect(clear_env))
+  local sel_env = h_env_select({ path = wta .. "/gold.env" })
+  ok("run.env_select selects by path",
+    sel_env.ok == true and sel_env.value.selected == wta .. "/gold.env",
+    vim.inspect(sel_env))
+  local sel_bad = h_env_select({ path = wta .. "/nope.env" })
+  ok("run.env_select missing path → not_found",
+    sel_bad.ok == false and sel_bad.code == "not_found", vim.inspect(sel_bad))
+
+  -- :AutoRun env — listing with the '*' marker, select/clear, doctor.
+  local listing = vim.api.nvim_exec2("AutoRun env", { output = true }).output
+  ok(":AutoRun env lists candidates with the '*' selected marker",
+    listing:find("* " .. wta .. "/gold.env", 1, true) ~= nil, listing)
+  ok(":AutoRun env clear clears",
+    pcall(vim.cmd, "AutoRun env clear") and envmod.get_selected() == nil)
+  ok(":AutoRun env select re-selects",
+    pcall(vim.cmd, "AutoRun env select "
+      .. vim.fn.fnameescape(wta .. "/gold.env"))
+      and envmod.get_selected() == wta .. "/gold.env")
+  local doc_out = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok("doctor shows the selected env row",
+    doc_out:find("selected env:", 1, true) ~= nil
+      and doc_out:find(wta .. "/gold.env", 1, true) ~= nil, doc_out)
+
+  -- Leave no global state behind.
+  envmod.set_selected(nil)
+  core.events.unsubscribe(h_env)
+  core.events.unsubscribe(h_exit)
+  require("auto-run.config").setup({})
+end
+section36()
 
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
