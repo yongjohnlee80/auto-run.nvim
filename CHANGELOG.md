@@ -8,6 +8,18 @@ selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
 half. Smoke 579/0.
 
+### Added (run output reconstruction — tests-panel `i`)
+
+- **`discovery.run_output(run_id, adapter, opts?)`** returns a recorded
+  run's human/terminal output, reconstructed via the adapter's new
+  optional **`output(exit, opts?)`** hook. The go adapter's `output`
+  re-joins the `go test -json` `Output` events in stream order — exactly
+  what `go test` prints to the terminal (run banner, `=== RUN` /
+  `--- PASS|FAIL`, captured logs, `PASS`/`ok`/`FAIL` summary). `opts.test`
+  narrows to one test plus its subtests. Distinct from
+  `results()[id].output` (a short failure snippet). Backs the auto-finder
+  tests panel's `i` output view.
+
 ### Added (Config section — launch-config selection)
 
 - **Per-repo selected launch config**, the config-side companion to the

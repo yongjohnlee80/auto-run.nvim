@@ -937,6 +937,57 @@ do
       and store.read_state().selected_launch_config == nil)
 end
 
+-- ── [8.6] run output reconstruction (tests-panel `i` backing) ───
+-- go adapter output() rejoins the `go test -json` Output events into
+-- what the terminal would print; discovery.run_output dispatches to it.
+print("\n[8.6] discovery.run_output + go.output — terminal-log reconstruction")
+do
+  local go = require("auto-run.adapters.go")
+  local discovery = require("auto-run.discovery")
+  local job = require("auto-run.exec.job")
+
+  local rid = "smoke-output-0001"
+  local dir = job.run_dir(rid)
+  vim.fn.mkdir(dir, "p")
+  local jf = assert(io.open(dir .. "/stdout", "w"))
+  jf:write(table.concat({
+    vim.json.encode({ Action="output", Package="p", Test="TestA", Output="=== RUN   TestA\n" }),
+    vim.json.encode({ Action="output", Package="p", Test="TestA", Output="    a_test.go:5: hello\n" }),
+    vim.json.encode({ Action="output", Package="p", Test="TestA/sub", Output="=== RUN   TestA/sub\n" }),
+    vim.json.encode({ Action="output", Package="p", Test="TestB", Output="=== RUN   TestB\n" }),
+    vim.json.encode({ Action="output", Package="p", Output="PASS\n" }),
+    vim.json.encode({ Action="pass", Package="p", Test="TestA", Elapsed=0.01 }),
+  }, "\n") .. "\n")
+  jf:close()
+
+  local full = go.output({ stdout_file = dir .. "/stdout" })
+  ok("go.output rejoins Output events into terminal text",
+    full:find("=== RUN   TestA", 1, true) and full:find("hello", 1, true)
+      and full:find("=== RUN   TestB", 1, true) and full:find("PASS", 1, true) ~= nil,
+    vim.inspect(full))
+  ok("go.output omits non-output events (no JSON leaks)",
+    full:find("Elapsed", 1, true) == nil, full)
+
+  local scoped = go.output({ stdout_file = dir .. "/stdout" }, { test = "TestA" })
+  ok("go.output test filter keeps the test + subtests + package lines",
+    scoped:find("TestA/sub", 1, true) and scoped:find("PASS", 1, true) ~= nil, scoped)
+  ok("go.output test filter drops sibling tests",
+    scoped:find("TestB", 1, true) == nil, scoped)
+
+  local text, rerr = discovery.run_output(rid, "go")
+  ok("discovery.run_output returns reconstructed text",
+    type(text) == "string" and text:find("=== RUN   TestA", 1, true) ~= nil,
+    tostring(rerr))
+  local _, e1 = discovery.run_output(rid, "nope")
+  ok("run_output errors on an unknown adapter",
+    tostring(e1):find("unknown adapter", 1, true) ~= nil, tostring(e1))
+  local _, e2 = discovery.run_output("no-such-run-xyz", "go")
+  ok("run_output errors when no stdout exists",
+    tostring(e2):find("no stdout", 1, true) ~= nil, tostring(e2))
+
+  vim.fn.delete(dir, "rf")
+end
+
 -- ── [9] mailbox verbs — run.* envelopes ─────────────────────────
 print("\n[9] mailbox — run.* verb registration + envelope contracts")
 local commands = require("auto-core.mailbox.commands")

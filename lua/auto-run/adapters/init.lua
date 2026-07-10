@@ -64,6 +64,11 @@ local M = {}
 ---@field results fun(spec: AutoRunSpec, exit: table, tree: table): table<string, AutoRunResult>
 ---           parse the machine output file into results keyed by
 ---           position id. `exit` = { code, signal, stdout_file, run_dir }.
+---@field output? fun(exit: table, opts: table?): string
+---           OPTIONAL: reconstruct the run's human/terminal output from
+---           its machine output file (`exit` = { stdout_file, run_dir }).
+---           `opts.test` narrows to one test + its subtests. Backs the
+---           tests panel's `i` output view via `discovery.run_output`.
 
 ---Required adapter fields → expected Lua type.
 local REQUIRED = {

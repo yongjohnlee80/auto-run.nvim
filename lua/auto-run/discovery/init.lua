@@ -286,6 +286,38 @@ function M.results()
   return vim.deepcopy(_results)
 end
 
+---Reconstructed human/terminal output of a recorded run, via the
+---adapter's optional `output` hook (go: the `go test -json` Output
+---events re-joined into what the terminal would show). This is the
+---full run log — distinct from `results()[id].output`, which is only a
+---short captured failure snippet. `(text, nil)` or `(nil, err)`.
+---@param run_id string          the run whose output to reconstruct
+---@param adapter_name string    the adapter that produced the run
+---@param opts { test: string? }?  narrow to one test + its subtests
+---@return string? text, string? err
+function M.run_output(run_id, adapter_name, opts)
+  if type(run_id) ~= "string" or run_id == "" then
+    return nil, "run_output: run_id must be a non-empty string"
+  end
+  local adapter = adapters.get(adapter_name)
+  if not adapter then
+    return nil, "run_output: unknown adapter '" .. tostring(adapter_name) .. "'"
+  end
+  if type(adapter.output) ~= "function" then
+    return nil, "run_output: adapter '" .. adapter_name
+      .. "' has no output hook"
+  end
+  local dir = require("auto-run.exec.job").run_dir(run_id)
+  local stdout_file = dir .. "/stdout"
+  if vim.fn.filereadable(stdout_file) ~= 1 then
+    return nil, "run_output: no stdout for run " .. run_id
+  end
+  local ok, text = pcall(adapter.output,
+    { stdout_file = stdout_file, run_dir = dir }, opts)
+  if not ok then return nil, "run_output: " .. tostring(text) end
+  return text, nil
+end
+
 local function publish_discovery()
   local tree = M.tree()
   local counts = tree:counts()

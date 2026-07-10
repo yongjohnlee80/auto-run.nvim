@@ -480,6 +480,43 @@ function M.results(spec, exit, tree)
   return results
 end
 
+---Reconstruct the human/terminal output of a run from its
+---`go test -json` stdout stream. Concatenating the `output`-action
+---events' `Output` fields in stream order reproduces exactly what
+---`go test` (without `-json`) prints to the terminal — the run banner,
+---`=== RUN` / `--- PASS|FAIL`, captured `t.Log`/stdout, and the final
+---`PASS`/`ok`/`FAIL` summary. `opts.test` narrows to that test plus its
+---subtests (and package-level lines); nil = the whole run.
+---@param exit { stdout_file: string }
+---@param opts { test: string? }?
+---@return string
+function M.output(exit, opts)
+  opts = opts or {}
+  local f = exit and exit.stdout_file and io.open(exit.stdout_file, "r")
+  if not f then return "" end
+  local want = opts.test
+  local parts = {}
+  for line in f:lines() do
+    local okd, ev = pcall(vim.json.decode, line)
+    if okd and type(ev) == "table" and ev.Action == "output"
+        and type(ev.Output) == "string" then
+      local keep = true
+      if want then
+        -- package-level lines (no Test) + the target test + its subtests.
+        keep = ev.Test == nil or ev.Test == want
+          or (type(ev.Test) == "string"
+            and ev.Test:sub(1, #want + 1) == want .. "/")
+      end
+      if keep then parts[#parts + 1] = ev.Output end
+    elseif not okd and line ~= "" then
+      -- Non-JSON line (defensive — a runner that bypassed -json): keep it.
+      parts[#parts + 1] = line .. "\n"
+    end
+  end
+  f:close()
+  return table.concat(parts)
+end
+
 ---Test-only: drop the memoized root/module caches.
 function M._reset_for_tests()
   _root_cache, _module_path_cache = {}, {}
