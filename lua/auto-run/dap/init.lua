@@ -275,6 +275,17 @@ function M.translate(name, opts)
     return nil, cerr and cerr.message or "env composition failed", cerr
   end
 
+  -- Working dir: the config's cwd, else the anchor's worktree root.
+  -- WITHOUT this default, delve is spawned in nvim's cwd — which in a
+  -- multi-repo parent is OUTSIDE the module, so `go build <abs program>`
+  -- fails "go.mod not found" and the launch dies with "Failed to launch".
+  -- (The run path already defaults cwd via exec.launch_cwd.)
+  local cwd = eff.cwd
+  if type(cwd) ~= "string" or cwd == "" then
+    local dirs = store.resolve_run_dirs()
+    cwd = dirs.root or dirs.anchor
+  end
+
   local dap_cfg
   if eff.runtime == "go" or eff.runtime == nil then
     dap_cfg = {
@@ -283,7 +294,7 @@ function M.translate(name, opts)
       mode    = eff.kind == "test" and "test" or "debug",
       name    = eff.name,
       program = eff.program,
-      cwd     = eff.cwd,
+      cwd     = cwd,
     }
     if type(eff.args) == "table" and #eff.args > 0 then
       dap_cfg.args = eff.args
@@ -298,7 +309,7 @@ function M.translate(name, opts)
       request = "launch",
       name    = eff.name,
       program = eff.program,
-      cwd     = eff.cwd,
+      cwd     = cwd,
     }
     if type(eff.args) == "table" and #eff.args > 0 then
       dap_cfg.args = eff.args

@@ -8,6 +8,17 @@ selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
 half. Smoke 579/0.
 
+### Fixed
+
+- **`dap.translate` now defaults `cwd` to the anchor's worktree root**
+  when a config sets none. Without it, delve was spawned in Neovim's cwd
+  — which in a multi-repo parent is OUTSIDE the module — so
+  `go build <abs program>` failed with "go.mod not found" and the launch
+  died with "Error on launch: Failed to launch". (The run path already
+  defaulted cwd via `exec.launch_cwd`; this brings the dap path in line.)
+  Fixes debug-panel `d` and cold-start `<F9>`/`<leader>dc` continue for
+  configs without an explicit `cwd`. Smoke [8.8].
+
 ### Added (debug-panel Entry Points: run-in-terminal + launch.json export)
 
 - **`exec.command_line(name, opts?)`** builds a terminal-ready shell
