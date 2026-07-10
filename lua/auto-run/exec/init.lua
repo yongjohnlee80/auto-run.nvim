@@ -76,6 +76,8 @@ local function prepare(name, opts)
     -- `detail` so mailbox handlers can map their code.
     return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
   end
+  -- Selected launch config (Config section) as the active base.
+  eff = require("auto-run.import").apply_selected_base(eff)
 
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()

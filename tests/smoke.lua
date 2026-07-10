@@ -841,6 +841,102 @@ local _, missing_err = import.import("No Such Entry", {})
 ok("import of an unknown entry errors",
   tostring(missing_err):find("No Such Entry", 1, true) ~= nil, tostring(missing_err))
 
+-- ── [8.5] launch-config selection (Config section runtime) ──────
+-- Direct-parse selection surface + apply_selected_base merge, over the
+-- lj fixture (worktree still active). launch.json has "Debug Gold"
+-- (mode=debug) and "Test Gold" (mode=test).
+print("\n[8.5] import — launch-config selection + active-base merge")
+do
+  -- configs_list: kind filter + selected annotation.
+  local all = import.configs_list()
+  ok("configs_list() returns every entry", #all == 2, vim.inspect(all))
+  local tests = import.configs_list("test")
+  ok("configs_list('test') filters to mode=test",
+    #tests == 1 and tests[1].name == "Test Gold", vim.inspect(tests))
+  local debugs = import.configs_list("debug")
+  ok("configs_list('debug') filters to mode=debug",
+    #debugs == 1 and debugs[1].name == "Debug Gold", vim.inspect(debugs))
+
+  -- selection round-trips through state.json.
+  ok("get_selected() nil before any selection", import.get_selected() == nil)
+  local seln, selerr = import.set_selected("Debug Gold")
+  ok("set_selected('Debug Gold') ok", seln == true, tostring(selerr))
+  ok("selection persists in state.json's selected_launch_config",
+    store.read_state().selected_launch_config == "Debug Gold")
+  ok("get_selected() returns the name", import.get_selected() == "Debug Gold")
+  ok("configs_list annotates the selected entry",
+    import.configs_list("debug")[1].selected == true)
+  local _, bad = import.set_selected("No Such Config")
+  ok("set_selected of an unknown name → not_found",
+    type(bad) == "table" and bad.code == "not_found", vim.inspect(bad))
+
+  -- selected_base surfaces the mergeable fields.
+  local base = import.selected_base()
+  ok("selected_base carries build_flags/env/env_files/args",
+    base and base.build_flags == "-tags=gold" and base.env.PORT == "8081"
+      and base.env_files[1] == "${workspaceFolder}/../.config/test.env"
+      and base.args[1] == "--region=${input:region}", vim.inspect(base))
+
+  -- apply_selected_base merge semantics (pure — no compose).
+  local merged = import.apply_selected_base({ kind = "test", name = "gen",
+    program = "own-prog" })
+  ok("base build_flags fills an eff that lacks them",
+    merged.build_flags == "-tags=gold")
+  ok("base env merges into an eff that lacks it",
+    merged.env and merged.env.PORT == "8081")
+  ok("base program/args do NOT override an eff that has a program",
+    merged.program == "own-prog" and merged.args == nil)
+  local kept = import.apply_selected_base({ kind = "debug", name = "x",
+    build_flags = "-tags=own", env = { PORT = "9090" } })
+  ok("eff wins over base for build_flags + env keys",
+    kept.build_flags == "-tags=own" and kept.env.PORT == "9090")
+
+  -- read_config masks env VALUES (§8.2): keys only, never "8081".
+  local view = import.read_config("Debug Gold")
+  ok("read_config surfaces env KEYS only",
+    view and view.env_keys and view.env_keys[1] == "PORT")
+  ok("read_config never carries an env VALUE",
+    vim.inspect(view):find("8081", 1, true) == nil, vim.inspect(view))
+  ok("read_config substitutes + keeps build_flags",
+    view.build_flags == "-tags=gold"
+      and view.program == lj .. "/cmd/gold", vim.inspect(view))
+
+  -- run.config:changed fires on selection (action="selected").
+  local seen_action
+  local h = core.events.subscribe("run.config:changed", function(p)
+    if p and p.action == "selected" then seen_action = p end
+  end)
+  import.set_selected("Test Gold")
+  ok("set_selected publishes run.config:changed {action=selected}",
+    seen_action ~= nil and seen_action.action == "selected"
+      and seen_action.name == "Test Gold", vim.inspect(seen_action))
+  core.events.unsubscribe(h)
+
+  -- self-heal: a stored name absent from launch.json resolves to nil.
+  local st = store.read_state()
+  st.selected_launch_config = "Ghost Config"
+  store.write_state(st)
+  ok("get_selected self-heals a vanished selection", import.get_selected() == nil)
+
+  -- End-to-end: with "Debug Gold" selected, translating a kind=test
+  -- config that lacks build_flags/env picks the base up through
+  -- compose. Create the referenced env file so compose resolves it.
+  write_file(fx .. "/.config/test.env", "BASE_ENV_KEY=base-val\n")
+  import.set_selected("Debug Gold")
+  local dap_cfg, terr = require("auto-run.dap").translate("Test Gold-2")
+  ok("translate picks up the selected base's build_flags",
+    dap_cfg and dap_cfg.buildFlags == "-tags=gold", tostring(terr))
+  ok("translate picks up the selected base's env (config + env_file)",
+    dap_cfg and dap_cfg.env and dap_cfg.env.PORT == "8081"
+      and dap_cfg.env.BASE_ENV_KEY == "base-val", vim.inspect(dap_cfg and dap_cfg.env))
+
+  -- Leave no selection behind for later sections.
+  import.set_selected(nil)
+  ok("selection cleared for downstream sections",
+    import.get_selected() == nil
+      and store.read_state().selected_launch_config == nil)
+end
+
 -- ── [9] mailbox verbs — run.* envelopes ─────────────────────────
 print("\n[9] mailbox — run.* verb registration + envelope contracts")
 local commands = require("auto-core.mailbox.commands")

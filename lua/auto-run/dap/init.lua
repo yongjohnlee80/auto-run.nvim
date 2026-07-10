@@ -263,6 +263,9 @@ function M.translate(name, opts)
   if not eff then
     return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
   end
+  -- Fold the selected launch config (Config section) in as the active
+  -- base BEFORE substitution/composition — eff wins field-by-field.
+  eff = require("auto-run.import").apply_selected_base(eff)
 
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()
@@ -397,6 +400,10 @@ function M.debug_test(name, opts)
       return nil, "debug_test needs a kind=test config (got kind="
         .. tostring(eff.kind) .. ")"
     end
+    -- Selected launch config (Config section) as the active base —
+    -- contributes build_flags/env/env_files; its program/args never
+    -- override the generated test config's.
+    eff = require("auto-run.import").apply_selected_base(eff)
     local env_mod = require("auto-run.env")
     local ctx = env_mod.context()
     eff = env_mod.substitute_deep(eff, ctx)

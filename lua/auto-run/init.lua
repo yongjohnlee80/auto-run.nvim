@@ -36,7 +36,7 @@
 
 local M = {}
 
-M.version = "0.1.4"
+M.version = "0.1.5"
 
 ---@type boolean
 M._initialized = false
@@ -47,8 +47,8 @@ M._initialized = false
 ---`auto-core.events.register_topics` on setup (idempotent).
 M.TOPICS = {
   ["run.config:changed"] = {
-    doc     = "A run config / profile / store dir changed (add, update, remove, set_dir).",
-    payload = "{ name?: string, action: 'add'|'update'|'remove'|'set_dir', tier?: string, layer?: string, shared?: string, origin?: string }",
+    doc     = "A run config / profile / store dir changed, or the selected launch config (Config section) changed.",
+    payload = "{ name?: string, action: 'add'|'update'|'remove'|'set_dir'|'selected', tier?: string, layer?: string, shared?: string, origin?: string }",
   },
   ["run.job:started"] = {
     doc     = "A run/test job started (exec engine, §6).",

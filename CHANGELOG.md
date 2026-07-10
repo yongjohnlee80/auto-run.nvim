@@ -8,6 +8,28 @@ selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
 half. Smoke 579/0.
 
+### Added (Config section — launch-config selection)
+
+- **Per-repo selected launch config**, the config-side companion to the
+  §4.2 selected env file. `auto-run.import` gains a selection surface
+  mirroring `auto-run.env`: `configs_list(kind?)` (direct-parse of the
+  reachable `.vscode/launch.json` / `launch.json` via `entries()`,
+  optionally filtered to `test`/`debug`, each annotated `selected`),
+  `get_selected` / `set_selected` (persist a config NAME in the shared
+  tier's `state.json` key `selected_launch_config`; self-heals when the
+  entry vanishes), `read_config` (resolved fields for panel display with
+  env VALUES masked — keys only, §8.2), and `selected_base`.
+- **Active base for every launch.** `import.apply_selected_base(eff)`
+  merges the selected config UNDER the effective config field-by-field
+  (`eff` wins) at the invocation chokepoints (`dap.translate`,
+  `dap.debug_test`, `exec.prepare`): its `env_files` / `env` /
+  `build_flags` / `cwd` / `params` flow into every run/debug, while
+  `program`/`args` (a coupled launch invocation) apply only when `eff`
+  has no program of its own — so a generated test config's program is
+  never overridden. The selected env file (compose step 2.5) still wins
+  highest for env keys.
+- `run.config:changed` gains a `selected` action (fired on selection).
+
 ### Fixed
 
 - **DAP failed-start capture no longer false-positives on a successful
