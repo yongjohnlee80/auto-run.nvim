@@ -6,7 +6,23 @@ ADR-0048 Phase 3 (auto-run half) — test discovery + adapters — plus
 the Phase 4 gobugger-parity gate (§14.2) and the §4.2 (r5) env-file
 selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
-half. Smoke 576/0.
+half. Smoke 579/0.
+
+### Fixed
+
+- **DAP failed-start capture no longer false-positives on a successful
+  session.** `setup_error_capture` reset its `initialized` latch in
+  `before.launch`/`before.attach`, which races the adapter's
+  `initialized` event — delve emits that event right after the
+  initialize response, and it can arrive *before* nvim-dap sends the
+  launch request. The launch-time reset then clobbered the latch for
+  the whole session, so delve's harmless teardown console output
+  (`Type 'dlv help' for list of commands.`) was misreported as
+  `debug session failed to start`. The per-session baseline now resets
+  on `before.initialize` (guaranteed to run before the `initialized`
+  event); `before.launch`/`before.attach` clear only accumulated output,
+  never the latch. Genuine failed starts (no `initialized` event, real
+  stderr) still report. New smoke §37 asserts both directions.
 
 ### Added (§4.2 r5 — env-file selection, auto-run half)
 

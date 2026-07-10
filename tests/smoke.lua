@@ -3384,6 +3384,44 @@ local section36 = function()
 end
 section36()
 
+-- ── [37] dap failed-start capture — no false positive on success ──
+-- Runs LAST: the genuine-failure assertion persists `last_failure` in the
+-- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
+-- expectation earlier in the suite (which assumes nothing captured yet).
+-- Regression: `initialized` was reset in before.launch, which races the
+-- adapter's `initialized` event — that event can land BEFORE the launch
+-- request, so the launch-time reset clobbered the latch for the whole
+-- (successful) session, and delve's harmless teardown chatter
+-- ("Type 'dlv help' …") was misreported as a failed start. Baseline now
+-- resets on `initialize` (guaranteed pre-init) and launch clears only output.
+print("\n[37] dap failed-start capture — false-positive regression")
+do
+  local okd, dap = pcall(require, "dap")
+  ok("real nvim-dap on rtp (§37)", okd, tostring(dap))
+  local darp = require("auto-run.dap")
+  local L, K = dap.listeners, "auto-run-errors"
+  local baseline = darp.last_error()
+  -- Successful session, driven in the racy order: initialized BEFORE launch.
+  L.before.initialize[K](nil)
+  L.after.event_initialized[K](nil)
+  L.before.launch[K](nil)
+  L.after.event_output[K](nil,
+    { category = "console", output = "Type 'dlv help' for list of commands." })
+  L.after.event_terminated[K](nil, {})
+  ok("successful session records NO false-positive failed-start",
+    darp.last_error() == baseline, tostring(darp.last_error()))
+  -- Genuine failed start (no `initialized` event) is still captured.
+  L.before.initialize[K](nil)
+  L.before.launch[K](nil)
+  L.after.event_output[K](nil,
+    { category = "stderr", output = "Build error: could not launch process\n" })
+  L.after.event_terminated[K](nil, {})
+  local captured = darp.last_error()
+  ok("genuine failed start is still captured",
+    type(captured) == "string" and captured:find("Build error", 1, true) ~= nil,
+    tostring(captured))
+end
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

@@ -147,13 +147,26 @@ end
 local function setup_error_capture(dap)
   local key = LISTENER_KEY .. "-errors"
 
-  dap.listeners.before.launch[key] = function()
+  -- Reset the per-session baseline on `initialize` — the first request of
+  -- every session, guaranteed to run before the adapter's `initialized`
+  -- event. Resetting `initialized` in before.launch/before.attach (as we
+  -- used to) races that event: delve emits `initialized` right after the
+  -- initialize response, which can land *before* the launch request is
+  -- sent, so the launch-time reset would clobber the latch back to false
+  -- for the entire (successful) session. Any console chatter delve prints
+  -- at teardown ("Type 'dlv help' …") was then misreported as a failed
+  -- start. Baseline-on-initialize can't be clobbered that way.
+  dap.listeners.before.initialize[key] = function()
     err_lines = {}
     initialized = false
   end
+  -- Per launch/attach attempt, clear only stale output — never the latch,
+  -- so a race with `event_initialized` can't re-arm the failure path.
+  dap.listeners.before.launch[key] = function()
+    err_lines = {}
+  end
   dap.listeners.before.attach[key] = function()
     err_lines = {}
-    initialized = false
   end
   dap.listeners.after.event_initialized[key] = function()
     initialized = true
