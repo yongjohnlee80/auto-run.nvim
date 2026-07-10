@@ -29,8 +29,12 @@ M.defaults = {
   },
   ---launch.json interop (ADR-0048 §5).
   import = {
-    ---Relative candidates checked at each level of the upward walk.
-    launch_paths = { ".vscode/launch.json", "launch.json" },
+    ---Relative candidates checked at each level of the upward walk
+    ---(worktree root up to — and including — the bare-repo container,
+    ---which in a linked-worktree layout usually holds the shared
+    ---`.vscode/` / `.config/`). `.config/launch.json` supports repos
+    ---that keep editor config under `.config/` instead of `.vscode/`.
+    launch_paths = { ".vscode/launch.json", ".config/launch.json", "launch.json" },
   },
   ---Store behavior.
   store = {

@@ -988,6 +988,46 @@ do
   vim.fn.delete(dir, "rf")
 end
 
+-- ── [8.7] detection paths — .config / .vscode dirs ──────────────
+-- launch.json + .env are discovered under a repo's root, `.config/`,
+-- and `.vscode/` (and, via the same loop / upward walk, the bare-repo
+-- container). Restores the active worktree so [9] still sees `lj`.
+print("\n[8.7] detection — .config/.vscode dirs for launch.json + env")
+do
+  local prev_wt = worktree.get_active()
+  local det = fx .. "/det-repo"
+  ok("detection fixture repo created", make_plain_repo(det))
+  write_file(det .. "/.env", "ROOT=1\n")
+  write_file(det .. "/.config/svc.env", "CFG=1\n")
+  write_file(det .. "/.vscode/dbg.env", "VSC=1\n")
+  worktree.set_active(det)
+  store_paths.invalidate()
+
+  local names = {}
+  for _, c in ipairs(require("auto-run.env").files_list()) do
+    names[vim.fn.fnamemodify(c.path, ":t")] = true
+  end
+  ok("env discovery finds worktree-root .env", names[".env"], vim.inspect(names))
+  ok("env discovery finds .config/*.env", names["svc.env"], vim.inspect(names))
+  ok("env discovery finds .vscode/*.env", names["dbg.env"], vim.inspect(names))
+
+  write_file(det .. "/.config/launch.json",
+    '{ "version": "0.2.0", "configurations": [ '
+    .. '{ "name": "Cfg", "type": "go", "request": "launch", '
+    .. '"mode": "test", "program": "${workspaceFolder}" } ] }')
+  local found_path = import.find_launch_json()
+  ok("find_launch_json locates .config/launch.json",
+    type(found_path) == "string"
+      and found_path:find("/.config/launch.json", 1, true) ~= nil,
+    tostring(found_path))
+  local cfgs = import.configs_list()
+  ok("configs parse from .config/launch.json",
+    #cfgs == 1 and cfgs[1].name == "Cfg", vim.inspect(cfgs))
+
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end
+
 -- ── [9] mailbox verbs — run.* envelopes ─────────────────────────
 print("\n[9] mailbox — run.* verb registration + envelope contracts")
 local commands = require("auto-core.mailbox.commands")

@@ -8,6 +8,18 @@ selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
 half. Smoke 579/0.
 
+### Changed (config / env-file detection roots)
+
+- **launch.json + `.env` detection now spans `.config/` and `.vscode/`
+  under both the worktree root AND the bare-repo container.** In a
+  linked-worktree layout the shared `.vscode/` / `.config/` usually live
+  at the container, so both roots are scanned. `import.launch_paths`
+  gains `.config/launch.json` (the upward walk already reaches the
+  container before stopping at `.bare`/`.git`); `env.files_list` scans
+  `{worktree root, container} × {., .config/, .vscode/}` for
+  `.env` / `.env.*` / `*.env` (was: container `.config/` + worktree root
+  only). Per-file dedup keeps a repeated dir harmless. Smoke [8.7].
+
 ### Added (run output reconstruction — tests-panel `i`)
 
 - **`discovery.run_output(run_id, adapter, opts?)`** returns a recorded

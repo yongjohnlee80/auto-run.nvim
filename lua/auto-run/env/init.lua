@@ -397,14 +397,21 @@ function M.files_list()
       end
     end
   end
-  if dirs.container then
-    scan_dir(fs_path.join(dirs.container, ".config"), function(f)
-      return f:match("%.env$") ~= nil
-    end)
-  end
-  scan_dir(dirs.root or dirs.anchor, function(f)
+  -- Env-file discovery across the worktree root AND the bare-repo
+  -- container (which, in a linked-worktree layout, usually holds the
+  -- shared `.config/` / `.vscode/`), each scanned at its root plus its
+  -- `.config/` and `.vscode/` subdirs. Per-file dedup (`seen`) makes a
+  -- repeated dir (e.g. container == root in a plain clone) harmless.
+  local function is_env(f)
     return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
-  end)
+  end
+  for _, base in ipairs({ dirs.root or dirs.anchor, dirs.container }) do
+    if base then
+      scan_dir(base, is_env)
+      scan_dir(fs_path.join(base, ".config"), is_env)
+      scan_dir(fs_path.join(base, ".vscode"), is_env)
+    end
+  end
   table.sort(found)
   for _, p in ipairs(found) do
     out[#out + 1] = { path = p, source = "discovered", exists = true }
