@@ -8,6 +8,22 @@ selection surface (auto-run half). The auto-finder `tests`/`debug`
 views (including the r5 Env section UI) are the separate auto-finder
 half. Smoke 579/0.
 
+### Added (debug-panel Entry Points: run-in-terminal + launch.json export)
+
+- **`exec.command_line(name, opts?)`** builds a terminal-ready shell
+  command for RUNNING a config without launching it (the auto-finder
+  debug panel's `r` chansends this into an auto-agents playground
+  terminal). Go-aware: `go run <build_flags> <program>` for run/debug
+  configs, `go test <build_flags> <package>` for test configs, the bare
+  `program` otherwise. Composed env is sourced from a materialized env
+  FILE (`set -a; . file; set +a; …`) so secret values never appear on the
+  command line; `cd <cwd> &&` prefixed.
+- **`import.export(name, opts?)`** serializes a store config to a VSCode
+  `launch.json` entry (VSCode field order) and appends it — or replaces
+  the same-name entry — in the nearest reachable `launch.json`; when none
+  is reachable it creates `<worktree>/.config/launch.json`. Fires
+  `run.config:changed {action="export"}`. Smoke [8.8].
+
 ### Changed (config / env-file detection roots)
 
 - **launch.json + `.env` detection now spans `.config/` and `.vscode/`

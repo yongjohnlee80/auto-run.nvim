@@ -36,7 +36,7 @@
 
 local M = {}
 
-M.version = "0.1.7"
+M.version = "0.1.8"
 
 ---@type boolean
 M._initialized = false
@@ -48,7 +48,7 @@ M._initialized = false
 M.TOPICS = {
   ["run.config:changed"] = {
     doc     = "A run config / profile / store dir changed, or the selected launch config (Config section) changed.",
-    payload = "{ name?: string, action: 'add'|'update'|'remove'|'set_dir'|'selected', tier?: string, layer?: string, shared?: string, origin?: string }",
+    payload = "{ name?: string, action: 'add'|'update'|'remove'|'set_dir'|'selected'|'export', tier?: string, layer?: string, shared?: string, origin?: string, path?: string }",
   },
   ["run.job:started"] = {
     doc     = "A run/test job started (exec engine, §6).",

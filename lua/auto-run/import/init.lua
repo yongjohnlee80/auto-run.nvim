@@ -555,4 +555,133 @@ function M.import(name, opts)
   return summary, nil
 end
 
+-- ── export (config → launch.json entry, §5) ────────────────────
+
+---VSCode launch.json field order for a Go config entry (present keys only).
+local EXPORT_FIELD_ORDER = {
+  "name", "type", "request", "mode", "program", "cwd",
+  "args", "buildFlags", "env", "envFile",
+}
+
+---Serialize one launch.json entry to pretty JSON at `indent` columns,
+---emitting only present keys in VSCode field order. Values via
+---vim.json.encode (nested env/args stay compact but valid).
+---@param entry table
+---@param indent integer
+---@return string
+local function encode_entry(entry, indent)
+  local pad, pad2 = string.rep(" ", indent), string.rep(" ", indent + 2)
+  local lines = {}
+  for _, k in ipairs(EXPORT_FIELD_ORDER) do
+    if entry[k] ~= nil then
+      lines[#lines + 1] = pad2 .. vim.json.encode(k) .. ": " .. vim.json.encode(entry[k])
+    end
+  end
+  return pad .. "{\n" .. table.concat(lines, ",\n") .. "\n" .. pad .. "}"
+end
+
+---A full launch.json (0.2.0) string from a configurations array.
+---@param configs table[]
+---@return string
+local function encode_file(configs)
+  if #configs == 0 then
+    return '{\n  "version": "0.2.0",\n  "configurations": []\n}\n'
+  end
+  local entries = {}
+  for _, c in ipairs(configs) do entries[#entries + 1] = encode_entry(c, 4) end
+  return '{\n  "version": "0.2.0",\n  "configurations": [\n'
+    .. table.concat(entries, ",\n") .. "\n  ]\n}\n"
+end
+
+---Map a store config record to a launch.json entry (raw `${...}` tokens
+---kept — VSCode + our importer resolve them). Only the config's authored
+---inline `env` is written (composed secrets are never part of the record).
+---@param eff table
+---@return table
+local function denormalize(eff)
+  local entry = {
+    name    = eff.name,
+    type    = eff.runtime or "go",
+    request = "launch",
+    mode    = eff.kind == "test" and "test" or "debug",
+  }
+  if type(eff.program) == "string" and eff.program ~= "" then entry.program = eff.program end
+  if type(eff.cwd) == "string" and eff.cwd ~= "" then entry.cwd = eff.cwd end
+  if type(eff.args) == "table" and #eff.args > 0 then entry.args = eff.args end
+  if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
+    entry.buildFlags = eff.build_flags
+  end
+  if type(eff.env) == "table" and next(eff.env) ~= nil then entry.env = eff.env end
+  if type(eff.env_files) == "table" and eff.env_files[1] then
+    entry.envFile = eff.env_files[1]
+  end
+  return entry
+end
+
+---Export a store config as a VSCode launch.json entry. Appends — or
+---replaces the same-name entry — in the nearest reachable launch.json;
+---when none is reachable, creates `<worktree root>/.config/launch.json`.
+---Comments in an existing file are NOT preserved (JSONC is re-serialized).
+---Fires `run.config:changed {action="export"}`.
+---@param name string  store config name
+---@param opts { target: string? }?  explicit launch.json path override
+---@return string? path, table? err
+function M.export(name, opts)
+  opts = opts or {}
+  local store = require("auto-run.store")
+  local eff, gerr = store.get(name)
+  if not eff then
+    return nil, structured_err("not_found",
+      "export: no config named '" .. tostring(name) .. "': " .. tostring(gerr))
+  end
+  local entry = denormalize(eff)
+
+  local target = opts.target or M.find_launch_json()
+  if not target then
+    local dirs = store.resolve_run_dirs()
+    local root = dirs.root or dirs.anchor
+    if type(root) ~= "string" or root == "" then
+      return nil, structured_err("no_workspace",
+        "export: cannot resolve a worktree root for the default .config/ target")
+    end
+    target = fs_path.join(root, ".config", "launch.json")
+  end
+
+  local configs = {}
+  if fs_path.is_file(target) then
+    local f = io.open(target, "r")
+    if f then
+      local content = f:read("*a")
+      f:close()
+      local data = M.parse(content)
+      if type(data) == "table" and type(data.configurations) == "table" then
+        configs = data.configurations
+      end
+    end
+  end
+
+  local replaced = false
+  for i, c in ipairs(configs) do
+    if type(c) == "table" and c.name == entry.name then
+      configs[i] = entry
+      replaced = true
+      break
+    end
+  end
+  if not replaced then configs[#configs + 1] = entry end
+
+  vim.fn.mkdir(fs_path.parent(target), "p")
+  local ok_w, werr = pcall(function()
+    local fh = assert(io.open(target, "w"))
+    fh:write(encode_file(configs))
+    fh:close()
+  end)
+  if not ok_w then
+    return nil, structured_err("write_failed", "export: " .. tostring(werr))
+  end
+  publish("run.config:changed", { action = "export", name = name, path = target })
+  log.debug("import", "exported config to launch.json")
+  return target, nil
+end
+
 return M

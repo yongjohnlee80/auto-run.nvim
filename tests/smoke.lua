@@ -1028,6 +1028,60 @@ do
   store_paths.invalidate()
 end
 
+-- ── [8.8] exec.command_line (debug panel `r`) + import.export (`a`) ──
+print("\n[8.8] exec.command_line + import.export (launch.json)")
+do
+  local exec = require("auto-run.exec")
+  -- command_line: go debug config → `go run` + tags, env sourced from a
+  -- FILE (secrets off the command line), cd-prefixed.
+  -- render_cmdline shell-escapes each token, so argv reads `'go' 'run'`.
+  local cmd, cerr = exec.command_line("Debug Gold")
+  ok("command_line builds a go-run line for a debug config",
+    type(cmd) == "string" and cmd:find("'go' 'run'", 1, true)
+      and cmd:find("tags=gold", 1, true) and cmd:find("cmd/gold", 1, true) ~= nil,
+    tostring(cerr or cmd))
+  ok("command_line sources env from a FILE (no inline secret values)",
+    type(cmd) == "string" and cmd:find("set -a; .", 1, true) ~= nil, tostring(cmd))
+  ok("command_line prefixes cd <cwd>",
+    type(cmd) == "string" and cmd:find("^cd ", 1) ~= nil, tostring(cmd))
+  local tcmd = exec.command_line("Test Gold-2")
+  ok("command_line builds a go-test line for a test config",
+    type(tcmd) == "string" and tcmd:find("'go' 'test'", 1, true) ~= nil, tostring(tcmd))
+
+  -- export: append/replace into the reachable launch.json (lj/.vscode).
+  local path, xerr = import.export("Debug Gold")
+  ok("export returns the target launch.json path",
+    type(path) == "string" and path:find("launch.json", 1, true) ~= nil, tostring(xerr))
+  local body = ""
+  if type(path) == "string" then
+    local jf = io.open(path, "r")
+    if jf then body = jf:read("*a"); jf:close() end
+  end
+  ok("exported launch.json carries the entry + buildFlags",
+    body:find('"Debug Gold"', 1, true) and body:find("tags=gold", 1, true) ~= nil, body)
+  local round = false
+  for _, c in ipairs(import.configs_list()) do
+    if c.name == "Debug Gold" then round = true break end
+  end
+  ok("exported entry re-parses back through configs_list", round)
+
+  -- export with NO launch.json → creates <worktree>/.config/launch.json.
+  local prev_wt = worktree.get_active()
+  local fresh = fx .. "/export-fresh"
+  ok("fresh repo created", make_plain_repo(fresh))
+  worktree.set_active(fresh)
+  store_paths.invalidate()
+  local padd = store.add({ name = "Solo", kind = "debug", runtime = "go",
+    program = "${worktree}/cmd/solo" })
+  ok("config added to fresh repo", padd ~= nil)
+  local np, nerr = import.export("Solo")
+  ok("export with no launch.json creates <root>/.config/launch.json",
+    type(np) == "string" and np:find("/.config/launch.json", 1, true) ~= nil
+      and vim.fn.filereadable(np) == 1, tostring(nerr or np))
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end
+
 -- ── [9] mailbox verbs — run.* envelopes ─────────────────────────
 print("\n[9] mailbox — run.* verb registration + envelope contracts")
 local commands = require("auto-core.mailbox.commands")

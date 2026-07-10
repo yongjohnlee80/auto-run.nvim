@@ -130,6 +130,69 @@ local function launch_cwd(eff)
   return dirs.root or dirs.anchor
 end
 
+---Build a terminal-ready shell command for RUNNING a config, without
+---launching it (the auto-finder debug panel's `r` chansends this into a
+---playground terminal). Go-aware: `go run <build_flags> <program>` for
+---run/debug configs, `go test <build_flags> <package>` for test configs,
+---the bare `program` for other runtimes. Composed env is sourced from a
+---materialized env FILE (`set -a; . file; set +a; …`) — secret VALUES
+---never appear in the visible command line, same as the `term` strategy.
+---Prefixed with `cd <cwd> && …`.
+---@param name string
+---@param opts AutoRunStartOpts?
+---@return string? cmdline, string? err, table? detail
+function M.command_line(name, opts)
+  opts = opts or {}
+  local prep, perr, detail = prepare(name, opts)
+  if not prep then return nil, perr, detail end
+  local eff = prep.eff
+
+  local is_go = (eff.runtime == "go" or eff.runtime == nil)
+  local function with_flags(base)
+    if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
+      for _, f in ipairs(vim.split(eff.build_flags, "%s+", { trimempty = true })) do
+        base[#base + 1] = f
+      end
+    end
+  end
+
+  local argv
+  if eff.kind == "test" and is_go then
+    argv = { "go", "test" }
+    with_flags(argv)
+    argv[#argv + 1] = eff.program or "./..."
+  elseif is_go then
+    if type(eff.program) ~= "string" or eff.program == "" then
+      return nil, "config '" .. tostring(name) .. "' has no program to run"
+    end
+    argv = { "go", "run" }
+    with_flags(argv)
+    argv[#argv + 1] = eff.program
+  else
+    if type(eff.program) ~= "string" or eff.program == "" then
+      return nil, "config '" .. tostring(name) .. "' has no program to run"
+    end
+    argv = { eff.program }
+  end
+  for _, a in ipairs(eff.args or {}) do argv[#argv + 1] = a end
+
+  local env_file
+  if next(prep.comp.env) ~= nil then
+    -- run_id must be path-safe (config names may contain spaces).
+    local safe = name:gsub("[^%w_%-]", "_")
+    local path, merr = require("auto-run.env").materialize("term-" .. safe, prep.comp.env)
+    if not path then return nil, "env materialize failed: " .. tostring(merr) end
+    env_file = path
+  end
+
+  local line = strategies.render_cmdline(argv, env_file)
+  local cwd = launch_cwd(eff)
+  if type(cwd) == "string" and cwd ~= "" then
+    line = "cd " .. vim.fn.shellescape(cwd) .. " && " .. line
+  end
+  return line, nil, nil
+end
+
 -- ── start ───────────────────────────────────────────────────────
 
 ---@class AutoRunStartOpts
