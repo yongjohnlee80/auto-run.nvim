@@ -247,8 +247,11 @@ composition (`env_file_missing`), never a silent skip.
 ```
 
 Candidates are the env files referenced by configs/profiles plus a
-bounded **non-recursive** glob over `<container>/.config/*.env` and
-`<worktree>/{.env,.env.*,*.env}`. The selection persists in the
+bounded **non-recursive** glob over **both the worktree root and the
+bare-repo container**, each scanned at its root plus `.config/` and
+`.vscode/` (`{.env,.env.*,*.env}`) — in a linked-worktree layout the
+shared editor config usually lives at the container. The selection
+persists in the
 shared-local tier's `state.json`, worktree-relative when the file
 sits under the worktree root — switching worktrees within the same
 container re-anchors the pick to the new worktree's copy. `:AutoRun
@@ -265,6 +268,44 @@ order and each entry's quoting style; structured
 Changes publish `run.env:changed` carrying the path + KEY name only —
 env **values** never enter logs, events, or mailbox responses
 (`run.env_list` returns file paths + sorted key names only).
+
+### Launch-config selection & launch.json interop
+
+The config-side companion to the env-file selection, consumed by the
+auto-finder **Config** section. `auto-run.import` gains a selection
+surface mirroring `auto-run.env`:
+
+- `import.configs_list(kind?)` — the reachable `launch.json` configs
+  (`entries()`), optionally filtered to `test` / `debug`, each annotated
+  `selected`; `import.get_selected()` / `import.set_selected(name|nil)`
+  persist a config **name** in the shared tier's `state.json`
+  (self-heals when the entry vanishes) and fire `run.config:changed`
+  `{action="selected"}`.
+- `import.apply_selected_base(eff)` merges the selected config **under**
+  the effective config at the launch chokepoints (`dap.translate`,
+  `dap.debug_test`, `exec.prepare`): `env_files` / `env` / `build_flags`
+  / `cwd` / `params` flow into every run/debug; `program`/`args` apply
+  only when the invoked config has none. `import.read_config(name)`
+  returns resolved fields for panel display with env **values masked**.
+- `import.export(name)` serializes a store config to a `launch.json`
+  entry (VSCode field order), appending — or replacing the same-name
+  entry — in the nearest reachable `launch.json`, else creating
+  `<worktree>/.config/launch.json`.
+
+Two more launch-time surfaces back the auto-finder debug panel:
+
+- `exec.command_line(name)` — a terminal-ready shell command for running
+  a config without launching (`go run` / `go test` + `build_flags`, env
+  sourced from a file so secrets stay off the command line, `cd`-prefixed).
+- `discovery.run_output(run_id, adapter)` — a run's human/terminal output,
+  reconstructed via the adapter's optional `output(exit, opts?)` hook (the
+  go adapter re-joins the `go test -json` `Output` events).
+
+> **delve `dlvCwd`:** `dap.translate` sets both `cwd` (the debugged
+> program's run dir) **and** `dlvCwd` (delve's own build dir) to the
+> config's cwd, else the worktree root. Without `dlvCwd`, delve runs
+> `go build` from Neovim's cwd — outside the module in a multi-repo
+> parent — and the launch dies "go.mod not found / Failed to launch".
 
 ### Breakpoint persistence
 
