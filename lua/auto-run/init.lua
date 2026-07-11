@@ -36,7 +36,7 @@
 
 local M = {}
 
-M.version = "0.1.9"
+M.version = "0.1.10"
 
 ---@type boolean
 M._initialized = false

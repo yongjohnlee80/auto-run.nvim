@@ -1052,9 +1052,11 @@ do
   -- none — WITHOUT this, delve builds in nvim's cwd (outside the module
   -- in a multi-repo parent) and dies "Failed to launch".
   local dcfg = require("auto-run.dap").translate("Debug Gold")
-  ok("translate defaults cwd to the worktree root (delve build context)",
+  ok("translate defaults cwd to the worktree root (program run dir)",
     type(dcfg) == "table" and type(dcfg.cwd) == "string"
       and dcfg.cwd:find("lj%-repo") ~= nil, vim.inspect(dcfg and dcfg.cwd))
+  ok("translate sets dlvCwd = cwd (delve build dir → in-module go build)",
+    type(dcfg) == "table" and dcfg.dlvCwd == dcfg.cwd, vim.inspect(dcfg and dcfg.dlvCwd))
 
   -- export: append/replace into the reachable launch.json (lj/.vscode).
   local path, xerr = import.export("Debug Gold")

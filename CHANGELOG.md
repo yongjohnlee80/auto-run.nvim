@@ -10,6 +10,14 @@ half. Smoke 579/0.
 
 ### Fixed
 
+- **`dap.translate` now also sets `dlvCwd` to the worktree root.** `cwd`
+  only sets the debugged program's run dir; delve runs `go build` from
+  its OWN working directory (nvim's cwd — outside the module in a
+  multi-repo parent), so the build failed "go.mod not found" → "Failed
+  to launch" even with `cwd` set. `dlvCwd` points delve's build at the
+  module. Verified against a live `dlv dap` launch (dlvCwd=<worktree> →
+  in-module build → `success:true`). Completes the v0.1.9 cwd fix for
+  the debug panel `d`. Smoke [8.8].
 - **`dap.translate` now defaults `cwd` to the anchor's worktree root**
   when a config sets none. Without it, delve was spawned in Neovim's cwd
   — which in a multi-repo parent is OUTSIDE the module — so

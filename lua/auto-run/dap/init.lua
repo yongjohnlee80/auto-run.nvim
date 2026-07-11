@@ -295,6 +295,12 @@ function M.translate(name, opts)
       name    = eff.name,
       program = eff.program,
       cwd     = cwd,
+      -- delve's OWN working dir for the `go build` step. `cwd` only sets
+      -- the debugged program's run dir; without dlvCwd delve builds from
+      -- nvim's cwd (outside the module in a multi-repo parent) → "go.mod
+      -- not found" → "Failed to launch". Verified via a live dlv dap
+      -- launch: dlvCwd=<worktree> builds in-module and succeeds.
+      dlvCwd  = cwd,
     }
     if type(eff.args) == "table" and #eff.args > 0 then
       dap_cfg.args = eff.args
