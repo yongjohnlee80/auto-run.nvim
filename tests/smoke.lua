@@ -1,7 +1,12 @@
 -- auto-run.nvim — smoke test driver (ADR-0048 Phase 1)
 --
 -- Run headless:
---   nvim --headless -u tests/smoke.lua -c 'qa!'
+--   nvim --headless -u NONE -l tests/smoke.lua
+--
+-- Use `-u NONE -l`, NOT `-u tests/smoke.lua -c 'qa!'`: under `-c 'qa!'`
+-- an uncaught throw that aborts the suite mid-run is swallowed and the
+-- trailing `qa!` still quits EXIT 0 — a silent, green, partial run. Under
+-- `-l` the error propagates and nvim exits 1. (Convention §2/§3.)
 --
 -- Per [[lua-nvim-plugin-development]] every iteration extends this
 -- driver and runs it green before reporting complete. Sections:
@@ -15,6 +20,10 @@
 --   [6] substitution tokens
 --   [7] env pipeline (trust gate, materialization, sweep)
 --   [8] launch.json import + read-through contract
+--   [8.5] import — launch-config selection + active-base merge
+--   [8.6] discovery.run_output + go.output — terminal-log reconstruction
+--   [8.7] detection — .config/.vscode dirs for launch.json + env
+--   [8.8] exec.command_line + import.export (launch.json)
 --   [9] mailbox verb envelopes (handlers called in-process)
 --   [10] exec — job engine end-to-end (§6)
 --   [11] exec — strategy resolution + terminal provider probe
@@ -39,10 +48,11 @@
 --   [30] import — REAL launch.json sample (LabelManager copy)
 --   [31] import + debug_test — go-test-env skill shape → dap-go merge
 --   [32] exec — pick_config kind filter + per-repo pick memory
---   [33] keymaps — gobugger→auto-run remap audit (ADR §10, programmatic)
---   [34] doctor — gobugger parity rows + `--fix` worktree repair
+--   [33] keymaps — auto-run remap-target surface + gobugger-absent guard (ADR §10)
+--   [34] doctor — git/worktree + config rows + `--fix` worktree repair
 --   [35] keymaps — rt/rf/dt discovery-position routing + fallback
 --   [36] env — §4.2 (r5) selection, candidates, var editing, masking
+--   [37] dap failed-start capture — false-positive regression
 --
 -- Discipline: assert the public contract, never internals; every
 -- fixture lives under one tempname-derived root we control (no
@@ -3018,101 +3028,52 @@ do
   vim.ui.select = real_select
 end
 
--- ── [33] keymaps — gobugger→auto-run remap audit (ADR §10) ──────
-print("\n[33] keymaps — gobugger→auto-run remap audit (programmatic)")
+-- ── [33] keymaps — auto-run remap-target surface (ADR §10) ──────
+-- gobugger.nvim was fully replaced by auto-run (ADR-0048 Phase 4) and is
+-- permanently gone, so the old "probe gobugger's live default_keymaps and
+-- prove parity" audit has no counterpart left to compare against — it
+-- produced 3 hard FAILs and, worse, 2 assertions that passed VACUOUSLY
+-- over an empty captured-keymap list (a vacuous green hides more than a
+-- red does). Pruned. What survives defends auto-run's OWN surface: the
+-- command replacements for the dropped bindings (dE → :AutoRun
+-- last-error, dF → doctor --fix) and the descriptions on the remapped
+-- run-namespace keys (dr → <leader>rl, dM/dN → <leader>rc), per the ADR
+-- §10 disposition.
+print("\n[33] keymaps — auto-run remap-target surface (ADR §10)")
 do
-  -- gobugger's ACTUAL default_keymaps list is the source of truth:
-  -- capture every lhs it registers (sibling worktree preferred, lazy
-  -- install fallback) and assert each one is accounted for by the
-  -- ADR §10 disposition table — kept, remapped, or dropped-to-command.
-  local gob_root = workspace .. "/gobugger.nvim/main"
-  if vim.fn.isdirectory(gob_root) == 0 then gob_root = LAZY .. "/gobugger.nvim" end
-  ok("gobugger available for the audit probe",
-    vim.fn.isdirectory(gob_root) == 1, gob_root)
-  vim.opt.rtp:prepend(gob_root)
+  -- Guard (P6): gobugger must STAY gone. If it is ever reintroduced,
+  -- fail loudly here rather than silently re-enabling a parity gate that
+  -- iterates over nothing.
+  local gob_present = vim.fn.isdirectory(workspace .. "/gobugger.nvim/main") == 1
+    or vim.fn.isdirectory(LAZY .. "/gobugger.nvim") == 1
+    or (pcall(require, "gobugger"))
+  ok("gobugger stays absent (replaced by auto-run, ADR-0048 P4)",
+    not gob_present,
+    "gobugger reappeared — the §10 parity audit was pruned on its removal; restore a real gate")
 
-  -- Stub the optional dap deps so EVERY dep-gated binding registers
-  -- on both sides (restored below).
-  local saved_dv, saved_dg = package.loaded["dap-view"], package.loaded["dap-go"]
-  package.loaded["dap-view"] = {
-    toggle = function() end, add_expr = function() end, eval = function() end,
-  }
-  package.loaded["dap-go"] = { debug_test = function() end, setup = function() end }
-
-  local gob_lhs = {}
-  local real_set = vim.keymap.set
-  vim.keymap.set = function(_, lhs, _, _)  -- capture-only: never binds
-    gob_lhs[#gob_lhs + 1] = lhs
-  end
-  local okg, gerr = pcall(function() require("gobugger").default_keymaps() end)
-  vim.keymap.set = real_set
-  ok("gobugger default_keymaps probe ran", okg, tostring(gerr))
-  ok("probe captured the full gobugger surface (24 bindings)",
-    #gob_lhs == 24, vim.inspect(gob_lhs))
-
-  -- ADR §10 disposition — every gobugger lhs maps here.
-  local REMAP = {  -- gobugger lhs → auto-run lhs (kept / renamed)
-    ["<F9>"] = "<F9>", ["<F8>"] = "<F8>", ["<F7>"] = "<F7>", ["<F10>"] = "<F10>",
-    ["<leader>db"] = "<leader>db", ["<leader>dB"] = "<leader>dB",
-    ["<leader>dC"] = "<leader>dC", ["<leader>dc"] = "<leader>dc",
-    ["<leader>dr"] = "<leader>rl",   -- run last → the run namespace
-    ["<leader>dq"] = "<leader>dq", ["<leader>dR"] = "<leader>dR",
-    ["<leader>dv"] = "<leader>dv", ["<leader>dw"] = "<leader>dw",
-    ["<leader>de"] = "<leader>de",
-    ["<leader>da"] = "<leader>da", ["<leader>dA"] = "<leader>dA",
-    ["<leader>dt"] = "<leader>dt", ["<leader>dm"] = "<leader>dm",
-    ["<leader>dM"] = "<leader>rc",   -- scaffold keys merged into rc
-    ["<leader>dN"] = "<leader>rc",
-    ["<leader>dD"] = "<leader>dD",
-  }
-  local DROPPED = {  -- moved to the command surface per §10
-    ["<leader>dL"] = "(store auto-reloads; :AutoRun list)",
-    ["<leader>dE"] = ":AutoRun last-error",
-    ["<leader>dF"] = ":AutoRun doctor --fix",
-  }
-
-  -- Register auto-run's set with the stubs live so the dep-gated
-  -- bindings (da / dv / dw / de) exist for the assertion.
+  -- Register auto-run's keymaps so the remapped targets exist.
   auto_run.default_keymaps()
 
-  local missing, unaccounted = {}, {}
-  for _, lhs in ipairs(gob_lhs) do
-    local target = REMAP[lhs]
-    if target then
-      local m = vim.fn.maparg(target, "n", false, true)
-      local bound = type(m) == "table" and (m.callback ~= nil or (m.rhs or "") ~= "")
-      if not bound then missing[#missing + 1] = lhs .. " → " .. target end
-    elseif DROPPED[lhs] == nil then
-      unaccounted[#unaccounted + 1] = lhs
-    end
-  end
-  ok("every KEEP-listed gobugger lhs is registered by auto-run",
-    #missing == 0, vim.inspect(missing))
-  ok("every gobugger binding is accounted for (keep/remap/drop)",
-    #unaccounted == 0, vim.inspect(unaccounted))
-
-  -- The dropped bindings' replacement command surfaces exist.
+  -- Dropped gobugger bindings (dL/dE/dF) moved to the command surface
+  -- per §10 — their replacements must respond.
   local le_out = vim.api.nvim_exec2("AutoRun last-error", { output = true }).output
   ok("dE replacement — :AutoRun last-error responds",
     le_out:find("auto%-run") ~= nil, le_out)
   ok("dF replacement — doctor completion offers --fix",
     contains(vim.fn.getcompletion("AutoRun doctor ", "cmdline"), "--fix"))
 
-  -- Spot-check the remapped targets carry auto-run descs (not stale
-  -- gobugger bindings that happened to share the lhs).
+  -- Remapped run-namespace targets carry auto-run's own descs (not a
+  -- stale binding that happened to share the lhs).
   local rl = vim.fn.maparg("<leader>rl", "n", false, true)
   local rc = vim.fn.maparg("<leader>rc", "n", false, true)
   ok("dr → <leader>rl is auto-run's Run Last",
     type(rl) == "table" and rl.desc == "Run: Run Last", vim.inspect(rl.desc))
   ok("dM/dN → <leader>rc is auto-run's scaffold",
     type(rc) == "table" and rc.desc == "Run: New Run Config (scaffold)")
-
-  package.loaded["dap-view"] = saved_dv
-  package.loaded["dap-go"] = saved_dg
 end
 
--- ── [34] doctor — gobugger parity rows + --fix repair ───────────
-print("\n[34] doctor — gobugger parity rows + --fix worktree repair")
+-- ── [34] doctor — git/worktree + config rows + --fix repair ─────
+print("\n[34] doctor — git/worktree + config rows + --fix worktree repair")
 do
   -- Parity rows on the go fixture: project root + marker, anchor
   -- .git kind, git status, common dir, go module root, configs per
