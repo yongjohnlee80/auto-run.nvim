@@ -253,6 +253,31 @@ function M.store_exists(dirs)
   return false
 end
 
+---Absolute path of the file that DEFINES a config, or nil when the name has
+---no own file — either it does not exist, or it resolves to a launch.json
+---read-through shim, which the store does not own (edit those via
+---`:AutoRun import`).
+---
+---Tier precedence is the store's own (tracked wins over shared), so the path
+---returned is the file `get(name)` reads its OWN layer from. Exposed because
+---consumers were reconstructing it from `configs_dir()` + `name .. ".json"`,
+---which duplicates the store's layout in a caller and silently rots if the
+---record naming ever changes (ADR-0048 Phase 3 follow-up;
+---[[auto-family-state-ownership]] — the owner of a location publishes it).
+---@param name string
+---@return string? path
+function M.config_file(name)
+  if type(name) ~= "string" or name == "" then return nil end
+  local dirs = paths.resolve_run_dirs()
+  for _, tier in ipairs({ dirs.tracked, dirs.shared }) do
+    if type(tier) == "string" then
+      local candidate = record_path(tier, "configs", name)
+      if fs_path.is_file(candidate) then return candidate end
+    end
+  end
+  return nil
+end
+
 ---Read-through shims from `auto-run.import` (lazy require — the
 ---import module requires the store back for `add`).
 ---@param dirs AutoRunDirs

@@ -376,6 +376,20 @@ local decoded = vim.json.decode(
   table.concat(vim.fn.readfile(plain .. "/.auto-run/configs/go-base.json"), "\n"))
 ok("stored file is strict JSON with the config", decoded.name == "go-base")
 
+-- config_file(): the public resolver consumers use instead of rebuilding
+-- `configs_dir() .. "/" .. name .. ".json"` themselves (ADR-0048 Phase 3
+-- follow-up). It must agree with where add() actually wrote.
+ok("config_file() resolves the tracked config's own file",
+  store.config_file("go-base") == plain .. "/.auto-run/configs/go-base.json",
+  tostring(store.config_file("go-base")))
+ok("config_file() agrees with the path add() returned",
+  store.config_file("go-base") == path1, tostring(path1))
+ok("config_file() returns nil for a name with no stored file",
+  store.config_file("no-such-config") == nil,
+  tostring(store.config_file("no-such-config")))
+ok("config_file() rejects a non-string / empty name",
+  store.config_file(nil) == nil and store.config_file("") == nil)
+
 local _, dup_err = store.add({ name = "go-base", kind = "run" }, { tier = "tracked" })
 ok("same-tier duplicate refused without overwrite",
   dup_err ~= nil and dup_err:match("already exists") ~= nil, tostring(dup_err))
@@ -406,6 +420,13 @@ store.add({ name = "svc-a", kind = "debug", program = "/shared/bin" },
 local eff_a2 = store.get("svc-a")
 ok("shared-local layer wins over tracked",
   eff_a2 and eff_a2.program == "/shared/bin")
+-- config_file() answers "which file DEFINES this name's own layer", and its
+-- tier precedence is the store's (tracked first) — deliberately NOT the merge
+-- precedence above, where the shared overlay wins the VALUE. `e` on a config
+-- row must open the tracked definition, not the overlay.
+ok("config_file() prefers the tracked tier when both tiers hold the name",
+  store.config_file("svc-a") == plain .. "/.auto-run/configs/svc-a.json",
+  tostring(store.config_file("svc-a")))
 ok("plain-repo shared tier scaffolds .auto-run/.gitignore",
   vim.fn.filereadable(plain .. "/.auto-run/.gitignore") == 1
     and table.concat(vim.fn.readfile(plain .. "/.auto-run/.gitignore"), "\n"):match("local/") ~= nil)
