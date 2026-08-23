@@ -1637,6 +1637,60 @@ do
   ok("stats() reports the store",
     stats.file == container .. "/.auto-run/breakpoints.json"
       and stats.count == 1 and stats.files == 1, vim.inspect(stats))
+
+  -- ── remove(path, lnum): cursor-independent single removal ──────
+  -- toggle/set act at the cursor and clear_all is all-or-nothing, so this is
+  -- the only way to drop ONE known breakpoint. Both branches are exercised,
+  -- because the store's rule ("live wins for loaded paths") makes the loaded
+  -- and unloaded cases genuinely different code paths.
+  ok("remove() rejects a bad path", (P2.bps.remove("", 3)) == nil)
+  ok("remove() rejects a non-integer lnum",
+    (P2.bps.remove("src/app.lua", 0)) == nil
+      and (P2.bps.remove("src/app.lua", 1.5)) == nil)
+
+  -- (a) LOADED buffer. Control first: the record is present before we act,
+  -- otherwise "gone afterwards" would pass against an empty store.
+  ok("remove() CONTROL — the target record exists before removal",
+    find_bp(read_bp_store(), "src/app.lua", 5) ~= nil)
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })   -- cursor deliberately elsewhere
+  local r_ok, r_err = P2.bps.remove("src/app.lua", 5)
+  ok("remove() succeeds on a loaded buffer regardless of cursor",
+    r_ok == true, tostring(r_err))
+  ok("remove() drops the record from the store",
+    find_bp(read_bp_store(), "src/app.lua", 5) == nil,
+    vim.inspect(read_bp_store()))
+  ok("remove() also clears nvim-dap's live registry for that line",
+    (function()
+      local okb, dbp = pcall(require, "dap.breakpoints")
+      if not okb then return false end
+      for _, bp in ipairs((dbp.get(P2.app_buf) or {})[P2.app_buf] or {}) do
+        if bp.line == 5 then return false end
+      end
+      return true
+    end)())
+
+  -- (b) UNLOADED path — nvim-dap holds nothing, and reconcile deliberately
+  -- preserves records for unloaded files, so this must go through the store.
+  write_file(main_wt .. "/src/other.lua", "local a = 1\nlocal b = 2\nlocal c = 3\n")
+  vim.cmd.edit(main_wt .. "/src/other.lua")
+  local other_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_win_set_cursor(0, { 2, 0 })
+  P2.bps.toggle()
+  ok("remove() CONTROL — a record exists for the second file",
+    find_bp(read_bp_store(), "src/other.lua", 2) ~= nil,
+    vim.inspect(read_bp_store()))
+  vim.cmd.edit(main_wt .. "/src/app.lua")
+  pcall(vim.api.nvim_buf_delete, other_buf, { force = true })
+  ok("remove() CONTROL — that file's buffer is now unloaded",
+    vim.fn.bufloaded(main_wt .. "/src/other.lua") == 0)
+  local u_ok, u_err = P2.bps.remove("src/other.lua", 2)
+  ok("remove() succeeds for an unloaded path", u_ok == true, tostring(u_err))
+  ok("remove() drops the unloaded file's record from the store",
+    find_bp(read_bp_store(), "src/other.lua", 2) == nil,
+    vim.inspect(read_bp_store()))
+
+  ok("remove() is a no-op (not an error) when nothing matches",
+    (P2.bps.remove("src/other.lua", 99)) == true)
 end
 
 -- ── [14] breakpoints — reconcile sweep ──────────────────────────

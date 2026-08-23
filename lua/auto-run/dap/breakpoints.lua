@@ -250,6 +250,71 @@ function M.set(opts)
   return true, nil
 end
 
+---Remove ONE breakpoint at an explicit path + line, without moving the cursor.
+---
+---`toggle`/`set` act at the CURSOR and `clear_all` is all-or-nothing, so
+---removing a single KNOWN breakpoint previously meant reaching into nvim-dap's
+---registry directly — which skips the persisted store and leaves any live
+---session still stopped there.
+---
+---Two cases, because the store's rule is "live wins for loaded paths":
+---  * buffer loaded → drop it from nvim-dap, notify live sessions the way
+---    `dap.toggle_breakpoint` does, then reconcile (live state is authoritative
+---    for that path, so the record follows);
+---  * not loaded → nvim-dap holds nothing for it, and reconcile deliberately
+---    preserves records for unloaded paths, so the record is dropped from the
+---    store directly.
+---@param path string   absolute, or relative to the active worktree root
+---@param lnum integer  1-based
+---@return boolean? ok, string? err
+function M.remove(path, lnum)
+  if type(path) ~= "string" or path == "" then
+    return nil, "remove: path must be a non-empty string"
+  end
+  if type(lnum) ~= "number" or lnum ~= math.floor(lnum) or lnum < 1 then
+    return nil, "remove: lnum must be a positive integer line number"
+  end
+  local okd, dap = pcall(require, "dap")
+  if not okd then return nil, "nvim-dap is not installed" end
+
+  local root = worktree_root()
+  local abs = to_abs(path, root)
+  local rel = to_rel(abs, root)
+
+  local bufnr = vim.fn.bufnr(abs)
+  if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) then
+    local okb, dap_bps = pcall(require, "dap.breakpoints")
+    if not okb then return nil, "nvim-dap breakpoints module unavailable" end
+    pcall(dap_bps.remove, bufnr, lnum)
+    -- Same registry-then-broadcast order nvim-dap uses itself; without this a
+    -- running session keeps the breakpoint until it next re-syncs.
+    local okg, bps = pcall(dap_bps.get, bufnr)
+    if okg and type(dap.sessions) == "function" then
+      for _, s in pairs(dap.sessions() or {}) do
+        pcall(function() s:set_breakpoints(bps) end)
+      end
+    end
+    M.reconcile()
+    return true, nil
+  end
+
+  -- Unloaded: the record only exists in the store.
+  local records, rerr = M.read()
+  if rerr then return nil, rerr end
+  local kept, dropped = {}, 0
+  for _, r in ipairs(records) do
+    local same = type(r.path) == "string"
+      and (r.path == rel or to_abs(r.path, root) == abs)
+      and r.lnum == lnum
+    if same then dropped = dropped + 1 else kept[#kept + 1] = r end
+  end
+  if dropped == 0 then return true, nil end
+  local okw, werr = write(kept)
+  if not okw then return nil, werr end
+  publish("remove", #kept)
+  return true, nil
+end
+
 ---Clear EVERY breakpoint — the live registry and the whole persisted
 ---store (including entries for files not currently loaded).
 ---@return boolean? ok, string? err
