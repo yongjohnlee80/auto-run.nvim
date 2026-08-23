@@ -135,6 +135,66 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
 > agent can never bootstrap its own execution trust (ADR-0035 §4.5,
 > ADR-0048 §11).
 
+### Configuring test runs (go and jest)
+
+Test discovery needs no configuration — `:AutoRun tests` finds positions as
+soon as an adapter recognises the project. A **`kind=test` config is only
+needed when a run needs something extra**: environment variables, an env
+file, or (go) build flags.
+
+**Which config a run uses.** An adapter picks the first `kind=test` config
+whose `runtime` matches its own name; a config with **no** `runtime` is
+generic and applies to any adapter. So one repo can serve both:
+
+```jsonc
+// .auto-run/configs/jest-tests.json          → jest runs only
+{ "name": "jest-tests", "kind": "test", "runtime": "jest",
+  "env": { "NODE_ENV": "test", "TZ": "UTC" },
+  "env_files": ["${worktree}/.env.test"] }
+
+// .auto-run/configs/go-tests.json            → go runs only
+{ "name": "go-tests", "kind": "test", "runtime": "go",
+  "build_flags": "-count=1 -race",
+  "env_files": ["${worktree}/.env.test"] }
+```
+
+Create them with `:AutoRun` scaffolding (`<leader>rc`), by hand under
+`.auto-run/configs/`, or by importing a `launch.json` (`:AutoRun import` —
+its `env` and `envFile` land as `env` and `env_files`).
+
+**Environment.** Both adapters compose identically, so anything that works
+for go works for jest:
+
+| field | what it is |
+| --- | --- |
+| `env` | inline `KEY: value` map — no file needed |
+| `env_files` | list of env files, applied in order |
+| selected env file | `:AutoRun env select <path>`, per-repo (§4.2) |
+
+Precedence, lowest to highest: config/profile `env_files` → the selected env
+file (the highest-precedence *file*) → secret manifests → `command_env` /
+`runtime_env` → config-level `env`. So a key set inline in `env` wins over
+the same key in any file, including the selected one (§4.2). The file need
+**not** be called `.env` — `env_files` takes any path.
+
+Two things worth knowing before your first config:
+
+- **Anchor `env_files` with `${worktree}`.** A bare relative path
+  (`"api.env"`) resolves against the process CWD, not the repo, so it will
+  usually fail to open.
+- **A missing env file fails the run**, loudly, rather than running your
+  tests with a silently incomplete environment.
+
+**Jest specifics.** The adapter needs a **project-local** jest binary — it
+probes `node_modules/.bin/jest` from the position's package upward to the
+worktree, so both plain repos and hoisted monorepos work; there is no global
+fallback by design. Roots are per `package.json`, so a monorepo's packages
+are discovered and run independently.
+
+**Verifying.** `:AutoRun doctor` lists configs per kind (with the remembered
+session pick) and the test-adapter roots + discovery snapshot — the quickest
+way to confirm a config is being seen and which one a run will pick.
+
 ### Execution model
 
 Every launch: 7-layer merge → uniform substitution → env composition
