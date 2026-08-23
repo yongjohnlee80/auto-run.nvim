@@ -5,6 +5,15 @@ Unified run-config / test / debug plugin for the auto-family
 discovery/execution, and DAP orchestration behind one canonical
 per-repo store. Supersedes gobugger.nvim at feature parity.
 
+> **On the `gobugger` references throughout this repo:** gobugger.nvim was
+> **replaced by auto-run and no longer exists** (ADR-0048 Phase 4). Every
+> remaining mention — "gobugger parity", "port", `[provenance: gobugger dD]` —
+> records **where a behaviour came from**, never a runtime dependency: nothing
+> in `lua/` loads, requires or probes gobugger. The one thing that genuinely
+> did depend on it — the smoke suite's gobugger *parity gate*, which compared
+> auto-run's keymaps against gobugger's live `default_keymaps()` — was pruned
+> when gobugger was deleted, because it had nothing left to compare against.
+
 ## Status
 
 Phases 1–3 (store + env engine, execution + DAP, test discovery +
@@ -106,6 +115,26 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   env-file selection (ungated — selection is data, not execution)
   and only ever carry file paths + KEY names, never values.
 
+> **Writing a restrictive `run.exec` allowlist? The subject is not always a
+> config name.** Each gated handler calls
+> `trust.check("run.exec", <subject>)`, and the subject is whatever
+> identifies the thing being run:
+>
+> | call | subject passed to the gate |
+> | --- | --- |
+> | `run.start` / `run.debug_start` | the config **name** (`api-server`) |
+> | `run.test_run` with `name` | the config **name** |
+> | `run.test_run` with `position` | the **position id** (`path::ns::name`) |
+>
+> A discovered position id is *path-shaped* — e.g.
+> `internal/api/user_test.go::TestUser::rejects_empty`. So an allowlist
+> written only as config-name patterns silently matches nothing for
+> positional test runs, and every such run is refused. Restrictive
+> allowlists need path-shaped patterns too. Trust is only ever granted
+> interactively in the host; no mailbox handler calls `trust.set`, so an
+> agent can never bootstrap its own execution trust (ADR-0035 §4.5,
+> ADR-0048 §11).
+
 ### Execution model
 
 Every launch: 7-layer merge → uniform substitution → env composition
@@ -194,13 +223,51 @@ runner's machine output back to position ids. Baseline adapters:
   `go.work` (memoized primary-root cache); `go test -json` with
   `^`-anchored slash-split `-run` regexes / file alternations /
   `./rel/...` dir patterns; a kind=test config's `build_flags` +
-  composed env apply to every run (gobugger parity).
+  composed env apply to every run.
 - **jest** — `describe`/`it`/`test` + aliases and
   `.only`/`.skip`/`.todo` modifiers over js/jsx/ts/tsx; one root per
   `package.json`; project-local `node_modules/.bin/jest` (hoisted
   parents probed up to the worktree) with
   `--json --outputFile=<per-run file>` and regex-escaped
-  ancestor-joined `--testNamePattern`s.
+  ancestor-joined `--testNamePattern`s; a kind=test config's composed
+  env applies to every run, exactly as for go.
+
+#### One env convention for every language
+
+A `kind=test` config supplies the environment for test runs, and both
+baseline adapters resolve it through the **same** owner
+(`auto-run.adapters.config`) and the same Phase 1 pipeline —
+`store.get` → `substitute_deep` → `env.compose`. So `env`, `env_files`,
+the §4.2 selected env file and secret manifests behave identically
+whether you are running `go test` or `jest`.
+
+A config claims an adapter by `runtime`: `runtime = "go"` applies to go
+runs, `runtime = "jest"` to jest runs, and a config with **no**
+`runtime` is generic and applies to whichever adapter asks.
+
+```jsonc
+// .auto-run/configs/jest-tests.json
+{
+  "name": "jest-tests",
+  "kind": "test",
+  "runtime": "jest",
+  "env": { "NODE_ENV": "test" },
+  "env_files": ["${worktree}/.env.test"]
+}
+```
+
+This mirrors VS Code, which auto-run already interoperates with: a
+`launch.json` entry's `env` map and its `envFile` path are imported to
+`env` and `env_files` respectively (see *Launch-config selection &
+launch.json interop*), and VS Code applies those same two fields
+uniformly across its Go and Node/Jest debug configurations. The env
+source is therefore **not** tied to a file named `.env` — anything
+`env_files` can reference works, and inline `env` needs no file at all.
+
+Anchor `env_files` with `${worktree}` (or another substitution token):
+a bare relative path resolves against the process CWD, not the repo. A
+referenced env file that cannot be read **fails the run** rather than
+running the tests with a silently incomplete environment.
 
 ### Env materialization lifecycle (ADR §4.1)
 

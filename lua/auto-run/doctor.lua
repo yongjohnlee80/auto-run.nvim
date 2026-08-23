@@ -1,14 +1,26 @@
----auto-run.doctor — git/worktree diagnostics + repair (ADR-0048 §13,
----gobugger doctor/fix parity).
+---auto-run.doctor — git/worktree diagnostics + repair (ADR-0048 §13).
 ---
----`git_info()` produces the structured rows gobugger's doctor printed
----that the store resolver doesn't already cover (project root +
----marker, the anchor's `.git` kind incl. gitfile-target health,
----`git status` reachability, the common dir, the go module root).
----`fix_worktree()` ports gobugger's `<leader>dF`: `git worktree
----repair` from the repo's common dir — reached through
----`:AutoRun doctor --fix` ONLY (mutating ⇒ interactive-only, never a
----mailbox verb; the read-only mailbox surface stays `run.status`).
+---This is the live diagnostic surface behind `:AutoRun doctor` and
+---`<leader>dD`; several modules render into it (`store.status`,
+---`breakpoints.stats`, `exec.pick_memory`, `dap`). It depends on git and
+---nothing else.
+---
+---**Provenance, not a dependency:** the rows and the `--fix` action were
+---ported from gobugger.nvim, which auto-run REPLACED and which no longer
+---exists (ADR-0048 Phase 4). "parity" in this file's history means "we
+---absorbed that behaviour", never "we compare ourselves against it at
+---runtime" — nothing here loads or probes gobugger. The smoke suite's old
+---gobugger *parity gate* did probe it, which is why that gate was pruned when
+---gobugger was deleted while this module was untouched.
+---
+---`git_info()` produces the structured rows the store resolver doesn't
+---already cover (project root + marker, the anchor's `.git` kind incl.
+---gitfile-target health, `git status` reachability, the common dir, the go
+---module root). `fix_worktree()` runs `git worktree repair` from the repo's
+---common dir — reached through `:AutoRun doctor --fix` ONLY (mutating ⇒
+---interactive-only, never a mailbox verb; the read-only mailbox surface stays
+---`run.status`, so an agent can ask about worktree health but cannot repair
+---it unattended).
 ---
 ---Anchoring: everything resolves off `store.resolve_run_dirs()`
 ---([[shared-resolver-single-source-of-truth]]) — never `getcwd`.

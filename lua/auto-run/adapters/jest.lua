@@ -291,6 +291,15 @@ function M.build_spec(args)
       .. "under " .. root
   end
 
+  -- Same composed `kind=test` config the Go adapter applies, so `env`,
+  -- `env_files` (VS Code's `envFile`), the selected env file and secret
+  -- manifests reach a jest run too. Until this, configured env reached
+  -- `go test` and silently never reached `jest`. A composition FAILURE is
+  -- returned, not swallowed: a missing envFile must fail the run rather than
+  -- run the tests with the wrong environment.
+  local applied, cfg_err = require("auto-run.adapters.config").test_config(M.name)
+  if cfg_err then return nil, cfg_err end
+
   local output_file = fs_path.join(args.run_dir, "jest-output.json")
   local argv = { bin, "--json", "--outputFile=" .. output_file }
 
@@ -314,6 +323,7 @@ function M.build_spec(args)
   return {
     cmd     = argv,
     cwd     = root,
+    env     = applied and applied.env or nil,
     context = { position_id = pos.id, output_file = output_file },
   }, nil
 end

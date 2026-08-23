@@ -311,15 +311,7 @@ end
 ---adapter-driven test run (and to `debug_position`'s debug_test).
 ---@return string?
 function M.test_config_name()
-  local ok, store = pcall(require, "auto-run.store")
-  if not ok then return nil end
-  for _, c in ipairs(store.list()) do
-    if not c.error and c.kind == "test"
-        and (c.runtime == nil or c.runtime == "go") then
-      return c.name
-    end
-  end
-  return nil
+  return require("auto-run.adapters.config").test_config_name(M.name)
 end
 
 ---The picked kind=test config as `{ build_flags?, env? }` — composed
@@ -328,25 +320,13 @@ end
 ---fails (never silently dropped).
 ---@return { build_flags: string?, env: table<string,string>? }? applied, string? err
 local function test_config()
-  local picked = M.test_config_name()
-  if not picked then return nil, nil end
-
-  local store = require("auto-run.store")
-  local eff, gerr = store.get(picked)
-  if not eff then return nil, tostring(gerr) end
-  local env_mod = require("auto-run.env")
-  local ctx = env_mod.context()
-  eff = env_mod.substitute_deep(eff, ctx)
-  local comp, cerr = env_mod.compose(eff, { ctx = ctx })
-  if not comp then
-    return nil, "config '" .. picked .. "': "
-      .. (cerr and cerr.message or "env composition failed")
-  end
-  local out = {}
-  if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
-    out.build_flags = eff.build_flags
-  end
-  if next(comp.env) ~= nil then out.env = comp.env end
+  local applied, err = require("auto-run.adapters.config").test_config(M.name)
+  if not applied then return nil, err end
+  local out = { env = applied.env }
+  -- build_flags is go's alone; the shared resolver hands back the whole
+  -- effective config so each adapter takes what its runner understands.
+  local flags = applied.eff.build_flags
+  if type(flags) == "string" and flags ~= "" then out.build_flags = flags end
   return out, nil
 end
 

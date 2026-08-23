@@ -2689,6 +2689,51 @@ describe("bar", () => {
     b_spec ~= nil and b_spec.cmd[1] == jestfix .. "/node_modules/.bin/jest",
     vim.inspect(b_spec and b_spec.cmd))
 
+  -- ── composed env reaches a jest run (parity with the go adapter) ──
+  -- Before this, `env` / `env_files` / the selected env file reached
+  -- `go test` and silently never reached `jest`: build_spec returned no
+  -- `env` field at all. The CONTROL is the spec built above, before any
+  -- kind=test config exists — without it, an adapter that always attached
+  -- some env would pass the positive case.
+  ok("jest CONTROL — no kind=test config ⇒ spec carries no env",
+    a_spec ~= nil and a_spec.env == nil, vim.inspect(a_spec and a_spec.env))
+
+  write_file(jestfix .. "/api.env", "FROM_FILE=file-value\nSHARED=from-file\n")
+  local jt_path, jt_err = store.add({
+    name = "jest-tests", kind = "test", runtime = "jest",
+    env = { FROM_CONFIG = "cfg-value", SHARED = "from-config" },
+    -- `${worktree}`-anchored, the form a real config uses: a bare relative
+    -- env_file resolves against CWD, not the worktree.
+    env_files = { "${worktree}/api.env" },
+  }, { tier = "tracked" })
+  ok("jest kind=test config added", jt_path ~= nil, tostring(jt_err))
+
+  local e_spec, e_err = jest.build_spec({ position = adds, tree = tree,
+    root = jestfix .. "/pkg-a", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("jest build_spec still succeeds with a config applied",
+    e_spec ~= nil, tostring(e_err))
+  ok("jest spec carries config-level env",
+    e_spec ~= nil and e_spec.env ~= nil and e_spec.env.FROM_CONFIG == "cfg-value",
+    vim.inspect(e_spec and e_spec.env))
+  ok("jest spec carries env_files (VS Code's envFile) values",
+    e_spec ~= nil and e_spec.env ~= nil and e_spec.env.FROM_FILE == "file-value",
+    vim.inspect(e_spec and e_spec.env))
+  ok("jest env precedence matches the rest of auto-run: config wins over file",
+    e_spec ~= nil and e_spec.env ~= nil and e_spec.env.SHARED == "from-config",
+    vim.inspect(e_spec and e_spec.env))
+  ok("jest spec keeps its argv/context while carrying env",
+    e_spec ~= nil and e_spec.cmd[2] == "--json"
+      and e_spec.context.position_id == adds.id, vim.inspect(e_spec and e_spec.cmd))
+
+  -- A config that exists but cannot compose must FAIL the run, not run the
+  -- tests with the wrong environment.
+  store.update("jest-tests", { env_files = { "does-not-exist.env" } })
+  local bad_spec, bad_env_err = jest.build_spec({ position = adds, tree = tree,
+    root = jestfix .. "/pkg-a", run_id = "probe", run_dir = fx .. "/jest-probe" })
+  ok("jest build_spec fails loudly when a referenced envFile is missing",
+    bad_spec == nil and bad_env_err ~= nil, tostring(bad_env_err))
+  store.remove("jest-tests", { tier = "tracked" })
+
   -- Regex-escaping probe on a hostile name.
   local hostile = { type = "test", path = foo_test,
     id = foo_test .. "::a.b (c) [d]" }
