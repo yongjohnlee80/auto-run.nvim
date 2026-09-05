@@ -824,7 +824,22 @@ function M.compose(cfg, opts)
       or 10000
     local res = vim.system({ "sh", "-c", cmd },
       { text = true, timeout = timeout_ms }):wait()
-    local timed_out = res.code == 124 and (res.signal == 15 or res.signal == 9)
+    -- A NIL result is the timeout outcome, not an impossible value.
+    -- SystemObj:wait returns `state.result`, which the exit handler fills
+    -- in; on the timeout path Neovim SIGKILLs the process and then waits a
+    -- SECOND time for the SAME `timeout` before returning whatever is there
+    -- (runtime/lua/vim/_core/system.lua). A small command_timeout_ms on a
+    -- loaded machine can miss that second window, and then wait() hands back
+    -- nil. Indexing it threw `attempt to index local 'res'` on a CI runner —
+    -- an uncaught error on an interactive and mailbox launch path, where the
+    -- designed behaviour is the structured command_env_timeout below.
+    --
+    -- nil maps onto timed_out rather than onto command_env_failed because the
+    -- only route to it is "we stopped waiting after killing it", which is
+    -- what a timeout IS. Everything downstream reads res, so this branch has
+    -- to absorb it: the elseif/else arms are unreachable when timed_out.
+    local timed_out = res == nil
+      or (res.code == 124 and (res.signal == 15 or res.signal == 9))
     if timed_out then
       if entry.required == false then
         warnings[#warnings + 1] = "command_env '" .. entry.key
