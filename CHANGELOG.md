@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+> **Scope note (added with v0.1.11).** The block below accumulated from
+> `v0.1.0` onward and was never split across the `v0.1.1`–`v0.1.10` tags,
+> so it describes work that is ALREADY RELEASED. It is left as-is rather
+> than retro-attributed to versions I cannot verify. `v0.1.11` below
+> covers only what landed after `v0.1.10`.
+
+
 ADR-0048 Phase 3 (auto-run half) — test discovery + adapters — plus
 the Phase 4 gobugger-parity gate (§14.2) and the §4.2 (r5) env-file
 selection surface (auto-run half). The auto-finder `tests`/`debug`
@@ -276,6 +283,88 @@ half. Smoke 579/0.
   per-adapter root at the anchor, discovery snapshot).
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
+
+## [v0.1.11] — 2026-09-05 — CI on every PR, and three defects it found on the run path
+
+Patch. No public Lua surface changed; every item is a fix or the gate
+that found it.
+
+**The repo's first automated gate**, and it earned its keep immediately:
+the suite was RED the first time CI looked at it, and then found two
+more defects that had been hidden behind the first. `tests/run-all.sh`
+already turns a silent abort into a loud failure by treating a missing
+summary line as a hard failure — which is how a mid-run crash was
+reported at all rather than passing as a partial run.
+
+### Fixed
+
+- **`doctor` no longer fabricates a common dir git has already denied.**
+  `resilient_common_dir` ended `return repo.common_dir(boundary) or
+  fs_path.join(boundary, ".git")`, inventing `<boundary>/.git` for the
+  one case the call exists FOR — git declining to name a common dir.
+  Both call sites already tolerate nil. The consequence was not
+  cosmetic: with a fabricated path, `doctor --fix` shelled out
+  `git worktree repair` against a directory whose ancestor is a real
+  repository.
+
+- **A nil from `vim.system():wait()` is a timeout, not a crash.**
+  `SystemObj:wait` returns `state.result`, which the exit handler fills
+  in; on the timeout path Neovim SIGKILLs and then waits a SECOND time
+  for the SAME timeout before returning whatever is there. A small
+  `env.command_timeout_ms` on a loaded machine misses that window, and
+  indexing the nil threw an uncaught error on the interactive and
+  mailbox launch paths — where the designed behaviour is the structured
+  `command_env_timeout`. 200 consecutive local attempts returned a
+  table, which is why this survived; a CI runner produced nil on the
+  first try.
+
+- **`exec.stop()` signals the run's process GROUP, not one process.**
+  A `run` config is usually a shell line. With one simple command the
+  shell exec-optimises `sh -c` and there is a single process, so killing
+  it closes the stdout/stderr pipes. With anything more the shell stays
+  and forks — and signalling only the direct child left the real work
+  running AND holding those pipes open, so `vim.system` never completed,
+  `on_exit` never fired, and the job sat at `exited = false`
+  **permanently**: no `result.json`, no `run.job:exited`. Stopping a
+  `go test` or `npm test` wrapper on Debian or Ubuntu left an orphan
+  plus a job that claimed to be running. Jobs now spawn into their own
+  process group and `stop()` signals the group, with the old
+  single-process kill retained as the fallback.
+
+### Tests
+
+- **The stop fixture was proving nothing, twice over.** `sh -c "sleep
+  30"` is exactly the single-command case every shell exec-optimises, so
+  the cell could only fail where `/bin/sh` happens not to — and the
+  platform difference then read as a quirk rather than as the defect.
+  And once the fixture could be two processes, the cell still signalled
+  about ONE MILLISECOND after start, before the shell had forked
+  anything. It now waits for a marker written after the child is
+  backgrounded, so the shape is real rather than merely requested.
+- **`[30]` asserted a `launch.json` that exists on one machine** — a
+  claim about that laptop, not about the product. The assertion moved to
+  the embedded copy (always present) and the real file was promoted to a
+  drift check where it exists.
+- Two timing-flaky cells and a machine-specific one removed; failure
+  details now carry what a reader needs, on ONE line, because the family
+  runner surfaces failures with `grep -E "^  FAIL"` and drops every
+  continuation line.
+
+### CI
+
+Built from the corrected family shape: no branch-restoring step (it is
+the only thing that behaves differently per trigger entry, and an entry
+whose first firing is the merge cannot be witnessed beforehand),
+event-scoped concurrency, dependencies pinned by commit through one
+shared install script, and a `drift` job resolving auto-core at its
+default branch on schedule and manual dispatch only. CI also builds the
+tree-sitter grammars the suite silently depended on — `go`, plus
+`javascript`/`typescript`/`tsx` from the jest adapter's dispatch —
+enumerated from the ADAPTERS rather than from the fixtures. `gobugger`
+is deliberately NOT installed and the script fails loudly if it appears,
+because smoke [33] asserts its absence.
+
+Reviewed by `agent:gold-man` across four rounds.
 
 ## [v0.1.0] — 2026-07-06
 
