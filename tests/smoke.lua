@@ -674,6 +674,46 @@ do
   require("auto-run.config").setup({})
 end
 
+-- vim.system():wait() returning NIL is a real outcome, not an impossible one.
+--
+-- Neovim's own SystemObj:wait (runtime/lua/vim/_core/system.lua) returns
+-- `state.result`, which the exit handler fills in. On the timeout path it
+-- SIGKILLs the process and then waits a SECOND time for the same
+-- `state.timeout` — so with a small command_timeout_ms on a loaded machine
+-- the reap can miss that window and wait() hands back nil. Found by CI on a
+-- GitHub runner: `attempt to index local 'res' (a nil value)` at
+-- env/init.lua, which aborted the suite MID-RUN rather than failing a cell.
+--
+-- Driven by stubbing vim.system rather than by racing a real one: the
+-- production question is "does composition survive a nil result", and a cell
+-- that has to lose a race to ask it would be flaky in exactly the way the
+-- thing it tests is.
+do
+  require("auto-run.config").setup({ env = { command_timeout_ms = 100 } })
+  local real_system = vim.system
+  vim.system = function() return { wait = function() return nil end } end
+  local nres, nerr = envmod.compose(
+    { name = "nilwait", kind = "run",
+      command_env = { { key = "NILW", command = "sleep 5", required = true } } },
+    { ctx = ctx })
+  vim.system = real_system
+  ok("nil from vim.system():wait() is treated as a timeout, not a crash",
+    nres == nil and nerr and nerr.code == "command_env_timeout",
+    vim.inspect(nerr))
+
+  vim.system = function() return { wait = function() return nil end } end
+  local sres2 = envmod.compose(
+    { name = "nilwait-soft", kind = "run",
+      command_env = { { key = "NILW", command = "sleep 5", required = false } } },
+    { ctx = ctx })
+  vim.system = real_system
+  ok("…and required=false still degrades with a warning rather than aborting",
+    sres2 ~= nil and sres2.env.NILW == nil and #sres2.warnings > 0
+      and tostring(sres2.warnings[1]):find("timed out", 1, true) ~= nil,
+    sres2 and vim.inspect(sres2.warnings))
+  require("auto-run.config").setup({})
+end
+
 -- Missing env file aborts composition.
 res, cerr = envmod.compose(
   { name = "x", kind = "run", env_files = { envfx .. "/missing.env" } },
