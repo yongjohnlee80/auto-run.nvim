@@ -1373,9 +1373,32 @@ do
   local stop_ok, stop_err = exec.stop(sleeper.id)
   ok("stop() signals a job we started", stop_ok == true, tostring(stop_err))
   local sdone = wait_for(function() return exited_ev end)
+  -- The detail has to say WHY when sdone is nil. It used to render as the
+  -- bare string "nil", which is the least diagnosable failure a cell can
+  -- produce: it cannot distinguish "the job never exited" from "the event
+  -- never published" from "stop() signalled the wrong process", and on a
+  -- machine you cannot log into, that difference is the whole investigation.
+  -- CI reported exactly that string, and this is what I could not read.
+  local function stop_detail()
+    if sdone ~= nil then return vim.inspect(sdone) end
+    local rec
+    for _, r in ipairs(exec.list() or {}) do
+      if r.id == sleeper.id then rec = r end
+    end
+    local alive = sleeper.pid
+      and vim.system({ "sh", "-c", "kill -0 " .. sleeper.pid .. " 2>/dev/null" }):wait()
+    return table.concat({
+      "no run.job:exited within the wait.",
+      "  record      = " .. vim.inspect(rec),
+      "  pid         = " .. tostring(sleeper.pid),
+      "  pid alive   = " .. tostring(alive and alive.code == 0),
+      "  /bin/sh     = " .. (vim.uv.fs_realpath("/bin/sh") or "?"),
+      "  stop() said = " .. tostring(stop_ok) .. " / " .. tostring(stop_err),
+    }, "\n")
+  end
   ok("stopped job exits by signal",
     sdone ~= nil and (sdone.signal == 15 or (sdone.code or 0) ~= 0),
-    vim.inspect(sdone))
+    stop_detail())
   local ghost_ok, ghost_err = exec.stop("r00000000-000000-9999")
   ok("stop() on an unknown id is not-found",
     ghost_ok == nil and tostring(ghost_err):find("not found", 1, true) ~= nil,
@@ -1384,7 +1407,10 @@ do
   -- No default timeout: a spawned job spec without timeout_ms passes
   -- none to vim.system (observable only as absence — the sleeper ran
   -- until signalled, not reaped by a default timeout).
-  ok("no default timeout (sleeper lived until stop)", sdone ~= nil)
+  -- Same sdone, so this reddens with the cell above rather than
+  -- independently — collateral, not a second defect.
+  ok("no default timeout (sleeper lived until stop)", sdone ~= nil,
+    "collateral of the cell above when sdone is nil")
 
   core.events.unsubscribe(h1)
   core.events.unsubscribe(h2)
@@ -2946,7 +2972,18 @@ do
     content = sf:read("*a")
     sf:close()
   end
-  ok("real sample readable (gate evidence source)", content ~= nil, sample)
+  -- The real file lives on ONE machine. Asserting it is readable makes a
+  -- claim about that machine, not about the product, so the cell was
+  -- unconditionally red everywhere else — CI reported the absolute path as
+  -- its own failure detail. The embedded copy below is what actually keeps
+  -- the assertions meaningful, and it is always present.
+  --
+  -- So the assertion moves to the thing that matters, and the real file is
+  -- promoted from a precondition to a DRIFT CHECK: where it is readable, the
+  -- embedded copy must still match it, which is the only reason to read it
+  -- at all. Where it is not, the cell says so and moves on.
+  local have_real = content ~= nil
+  local real_content = content
   content = content or [[
 {
   "version": "0.2.0",
@@ -2975,6 +3012,22 @@ do
   ]
 }
 ]]
+
+  ok("launch.json sample available (embedded copy is always present)",
+    type(content) == "string" and content:find('"configurations"', 1, true) ~= nil,
+    "content is " .. type(content))
+  -- Drift check, and the only reason to touch the real file. It is absent on
+  -- every machine but one, so this is a bonus assertion where it exists, not
+  -- a precondition anywhere.
+  if have_real then
+    ok("embedded copy still matches the real sample (drift check)",
+      real_content:find('"buildFlags": "-buildvcs=false"', 1, true) ~= nil
+        and real_content:find('"Go: Debug Test (LM)"', 1, true) ~= nil,
+      "the real sample changed shape; re-copy the embedded fixture")
+  else
+    print("  [30] real sample not on this machine (" .. sample
+      .. ") — embedded copy in use, drift check skipped")
+  end
 
   local lmfix = fx .. "/lmfix"
   ok("sample fixture repo created", make_plain_repo(lmfix))
