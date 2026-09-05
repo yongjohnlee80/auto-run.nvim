@@ -90,6 +90,22 @@ jobs:
           NVIM_DAP_REF:  "c9a0738e45f1bd41d792a126941348dce661cf9b"
         run: ./.github/install-deps.sh
 
+      # A runner's Neovim ships parsers for c, lua, vim, vimdoc, markdown and
+      # query ONLY. Everything else is something a developer installed once and
+      # stopped seeing — which is exactly how this stayed invisible: the suite
+      # was green on every machine with a parser lying around, and the first
+      # runner without one failed the rendering cells while reporting the scan
+      # as "complete". It completed, having found nothing.
+      #
+      # auto-run dispatches to a tree-sitter grammar per language: `go` from the go
+      # adapter, and `javascript` / `typescript` / `tsx` from jest's lang_for().
+      # Enumerated from the ADAPTERS, not from the fixtures the suite builds — a
+      # language the code can dispatch to is one CI has to be able to parse.
+      - name: install tree-sitter parsers
+        env:
+          LANGS: "go javascript typescript tsx"
+        run: ./.github/install-parsers.sh
+
       # Named "assert", not "verify", because it CAN fail: it compares the
       # running nvim against the pin. A step named "verify" that only prints a
       # version and checks a directory exists is the present-and-blind shape —
@@ -145,6 +161,22 @@ jobs:
           PLENARY_REF:   "74b06c6c75e4eeb3108ec01852001636d85a932b"
           NVIM_DAP_REF:  "c9a0738e45f1bd41d792a126941348dce661cf9b"
         run: ./.github/install-deps.sh
+
+      # A runner's Neovim ships parsers for c, lua, vim, vimdoc, markdown and
+      # query ONLY. Everything else is something a developer installed once and
+      # stopped seeing — which is exactly how this stayed invisible: the suite
+      # was green on every machine with a parser lying around, and the first
+      # runner without one failed the rendering cells while reporting the scan
+      # as "complete". It completed, having found nothing.
+      #
+      # auto-run dispatches to a tree-sitter grammar per language: `go` from the go
+      # adapter, and `javascript` / `typescript` / `tsx` from jest's lang_for().
+      # Enumerated from the ADAPTERS, not from the fixtures the suite builds — a
+      # language the code can dispatch to is one CI has to be able to parse.
+      - name: install tree-sitter parsers
+        env:
+          LANGS: "go javascript typescript tsx"
+        run: ./.github/install-parsers.sh
 
       - name: report which auto-core is under test
         run: |
