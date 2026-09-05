@@ -1365,19 +1365,41 @@ do
     wait_for(function() return exited_ev end) ~= nil)
 
   -- stop() — only jobs auto-run started.
-  -- `; :` is load-bearing, not noise. With a SINGLE simple command every
-  -- shell exec-optimises `sh -c` — it replaces itself with sleep, so there
-  -- is one process and killing it closes the pipes. Add a second command
-  -- and the shell stays, forks, and there are TWO processes: the shape a
-  -- real `run` config almost always has, and the shape stop() got wrong.
-  -- Without it this cell finds the bug only where /bin/sh happens not to
-  -- optimise — a runner's dash did, and so the failure looked like an
-  -- environment quirk rather than the product defect it is.
+  -- The fixture has to BE the two-process shape, and the cell has to wait
+  -- until it actually is. Two separate traps, and the second one nearly
+  -- cost the finding.
+  --
+  -- (1) With a SINGLE simple command every shell exec-optimises `sh -c` —
+  -- it replaces itself with sleep, so there is one process and killing it
+  -- closes the pipes. `sh -c "sleep 30"` is therefore the one shape stop()
+  -- always handled, and this cell could only fail where /bin/sh happens
+  -- NOT to optimise (a runner's dash; not this laptop's bash). A fixture
+  -- that avoids the shape real `run` configs have passes everywhere and
+  -- proves nothing.
+  --
+  -- (2) The cell then RACED THE FORK. stop() ran ~1 ms after start —
+  -- measured — which is before the shell has forked anything, so there was
+  -- still only one process and the kill still worked. The fixture was
+  -- two-process on paper and single-process in practice, which is why
+  -- reverting the group-kill left this cell green while the primitive says
+  -- it cannot be.
+  --
+  -- So: sleep goes to the BACKGROUND and the marker is written after it,
+  -- with the shell parked in `wait`. When the marker exists, the child is
+  -- forked and the parent is alive — the shape is real, not merely
+  -- requested — and only then do we signal.
+  local sleeper_marker = fx .. "/sleeper.forked"
+  vim.fn.delete(sleeper_marker)
   store.add({ name = "sleeper", kind = "run", program = "sh",
-    args = { "-c", "sleep 30; :" } }, { tier = "shared" })
+    args = { "-c", "sleep 30 & touch " .. sleeper_marker .. "; wait" } },
+    { tier = "shared" })
   exited_ev = nil
   local sleeper = exec.start("sleeper")
   ok("long-running job starts", sleeper ~= nil and sleeper.pid ~= nil)
+  -- Do not signal until the descendant exists; see (2) above.
+  ok("sleeper reached the two-process shape before we signal it",
+    wait_for(function() return vim.fn.filereadable(sleeper_marker) == 1 end) ~= nil,
+    "marker never appeared: " .. sleeper_marker)
   local stop_ok, stop_err = exec.stop(sleeper.id)
   ok("stop() signals a job we started", stop_ok == true, tostring(stop_err))
   local sdone = wait_for(function() return exited_ev end)
