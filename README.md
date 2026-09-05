@@ -85,7 +85,8 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   [name]` — launch a config (picker with per-repo pick memory when
   the name is omitted).
 - `:AutoRun jobs` / `:AutoRun stop <run-id>` — session job inventory
-  and control. Stop only ever signals jobs auto-run started.
+  and control. Stop only ever signals jobs auto-run started, and it
+  signals the **process group**, not the handle (see below).
 - `:AutoRun tests` / `:AutoRun scan` — render the discovered position
   tree (status glyphs from the last results) / run a bounded full
   scan of the active worktree.
@@ -210,6 +211,20 @@ Every launch: 7-layer merge → uniform substitution → env composition
 configured package, or dap-go's `debug_test` with the config's
 buildFlags/env merged in) — the Phase 2 form. Position-level test
 execution goes through the discovery model below.
+
+Jobs are started **detached** so that `stop` can signal the whole process
+group with `kill(-pid, sig)`. Both halves are load-bearing and neither
+works alone — measured on the two-process shape `sh -c "sleep 30; :"`:
+
+| | outcome |
+|---|---|
+| no `detach` + `handle:kill` | **no exit event** — the defect: the job stays in the inventory forever |
+| `detach` + `handle:kill` | **no exit event** — detach alone is not the fix |
+| `detach` + `kill(-pid)` | exit event, `code=0 signal=15` |
+
+`handle:kill` remains the fallback for a record with no pid, or a platform
+without process groups. That is the old behaviour, so the worst case is
+what shipped before rather than a new failure mode.
 
 ## Test discovery (ADR §7)
 
@@ -355,6 +370,13 @@ File retention:
   `env.command_timeout_ms` (default 10000 ms): a timeout fails
   composition with `command_env_timeout` for required entries and
   warns + skips entries with `required = false`.
+  A timeout is detected two ways, because `SystemObj:wait()` returns
+  `state.result` and that is **`nil` on the timeout path** — the only route
+  to `nil` is "we stopped waiting after killing it", which is what a
+  timeout is. So `res == nil` maps onto the timeout branch alongside
+  `code == 124 and signal is 15 or 9`. Reading `res.code` first was an
+  uncaught error on an interactive or mailbox launch, in place of the
+  structured `command_env_timeout` the design calls for.
 
 ### Env-file selection (ADR §4.2, r5)
 
@@ -508,3 +530,121 @@ fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
 3. Test discovery (go, jest) ✓ + auto-finder tests/debug views (auto-finder side)
 4. gobugger retirement
 5. Additional adapters (dart, rust, python)
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs two jobs, and the split between them is
+the point.
+
+**`lua` — the gate.** Every push to `main` and every pull request. It
+installs a pinned toolchain and hands the verdict to `tests/run-all.sh`.
+Everything is pinned, so a red run means *this change* rather than
+something that moved underneath it:
+
+| Pinned by | What | Why |
+|---|---|---|
+| commit SHA | `actions/checkout` | a tag can be moved to different code under the same name |
+| version **and SHA-256** | Neovim `v0.12.5` | a release asset can be replaced under the same tag and name, so the version alone is not reproducible |
+| commit SHA | `auto-core.nvim`, `plenary.nvim`, `nvim-dap` | reproducibility; the pin's age is reported (see below) |
+
+A runner's Neovim ships tree-sitter parsers for `c`, `lua`, `vim`,
+`vimdoc`, `markdown` and `query` **only** — every other parser is something
+a developer installed once and stopped seeing. So a suite that renders
+tree-sitter output is green on every machine with a parser lying around and
+red on the first runner without one. `.github/install-parsers.sh` builds
+`go`, `javascript`, `typescript` and `tsx` from pinned grammar sources.
+Those four are the languages this plugin's discovery adapters
+have fixtures for.
+
+**`drift` — the early warning.** The same suite, with **auto-core resolved
+at its default branch** instead of the commit `lua` pins. A regression in
+auto-core reaches its consumers before anyone notices, and a consumer
+pinned to a frozen auto-core is precisely the thing that cannot notice.
+Both properties are wanted and they conflict, so they are split rather
+than traded.
+
+`drift` runs on a **schedule (Mondays, 06:00 UTC) and manual dispatch
+only** — deliberately *not* on push or pull request. On push it would
+redden the merge run for an upstream change unrelated to the PR being
+merged, and would put a code path on the merge that no PR run exercised.
+
+### `tests/run-all.sh` is the whole verdict
+
+CI does not reimplement the gate; it supplies the environment and lets the
+runner be the judge. `run-all.sh` runs every suite and treats a **missing**
+`N passed, M failed` summary line as a hard failure, rather than parsing
+whatever partial PASS lines a suite emitted before it stopped. That
+sentinel is the only thing that catches a C-level crash mid-run, which is
+why running a single suite by hand is **not** a substitute:
+
+```sh
+./tests/run-all.sh                              # the gate
+nvim --headless -u NONE -l tests/smoke.lua      # one suite, while iterating
+```
+
+### A failing `drift` run has an addressee
+
+A red row in the Actions tab is not a signal — nobody is obliged to open
+it, and the one time a drift job caught a real regression in this family,
+it was caught because somebody dispatched it by hand while investigating
+something unrelated. Left to the schedule it would have gone red and sat
+there. So on failure the job opens an **issue**, which has an addressee
+that outlives a run's log retention and records *when* divergence started:
+
+- **One issue per repo**, found by the **`ci-drift` label**, not by title.
+  Title matching breaks the moment somebody edits the title — the next
+  failure opens a duplicate instead of commenting.
+- Reopened and commented rather than duplicated, so a month of Mondays is
+  one thread instead of four issues nobody triages.
+- **Closed automatically on the next green** drift run, with a comment
+  saying the divergence cleared.
+
+A `ci-drift` issue does **not** mean this plugin is broken for its users:
+the gating job pins auto-core and is green. It means auto-core has moved in
+a way this suite does not accept yet, and one of the two has to change
+before the pin is bumped.
+
+### Exercising the notifier, and the pin's age
+
+`workflow_dispatch` takes a **`force_drift_failure`** boolean that fails the
+drift job deliberately:
+
+```sh
+gh workflow run ci.yml --repo yongjohnlee80/auto-run.nvim --ref main \
+  -f force_drift_failure=true
+```
+
+The whole premise of the notifier is that an unread signal is not a signal
+— so an untested notifier is the same bug one layer up, and there has to be
+a way to make it fire without waiting for auto-core to break something.
+
+Proven here, both halves, on the real runner: a forced dispatch opened
+[#7](https://github.com/yongjohnlee80/auto-run.nvim/issues/7)
+and the next green drift run closed it again. The design was piloted
+in
+[auto-finder.nvim](https://github.com/yongjohnlee80/auto-finder.nvim) and
+rolled out unchanged.
+
+The `lua` job also reports **how stale the auto-core pin is**, as routine
+output rather than something discovered while debugging.
+It is
+reported and never acted on: **bumping the pin is a deliberate, reviewed
+change, never automatic.** A gating job that changes under a PR
+reintroduces exactly the mystery failure on unrelated work that pinning was
+adopted to prevent.
+
+Two guards keep that report honest, and both exist because the first
+version was wrong:
+
+- It reads the compare API's **`ahead_by`**, not `behind_by`. For
+  `compare/PIN...main`, `behind_by` is always `0` when the pin is an
+  ancestor — the first version printed `0` on a pin eight commits stale,
+  ran green, and would have called the pin current for as long as the repo
+  existed. An unparseable answer now emits a `::warning` saying staleness
+  was **not determined**, because `0` reads as "current".
+- It **counts the `AUTO_CORE_REF` values in the file** and fails with
+  `::error` if there is more than one. When this design was rolled out
+  across the family, the step arrived carrying the pilot repo's SHA — every
+  copy would have reported the age of a pin it does not use, in a step
+  whose whole job is noticing staleness, with nothing about the copy
+  looking wrong.
