@@ -1387,14 +1387,19 @@ do
     end
     local alive = sleeper.pid
       and vim.system({ "sh", "-c", "kill -0 " .. sleeper.pid .. " 2>/dev/null" }):wait()
+    -- ONE LINE, deliberately. tests/run-all.sh surfaces a failing cell with
+    -- `grep -E "^  FAIL"`, so every continuation line of a multi-line detail
+    -- is dropped before it reaches CI's log — which is exactly what happened
+    -- to the first version of this message. A detail that only renders where
+    -- you already have the output is not a detail.
     return table.concat({
-      "no run.job:exited within the wait.",
-      "  record      = " .. vim.inspect(rec),
-      "  pid         = " .. tostring(sleeper.pid),
-      "  pid alive   = " .. tostring(alive and alive.code == 0),
-      "  /bin/sh     = " .. (vim.uv.fs_realpath("/bin/sh") or "?"),
-      "  stop() said = " .. tostring(stop_ok) .. " / " .. tostring(stop_err),
-    }, "\n")
+      "no run.job:exited within the wait",
+      "record=" .. vim.inspect(rec, { newline = " ", indent = "" }),
+      "pid=" .. tostring(sleeper.pid),
+      "alive=" .. tostring(alive and alive.code == 0),
+      "sh=" .. (vim.uv.fs_realpath("/bin/sh") or "?"),
+      "stop=" .. tostring(stop_ok) .. "/" .. tostring(stop_err),
+    }, " | ")
   end
   ok("stopped job exits by signal",
     sdone ~= nil and (sdone.signal == 15 or (sdone.code or 0) ~= 0),
