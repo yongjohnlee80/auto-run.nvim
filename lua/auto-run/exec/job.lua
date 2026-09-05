@@ -187,6 +187,19 @@ function M.spawn(spec)
     env    = spec.env,          -- values go to the process ONLY
     stdout = stream_to(out_fd),
     stderr = stream_to(err_fd),
+    -- Own process GROUP, so stop() can reach the whole run and not just
+    -- the command we happened to name. A `run` config is usually a shell
+    -- line, and a shell that does not exec-optimise stays alive and forks:
+    -- signalling only the direct child leaves the real work running AND
+    -- holding the stdout/stderr pipes open, so vim.system never completes,
+    -- on_exit never fires, and the job sits at exited=false forever.
+    -- Measured on a runner: pid dead, record exited=false, no
+    -- run.job:exited, /bin/sh = dash.
+    --
+    -- This does NOT change what happens when Neovim exits: measured both
+    -- ways, a vim.system child outlives a headless nvim with and without
+    -- detach, so the flag buys the group and costs nothing here.
+    detach = true,
   }
   if spec.timeout_ms ~= nil then sys_opts.timeout = spec.timeout_ms end
 
@@ -269,9 +282,26 @@ function M.stop(id, signal)
   if not rec or not handle or rec.exited then
     return nil, "job '" .. id .. "' not found among running auto-run jobs"
   end
-  local okk, kerr = pcall(function() handle:kill(signal or 15) end)
-  if not okk then return nil, "kill: " .. tostring(kerr) end
-  log.debug("exec", "job " .. id .. " signalled (" .. tostring(signal or 15) .. ")")
+  -- Signal the GROUP (negative pid), not the handle. Both halves of this
+  -- are load-bearing and neither works alone — measured on the two-process
+  -- shape `sh -c "sleep 30; :"`:
+  --   no detach + handle:kill   -> no exit event (the defect)
+  --   detach   + handle:kill    -> no exit event (detach alone is not it)
+  --   detach   + kill(-pid)     -> exit event, code=0 signal=15
+  -- handle:kill stays as the fallback for a record with no pid, or a
+  -- platform without process groups; it is the old behaviour, so the worst
+  -- case is what shipped before rather than a new failure mode.
+  local sig = signal or 15
+  local okk, kerr
+  if type(rec.pid) == "number" and rec.pid > 0 then
+    okk, kerr = pcall(vim.uv.kill, -rec.pid, sig)
+  end
+  if not okk then
+    okk, kerr = pcall(function() handle:kill(sig) end)
+    if not okk then return nil, "kill: " .. tostring(kerr) end
+    log.debug("exec", "job " .. id .. " group-kill unavailable; signalled the handle")
+  end
+  log.debug("exec", "job " .. id .. " signalled (" .. tostring(sig) .. ")")
   return true, nil
 end
 

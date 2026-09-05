@@ -1365,17 +1365,75 @@ do
     wait_for(function() return exited_ev end) ~= nil)
 
   -- stop() — only jobs auto-run started.
+  -- The fixture has to BE the two-process shape, and the cell has to wait
+  -- until it actually is. Two separate traps, and the second one nearly
+  -- cost the finding.
+  --
+  -- (1) With a SINGLE simple command every shell exec-optimises `sh -c` —
+  -- it replaces itself with sleep, so there is one process and killing it
+  -- closes the pipes. `sh -c "sleep 30"` is therefore the one shape stop()
+  -- always handled, and this cell could only fail where /bin/sh happens
+  -- NOT to optimise (a runner's dash; not this laptop's bash). A fixture
+  -- that avoids the shape real `run` configs have passes everywhere and
+  -- proves nothing.
+  --
+  -- (2) The cell then RACED THE FORK. stop() ran ~1 ms after start —
+  -- measured — which is before the shell has forked anything, so there was
+  -- still only one process and the kill still worked. The fixture was
+  -- two-process on paper and single-process in practice, which is why
+  -- reverting the group-kill left this cell green while the primitive says
+  -- it cannot be.
+  --
+  -- So: sleep goes to the BACKGROUND and the marker is written after it,
+  -- with the shell parked in `wait`. When the marker exists, the child is
+  -- forked and the parent is alive — the shape is real, not merely
+  -- requested — and only then do we signal.
+  local sleeper_marker = fx .. "/sleeper.forked"
+  vim.fn.delete(sleeper_marker)
   store.add({ name = "sleeper", kind = "run", program = "sh",
-    args = { "-c", "sleep 30" } }, { tier = "shared" })
+    args = { "-c", "sleep 30 & touch " .. sleeper_marker .. "; wait" } },
+    { tier = "shared" })
   exited_ev = nil
   local sleeper = exec.start("sleeper")
   ok("long-running job starts", sleeper ~= nil and sleeper.pid ~= nil)
+  -- Do not signal until the descendant exists; see (2) above.
+  ok("sleeper reached the two-process shape before we signal it",
+    wait_for(function() return vim.fn.filereadable(sleeper_marker) == 1 end) ~= nil,
+    "marker never appeared: " .. sleeper_marker)
   local stop_ok, stop_err = exec.stop(sleeper.id)
   ok("stop() signals a job we started", stop_ok == true, tostring(stop_err))
   local sdone = wait_for(function() return exited_ev end)
+  -- The detail has to say WHY when sdone is nil. It used to render as the
+  -- bare string "nil", which is the least diagnosable failure a cell can
+  -- produce: it cannot distinguish "the job never exited" from "the event
+  -- never published" from "stop() signalled the wrong process", and on a
+  -- machine you cannot log into, that difference is the whole investigation.
+  -- CI reported exactly that string, and this is what I could not read.
+  local function stop_detail()
+    if sdone ~= nil then return vim.inspect(sdone) end
+    local rec
+    for _, r in ipairs(exec.list() or {}) do
+      if r.id == sleeper.id then rec = r end
+    end
+    local alive = sleeper.pid
+      and vim.system({ "sh", "-c", "kill -0 " .. sleeper.pid .. " 2>/dev/null" }):wait()
+    -- ONE LINE, deliberately. tests/run-all.sh surfaces a failing cell with
+    -- `grep -E "^  FAIL"`, so every continuation line of a multi-line detail
+    -- is dropped before it reaches CI's log — which is exactly what happened
+    -- to the first version of this message. A detail that only renders where
+    -- you already have the output is not a detail.
+    return table.concat({
+      "no run.job:exited within the wait",
+      "record=" .. vim.inspect(rec, { newline = " ", indent = "" }),
+      "pid=" .. tostring(sleeper.pid),
+      "alive=" .. tostring(alive and alive.code == 0),
+      "sh=" .. (vim.uv.fs_realpath("/bin/sh") or "?"),
+      "stop=" .. tostring(stop_ok) .. "/" .. tostring(stop_err),
+    }, " | ")
+  end
   ok("stopped job exits by signal",
     sdone ~= nil and (sdone.signal == 15 or (sdone.code or 0) ~= 0),
-    vim.inspect(sdone))
+    stop_detail())
   local ghost_ok, ghost_err = exec.stop("r00000000-000000-9999")
   ok("stop() on an unknown id is not-found",
     ghost_ok == nil and tostring(ghost_err):find("not found", 1, true) ~= nil,
@@ -1384,7 +1442,10 @@ do
   -- No default timeout: a spawned job spec without timeout_ms passes
   -- none to vim.system (observable only as absence — the sleeper ran
   -- until signalled, not reaped by a default timeout).
-  ok("no default timeout (sleeper lived until stop)", sdone ~= nil)
+  -- Same sdone, so this reddens with the cell above rather than
+  -- independently — collateral, not a second defect.
+  ok("no default timeout (sleeper lived until stop)", sdone ~= nil,
+    "collateral of the cell above when sdone is nil")
 
   core.events.unsubscribe(h1)
   core.events.unsubscribe(h2)
@@ -2946,7 +3007,18 @@ do
     content = sf:read("*a")
     sf:close()
   end
-  ok("real sample readable (gate evidence source)", content ~= nil, sample)
+  -- The real file lives on ONE machine. Asserting it is readable makes a
+  -- claim about that machine, not about the product, so the cell was
+  -- unconditionally red everywhere else — CI reported the absolute path as
+  -- its own failure detail. The embedded copy below is what actually keeps
+  -- the assertions meaningful, and it is always present.
+  --
+  -- So the assertion moves to the thing that matters, and the real file is
+  -- promoted from a precondition to a DRIFT CHECK: where it is readable, the
+  -- embedded copy must still match it, which is the only reason to read it
+  -- at all. Where it is not, the cell says so and moves on.
+  local have_real = content ~= nil
+  local real_content = content
   content = content or [[
 {
   "version": "0.2.0",
@@ -2975,6 +3047,22 @@ do
   ]
 }
 ]]
+
+  ok("launch.json sample available (embedded copy is always present)",
+    type(content) == "string" and content:find('"configurations"', 1, true) ~= nil,
+    "content is " .. type(content))
+  -- Drift check, and the only reason to touch the real file. It is absent on
+  -- every machine but one, so this is a bonus assertion where it exists, not
+  -- a precondition anywhere.
+  if have_real then
+    ok("embedded copy still matches the real sample (drift check)",
+      real_content:find('"buildFlags": "-buildvcs=false"', 1, true) ~= nil
+        and real_content:find('"Go: Debug Test (LM)"', 1, true) ~= nil,
+      "the real sample changed shape; re-copy the embedded fixture")
+  else
+    print("  [30] real sample not on this machine (" .. sample
+      .. ") — embedded copy in use, drift check skipped")
+  end
 
   local lmfix = fx .. "/lmfix"
   ok("sample fixture repo created", make_plain_repo(lmfix))
