@@ -92,7 +92,22 @@ local function resilient_common_dir(anchor)
   if not boundary then return nil end
   local bare = fs_path.join(boundary, ".bare")
   if fs_path.is_dir(bare) then return bare end
-  return repo.common_dir(boundary) or fs_path.join(boundary, ".git")
+  -- Ask git, and BELIEVE THE ANSWER. The previous fallback returned
+  -- `<boundary>/.git` whether or not it was a repository — but that branch is
+  -- only reached when repo.common_dir(boundary) already returned nil, i.e.
+  -- when git has just said the boundary is NOT a repo. So the fabricated path
+  -- was wrong in exactly the case that produced it.
+  --
+  -- The cost was not cosmetic. boundary_walk stops at any ancestor holding a
+  -- `.git` DIRECTORY, and a stray `/tmp/.git` on the host is enough: fix_worktree
+  -- then ran `git -C /tmp/.git worktree repair` and reported "git worktree
+  -- repair failed: fatal: not a git repository" instead of the structured
+  -- "cannot repair". Worse in principle — an ancestor holding a REAL but
+  -- unrelated repository would have been repaired instead of the caller's.
+  --
+  -- Returning nil lets the caller say "not inside a git repo; cannot repair",
+  -- which is both true and actionable.
+  return repo.common_dir(boundary)
 end
 
 -- ── structured diagnostics (doctor rows) ─────────────────────────

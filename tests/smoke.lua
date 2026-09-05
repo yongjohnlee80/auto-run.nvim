@@ -3278,6 +3278,30 @@ do
   local nofix_out = vim.api.nvim_exec2("AutoRun doctor --fix", { output = true }).output
   ok(":AutoRun doctor --fix outside a repo errors gracefully",
     nofix_out:find("cannot repair", 1, true) ~= nil, nofix_out)
+
+  -- An ANCESTOR holding a `.git` DIRECTORY that is not a repository.
+  --
+  -- The two assertions above only exercised this when the host happened to
+  -- have one -- a stray /tmp/.git was enough to flip them, because
+  -- boundary_walk stops at any ancestor with a `.git` dir and the resolver
+  -- then FABRICATED `<boundary>/.git` as the common dir. The result was
+  -- `git -C /tmp/.git worktree repair` and a confusing "git worktree repair
+  -- failed: fatal: not a git repository" in place of the structured error.
+  -- Worse in principle: a real but unrelated repository up the tree would
+  -- have been repaired instead of the caller's.
+  --
+  -- Build the condition instead of hoping for it, so this holds on any host.
+  local bogus = fx .. "/bogus"
+  vim.fn.mkdir(bogus .. "/.git", "p")        -- a .git DIR that is not a repo
+  vim.fn.mkdir(bogus .. "/nested/deep", "p")
+  worktree.set_active(bogus .. "/nested/deep")
+  local bres, berr = doctor_mod.fix_worktree()
+  ok("an ancestor .git that is NOT a repo yields the structured error, not a git failure",
+    bres == nil and tostring(berr):find("cannot repair", 1, true) ~= nil,
+    tostring(berr))
+  ok("and it never shells out to repair the unrelated ancestor",
+    tostring(berr):find("worktree repair failed", 1, true) == nil,
+    tostring(berr))
 end
 
 -- ── [35] keymaps — rt/rf/dt discovery-position routing ──────────
