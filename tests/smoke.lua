@@ -1365,8 +1365,16 @@ do
     wait_for(function() return exited_ev end) ~= nil)
 
   -- stop() — only jobs auto-run started.
+  -- `; :` is load-bearing, not noise. With a SINGLE simple command every
+  -- shell exec-optimises `sh -c` — it replaces itself with sleep, so there
+  -- is one process and killing it closes the pipes. Add a second command
+  -- and the shell stays, forks, and there are TWO processes: the shape a
+  -- real `run` config almost always has, and the shape stop() got wrong.
+  -- Without it this cell finds the bug only where /bin/sh happens not to
+  -- optimise — a runner's dash did, and so the failure looked like an
+  -- environment quirk rather than the product defect it is.
   store.add({ name = "sleeper", kind = "run", program = "sh",
-    args = { "-c", "sleep 30" } }, { tier = "shared" })
+    args = { "-c", "sleep 30; :" } }, { tier = "shared" })
   exited_ev = nil
   local sleeper = exec.start("sleeper")
   ok("long-running job starts", sleeper ~= nil and sleeper.pid ~= nil)
