@@ -3582,8 +3582,158 @@ do
   ok("dt on an unclaimed buffer falls back to the config path",
     ok_dtf and captured ~= nil and captured.buildFlags == "-count=1",
     tostring(dtf_err) .. " " .. vim.inspect(captured))
+
   package.loaded["dap-go"] = saved_dg
 end
+
+-- ── [35b] keymaps — dt language leak + dc dead-end message ──────
+-- Runs inside a FUNCTION, not a plain do-block: [35] already carries enough
+-- locals that adding these tipped the main chunk over Lua's 200-local cap —
+-- the same reason [36] is a function.
+print("\n[35b] keymaps — dt language leak + dc dead-end message")
+local section35b = function()
+  local disc = P3.discovery
+  auto_run.default_keymaps()
+  local function cb_of(suffix)
+    local m = vim.fn.maparg("<leader>" .. suffix, "n", false, true)
+    return type(m) == "table" and m.callback or nil
+  end
+
+  -- dt must never hand a NON-GO buffer to the Go debugger. The fallback in
+  -- <leader>dt ends in dap-go's `debug_test`, which debugs the GO test at the
+  -- cursor; `nearest` documents ONE trigger for it (`no_adapter`), but dt fell
+  -- back on ANY non-test outcome. A CLAIMED buffer with no position at the
+  -- cursor is the exact shape.
+  local saved_dg = package.loaded["dap-go"]
+  local dg_calls = 0
+  package.loaded["dap-go"] = {
+    debug_test = function() dg_calls = dg_calls + 1 end,
+    setup = function() end,
+  }
+
+  local leakdir = fx .. "/dt-leak"
+  vim.fn.mkdir(leakdir, "p")
+  write_file(leakdir .. "/app.test.js", "// no test() calls at all\nconst x = 1;\n")
+  worktree.set_active(leakdir)
+  vim.cmd.edit(vim.fn.fnameescape(leakdir .. "/app.test.js"))
+  local _, _, why = disc.nearest()
+  ok("[35b] a CLAIMED buffer with no position reports a non-no_adapter reason",
+    why ~= nil and why ~= "no_adapter", tostring(why))
+
+  -- COUNT invocations. A capture-based assertion (`captured == nil`) cannot
+  -- tell "never called" from "called with nil" — and with no kind=test config
+  -- here the pre-fix path called debug_test(nil), so such a cell passed under
+  -- the mutation. Counting is the noun in the claim.
+  ok("[35b] dt does NOT invoke the go debugger for a claimed non-go buffer",
+    select(1, pcall(cb_of("dt"))) and dg_calls == 0,
+    "dap-go invocations: " .. tostring(dg_calls))
+
+  -- POSITIVE CONTROL: the same stub must still record the legitimate
+  -- no_adapter fallback, so 0 above means "blocked", not "stub dead".
+  worktree.set_active(gofix)
+  P2.exec.remember_pick("test", "gofix-tests")
+  vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
+  ok("[35b] …while an UNCLAIMED buffer still reaches it (control)",
+    select(1, pcall(cb_of("dt"))) and dg_calls == 1,
+    "dap-go invocations: " .. tostring(dg_calls))
+
+  -- ONE OWNER: dt must share rt/rf's fallback contract, not re-derive it.
+  -- The previous head claimed this refactor but production still gated on
+  -- `why ~= "no_adapter"` inline, which had ALREADY drifted: `nearest_or_fallback`
+  -- treats `no_file` as fallback too, so on an unnamed buffer rt fell through to
+  -- the config path while dt stopped. Assert the two agree, which a duplicated
+  -- gate cannot satisfy by accident.
+  vim.cmd("enew!")            -- an unnamed buffer → reason `no_file`
+  local _, _, unnamed_why = disc.nearest()
+  ok("[35b] an unnamed buffer reports no_file", unnamed_why == "no_file",
+    tostring(unnamed_why))
+  local rt_ran = false
+  local saved_pick = P2.exec.pick_config
+  P2.exec.pick_config = function() rt_ran = true end
+  pcall(cb_of("rt"))
+  local rt_fell_back = rt_ran
+  rt_ran = false
+  pcall(cb_of("dt"))
+  ok("[35b] dt and rt agree on the no_file fallback (one owner, not two gates)",
+    rt_ran == rt_fell_back, ("rt=%s dt=%s"):format(tostring(rt_fell_back), tostring(rt_ran)))
+  P2.exec.pick_config = saved_pick
+  package.loaded["dap-go"] = saved_dg
+
+  -- dc: replace nvim-dap's dead end with an actionable message. With no
+  -- session nvim-dap gathers configs from every provider and, finding none,
+  -- says "add configs to `dap.configurations.<ft>`" (dap.lua:545-548) — a
+  -- surface auto-run never writes, since it owns a providers.configs slot.
+  -- ASSERT THE MESSAGE, not a stubbed `continue` counter: bound as raw
+  -- `dap.continue`, the pre-fix keymap captures the function VALUE at bind
+  -- time, so a later stub is never consulted and `continued == 0` passes for
+  -- entirely the wrong reason.
+  local dapm = require("dap")
+  local saved_providers = dapm.providers.configs
+  dapm.providers.configs = {}
+  local msgs = {}
+  -- BOTH sinks: auto-run's log routes to auto-core's logger when that is on
+  -- the rtp (it is here); nvim-dap's message goes through vim.notify.
+  local logmod = require("auto-run.log")
+  local saved_warn, saved_notify = logmod.warn, vim.notify
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  pcall(cb_of("dc"))
+  wait_for(function() return #msgs > 0 end, 5000)
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  local said = table.concat(msgs, "\n")
+  ok("[35b] dc names the gestures that work when nothing provides a config",
+    said:find("<leader>rc", 1, true) ~= nil
+      and said:find("<leader>dt", 1, true) ~= nil, "said: " .. said)
+  ok("[35b] …and never sends the user to dap.configurations",
+    said:find("dap.configurations", 1, true) == nil, said)
+
+  -- ONCE-ONLY over the REAL boundary. The previous non-empty control stubbed
+  -- dap.continue, so nvim-dap never performed its own provider evaluation and
+  -- the cell could not see that the mapping read every provider twice per
+  -- keypress. `dap.providers.configs` is a public extension point: a stateful
+  -- provider that yields a config once and none after must still launch, and a
+  -- provider that raises must keep nvim-dap's semantics rather than being
+  -- reclassified as "empty". No stub of dap.continue here — that is the point.
+  local calls = 0
+  dapm.providers.configs = {
+    ["smoke-stateful"] = function()
+      calls = calls + 1
+      if calls == 1 then
+        -- A type with no registered adapter: nvim-dap proceeds past the
+        -- empty-config branch (which is what we are asserting) and then
+        -- reports a missing adapter, which is emphatically NOT our dead end.
+        return { { type = "smoke-absent-adapter", request = "launch", name = "probe" } }
+      end
+      return {}
+    end,
+  }
+  msgs = {}
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  pcall(cb_of("dc"))
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  ok("[35b] dc evaluates each provider EXACTLY once per keypress",
+    calls == 1, "provider calls: " .. tostring(calls))
+  ok("[35b] …so a stateful provider's config is not lost to a second read",
+    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
+    table.concat(msgs, "\n"))
+
+  -- A raising provider is nvim-dap's business; it must not become "no configs".
+  dapm.providers.configs = {
+    ["smoke-raises"] = function() error("provider blew up") end,
+  }
+  msgs = {}
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  pcall(cb_of("dc"))
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  ok("[35b] a provider that RAISES is not reclassified as empty",
+    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
+    table.concat(msgs, "\n"))
+
+  dapm.providers.configs = saved_providers
+end
+section35b()
 
 -- ── [36] env — §4.2 (r5) selection, candidates, var editing ─────
 -- Runs inside a FUNCTION (not a plain do-block): the section carries

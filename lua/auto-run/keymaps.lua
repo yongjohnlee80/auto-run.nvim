@@ -208,7 +208,54 @@ function M.default_keymaps()
     end, "Debug: Clear Breakpoints")
 
     -- <leader>dc — continue/start (dap)  [provenance: kept]
-    bind("n", "<leader>dc", dap.continue, "Debug: Continue / Start")
+    -- With a live session this is a plain resume. With NO session nvim-dap
+    -- gathers configs from every registered provider and, finding none, says
+    -- "No configuration found for `<ft>`. You need to add configs to
+    -- `dap.configurations.<ft>`" (dap.lua:545-548). auto-run deliberately never
+    -- writes `dap.configurations` — it owns a `providers.configs` slot instead
+    -- — so that message sends the user to a surface auto-run does not own, with
+    -- no mention of the two gestures that actually work here. Worse for Rust,
+    -- whose configs are omitted from the synchronous provider until the binary
+    -- exists (ADR 0194 §2.3.4), so the empty case is the NORMAL first
+    -- experience.
+    --
+    -- nvim-dap remains the ONLY consumer of the providers. An earlier attempt
+    -- pre-counted them to detect the empty case, which was a correctness
+    -- regression on a public extension point, not merely duplicate work:
+    --   • `dap.providers.configs` entries were called twice per keypress, so a
+    --     stateful provider yielding one config then none produced the dead end
+    --     anyway (observed: provider_calls=2);
+    --   • the inverse transition (empty, then non-empty) was wrongly BLOCKED
+    --     even though nvim-dap would have launched it;
+    --   • a provider that raised was swallowed by the preflight's pcall and
+    --     reported as "no configs", silently changing nvim-dap's semantics.
+    --
+    -- Instead, intercept the ONE message nvim-dap emits for the empty case.
+    -- It is emitted synchronously inside `dap.continue` (verified against
+    -- nvim-dap: the gather + notify run before the first yield), so the wrap is
+    -- bounded to this call and providers are evaluated exactly once, by their
+    -- owner. Everything else — picking, launching, provider errors — is
+    -- nvim-dap's, untouched.
+    bind("n", "<leader>dc", function()
+      if dap.session() then return dap.continue() end
+      local ft = vim.bo.filetype
+      local saved_notify = vim.notify
+      local swapped = false
+      vim.notify = function(msg, level, opts)
+        if not swapped and type(msg) == "string"
+            and msg:find("No configuration found for", 1, true) then
+          swapped = true
+          return require("auto-run.log").warn("keymaps",
+            ("no debug configs for %s — scaffold one with <leader>rc, or debug the test under the cursor with <leader>dt")
+              :format(ft ~= "" and ft or "this buffer"))
+        end
+        return saved_notify(msg, level, opts)
+      end
+      local ok, err = pcall(dap.continue)
+      vim.notify = saved_notify
+      -- Never swallow a real failure from dap.continue.
+      if not ok then error(err, 0) end
+    end, "Debug: Continue / Start")
 
     -- <leader>dq / dR — terminate / restart  [provenance: kept]
     -- Terminate must also abort an in-flight debug PREPARATION (e.g. a Cargo
@@ -226,19 +273,36 @@ function M.default_keymaps()
   end
 
   -- <leader>dt — debug nearest test  [provenance: gobugger `dt`]
-  -- Same nearest resolution as <leader>rt, routed through
-  -- debug_position for go test positions (jump + dap-go debug_test
-  -- with the repo's kind=test config merged in). Anything else —
-  -- non-go positions, undiscovered buffers — takes the Phase 2
-  -- config path (dap-go cursor selection).
+  -- Resolution and the fallback contract come from `nearest_or_fallback()` —
+  -- the SAME owner <leader>rt and <leader>rf use — so all three mappings agree
+  -- on what "not discovery material" means (no_adapter / no_file fall back to
+  -- the Phase 2 config path; every other reason is a warn-logged stop).
+  --
+  -- dt used to call `discovery().nearest(0)` raw and re-derive that gate. The
+  -- fallback below ends in dap-go's `debug_test`, which debugs the GO test at
+  -- the cursor, so falling back on ANY non-test outcome handed a Rust or jest
+  -- buffer to the Go debugger. No `== "go"` branch survived Phase 1's
+  -- migration; this reached the same place by omission, because it duplicated a
+  -- contract that already had exactly one owner — and the duplicate had already
+  -- drifted, stopping on an unnamed buffer where rt/rf fall back.
   bind("n", "<leader>dt", function()
-    local node = discovery().nearest(0)
+    local node, fall_back = nearest_or_fallback()
     -- Any discovered test position routes through debug_position, which
     -- dispatches by the adapter's debug capability (ADR 0194 §2.3.3) — no
-    -- keymap-level language branch. Undiscovered buffers fall back below.
+    -- keymap-level language branch.
     if node and node.type == "test" then
       local _, err = discovery().debug_position(node.id)
       if err then require("auto-run.log").error("keymaps", err) end
+      return
+    end
+    if not fall_back then
+      -- An adapter CLAIMS this buffer, so it is authoritative about it: either
+      -- nearest_or_fallback already warn-logged a discovery error, or it
+      -- resolved a non-test node (file/namespace) — the cursor is simply not on
+      -- a test. Neither is a reason to debug something else.
+      if node then
+        require("auto-run.log").warn("keymaps", "no test position at the cursor")
+      end
       return
     end
     exec().pick_config("test", function(name, reason)
