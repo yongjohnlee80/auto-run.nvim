@@ -459,6 +459,10 @@ function M.launch(launch)
     cwd     = launch.cwd,
     env     = launch.env,
   }
+  -- Adapter-specific dap fields (e.g. go's mode / dlvCwd / buildFlags).
+  if type(launch.extra) == "table" then
+    for k, v in pairs(launch.extra) do cfg[k] = v end
+  end
   open_view()
   local okr, rerr = pcall(dap.run, cfg)
   if not okr then return nil, "dap.run: " .. tostring(rerr) end

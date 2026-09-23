@@ -660,18 +660,8 @@ end
 
 -- ── debug capabilities (async: cargo build → artifact → codelldb) ─
 
----@class AutoRunDebugLaunch
----@field dap_type string             nvim-dap adapter key (→ dap.adapters[dap_type])
----@field request "launch"|"attach"
----@field program string             absolute path to the built executable
----@field args string[]?
----@field cwd string?
----@field env table<string,string>?
-
----@class AutoRunError
----@field code string
----@field message string
----@field detail table?
+-- `AutoRunDebugLaunch` / `AutoRunError` are declared once on the interface, in
+-- `auto-run.adapters` (ADR 0194 §2.3.4).
 
 ---Build via `cargo <sub> --message-format=json <selectors>` and select the ONE
 ---executable matching `identity.target` (and, for tests, `profile.test`). Async

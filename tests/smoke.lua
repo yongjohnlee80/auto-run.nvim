@@ -2651,11 +2651,28 @@ do
   local dbg, dbg_err = P3.discovery.debug_position(calc_test)
   ok("debug_position refuses non-test positions",
     dbg == nil and tostring(dbg_err):find("test position", 1, true) ~= nil)
+  -- Go test debug now runs through the adapter capability (ADR 0194 §2.3.4,
+  -- Lector P1-5) instead of a `node.adapter == "go"` branch. Capture the launch
+  -- the core would run and assert it is CONFIG-EQUIVALENT to the dap-go test
+  -- launch: mode=test on the position's package, a -test.run anchored at the
+  -- position, and the repo's kind=test config's build_flags merged in.
+  local dapmod = require("auto-run.dap")
+  local saved_launch = dapmod.launch
+  local captured_launch
+  dapmod.launch = function(l) captured_launch = l return true end
   local dbg2, dbg2_err = P3.discovery.debug_position(calc_test .. "::TestFail")
-  ok("debug_position degrades structured without dap-go",
-    dbg2 == nil and tostring(dbg2_err):find("dap%-go") ~= nil
-      or (dbg2 == nil and tostring(dbg2_err):find("not installed", 1, true) ~= nil),
-    tostring(dbg2_err))
+  dapmod.launch = saved_launch
+  ok("debug_position launches a go test through the adapter capability",
+    dbg2 == true and captured_launch ~= nil, tostring(dbg2_err))
+  ok("go prepare_debug is config-equivalent to the dap-go test launch",
+    captured_launch ~= nil
+      and captured_launch.dap_type == "go"
+      and captured_launch.extra.mode == "test"
+      and captured_launch.program == gofix .. "/calc"
+      and captured_launch.args[1] == "-test.run"
+      and captured_launch.args[2] == "^TestFail$"
+      and captured_launch.extra.buildFlags == "-count=1",
+    vim.inspect(captured_launch))
 
   core.events.unsubscribe(h_ev)
   store.remove("gofix-tests")
@@ -3532,17 +3549,31 @@ do
     debug_test = function(cfg) captured = cfg end,
     setup = function() end,
   }
+  -- A DISCOVERED position now routes through the adapter capability, so the
+  -- launch (not a dap-go payload) is what to capture. The dap-go stub above
+  -- stays for the UNCLAIMED-buffer fallback asserted below.
+  local dapmod_dt = require("auto-run.dap")
+  local saved_launch_dt = dapmod_dt.launch
+  local captured_launch_dt
+  dapmod_dt.launch = function(l) captured_launch_dt = l return true end
   vim.cmd.edit(vim.fn.fnameescape(calc_test))
   local sub_line = line_of('t.Run("sub one"')
   vim.api.nvim_win_set_cursor(0, { sub_line, 0 })
   local ok_dt, dt_err = pcall(cb_of("dt"))
+  dapmod_dt.launch = saved_launch_dt
   ok("<leader>dt routes the nearest go test through debug_position",
-    ok_dt and captured ~= nil, tostring(dt_err))
+    ok_dt and captured_launch_dt ~= nil, tostring(dt_err))
   ok("dt jumps the cursor to the resolved position",
     vim.api.nvim_win_get_cursor(0)[1] == sub_line
       and vim.api.nvim_buf_get_name(0) == calc_test)
-  ok("dt merges the repo's kind=test config into the payload",
-    captured ~= nil and captured.buildFlags == "-count=1", vim.inspect(captured))
+  ok("dt anchors -test.run at the nearest SUBTEST position",
+    captured_launch_dt ~= nil and captured_launch_dt.args[1] == "-test.run"
+      and captured_launch_dt.args[2] == "^TestAdd$/^sub_one$",
+    vim.inspect(captured_launch_dt and captured_launch_dt.args))
+  ok("dt merges the repo's kind=test config into the launch",
+    captured_launch_dt ~= nil and captured_launch_dt.extra
+      and captured_launch_dt.extra.buildFlags == "-count=1",
+    vim.inspect(captured_launch_dt))
 
   -- dt fallback: unclaimed buffer → Phase 2 pick + debug_test.
   captured = nil

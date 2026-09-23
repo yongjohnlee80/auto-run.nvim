@@ -22,7 +22,6 @@
 ---logs, or events.
 ---@module 'auto-run.exec'
 
-local fs_path = require("auto-core.fs.path")
 local job = require("auto-run.exec.job")
 local strategies = require("auto-run.exec.strategies")
 local log = require("auto-run.log")
@@ -94,29 +93,16 @@ end
 ---@param opts { package: string?, test_name: string? }
 ---@return string[]? argv, string? err
 local function build_argv(eff, opts)
-  if eff.kind == "test" and (eff.runtime == "go" or eff.runtime == nil) then
-    -- Plain test run: `go test` on the configured package (Phase 2
-    -- scope — position-level selection arrives with Phase 3).
-    local argv = { "go", "test" }
-    if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
-      for _, flag in ipairs(vim.split(eff.build_flags, "%s+", { trimempty = true })) do
-        argv[#argv + 1] = flag
-      end
-    end
-    if type(opts.test_name) == "string" and opts.test_name ~= "" then
-      argv[#argv + 1] = "-run"
-      argv[#argv + 1] = "^" .. opts.test_name .. "$"
-    end
-    argv[#argv + 1] = opts.package or eff.program or "./..."
-    for _, a in ipairs(eff.args or {}) do argv[#argv + 1] = a end
-    return argv, nil
-  end
-
-  -- Adapter run-argv capability (ADR 0194 §2.3.4) for non-go runtimes: rust
-  -- returns `cargo test`/`cargo run`. Go's path above stays first (unchanged).
-  local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
+  -- Capability-only dispatch (ADR 0194 §2.3.4, Lector P1-5): the runtime's
+  -- adapter owns its run argv — go returns `go test …`/the bare program, rust
+  -- `cargo test`/`cargo run`. A config with NO runtime is go's (the store's
+  -- long-standing default), so it resolves to the go adapter too. Adapters
+  -- without the capability (jest) fall through to the bare program. The args
+  -- are appended here for every runtime.
+  local adapter = require("auto-run.adapters").get(eff.runtime or "go")
   if adapter and type(adapter.build_run_argv) == "function" then
-    local a, aerr = adapter.build_run_argv(eff, opts)
+    local a, aerr = adapter.build_run_argv(eff,
+      vim.tbl_extend("force", opts or {}, { strategy = "run" }))
     if not a then return nil, aerr end
     for _, x in ipairs(eff.args or {}) do a[#a + 1] = x end
     return a, nil
@@ -157,33 +143,17 @@ function M.command_line(name, opts)
   if not prep then return nil, perr, detail end
   local eff = prep.eff
 
-  local is_go = (eff.runtime == "go" or eff.runtime == nil)
-  local function with_flags(base)
-    if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
-      for _, f in ipairs(vim.split(eff.build_flags, "%s+", { trimempty = true })) do
-        base[#base + 1] = f
-      end
-    end
-  end
-
+  -- Capability-only dispatch (ADR 0194 §2.3.4, Lector P1-5): the runtime's
+  -- adapter builds the TERM command — go `go run`/`go test`, rust `cargo
+  -- run`/`cargo test` — else a bare program. `strategy = "term"` distinguishes
+  -- this from the run-strategy argv, which for go is the bare program rather
+  -- than `go run`; one capability serves both via that hint.
   local argv
-  if eff.kind == "test" and is_go then
-    argv = { "go", "test" }
-    with_flags(argv)
-    argv[#argv + 1] = eff.program or "./..."
-  elseif is_go then
-    if type(eff.program) ~= "string" or eff.program == "" then
-      return nil, "config '" .. tostring(name) .. "' has no program to run"
-    end
-    argv = { "go", "run" }
-    with_flags(argv)
-    argv[#argv + 1] = eff.program
-  else
-    -- Non-go runtime: the adapter's run-argv capability (rust: cargo run/test),
-    -- else a bare program. Args are appended below, same as every branch.
-    local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
+  do
+    local adapter = require("auto-run.adapters").get(eff.runtime or "go")
     if adapter and type(adapter.build_run_argv) == "function" then
-      local a, aerr = adapter.build_run_argv(eff, opts)
+      local a, aerr = adapter.build_run_argv(eff,
+        vim.tbl_extend("force", opts, { strategy = "term" }))
       if not a then return nil, aerr end
       argv = a
     elseif type(eff.program) ~= "string" or eff.program == "" then

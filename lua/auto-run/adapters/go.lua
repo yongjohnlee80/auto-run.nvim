@@ -513,6 +513,101 @@ function M.default_config(kind, name)
   }
 end
 
+---argv for the run/term strategies (NEVER a DAP launch — that is
+---prepare_debug*). Reproduces the go branches `exec.build_argv` and
+---`exec.command_line` used to hardcode:
+---  • kind=test → `go test [build_flags] [-run ^N$] <package>`
+---  • otherwise → `go run [build_flags] <program>` for the TERM strategy
+---    (`opts.strategy == "term"`, where `program` is a package path), and the
+---    bare program for the RUN strategy.
+---The caller appends the config's args, as it does for every runtime.
+---@param eff table
+---@param opts { test_name: string?, package: string?, strategy: string? }?
+---@return string[]? argv, string? err
+function M.build_run_argv(eff, opts)
+  opts = opts or {}
+  local function with_flags(base)
+    if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
+      for _, flag in ipairs(vim.split(eff.build_flags, "%s+", { trimempty = true })) do
+        base[#base + 1] = flag
+      end
+    end
+  end
+
+  if eff.kind == "test" then
+    local argv = { "go", "test" }
+    with_flags(argv)
+    if type(opts.test_name) == "string" and opts.test_name ~= "" then
+      argv[#argv + 1] = "-run"
+      argv[#argv + 1] = "^" .. opts.test_name .. "$"
+    end
+    argv[#argv + 1] = opts.package or eff.program or "./..."
+    return argv, nil
+  end
+
+  if type(eff.program) ~= "string" or eff.program == "" then
+    return nil, "config '" .. tostring(eff.name) .. "' has no program to run"
+  end
+  if opts.strategy == "term" then
+    local argv = { "go", "run" }
+    with_flags(argv)
+    argv[#argv + 1] = eff.program
+    return argv, nil
+  end
+  return { eff.program }, nil
+end
+
+---Prepare a launch-ready DAP config for a discovered Go TEST position —
+---config-equivalent to the dap-go test launch: `mode="test"` on the position's
+---package with a `-test.run` regex anchored at the position (slash-split for
+---subtests), plus the repo's kind=test config's build_flags + composed env.
+---Synchronous — delve builds at launch, so there is no prebuild step.
+---@param pos AutoRunPosition
+---@param _opts table
+---@param cb fun(launch: table|nil, err: table|nil)
+function M.prepare_debug(pos, _opts, cb)
+  local pkg_dir = fs_path.parent(pos.path)
+  local launch = {
+    dap_type = "go",
+    request = "launch",
+    program = pkg_dir,
+    args = { "-test.run", run_regex(pos) },
+    cwd = pkg_dir,
+    -- delve's own build dir; without it delve builds from nvim's cwd.
+    extra = { mode = "test", dlvCwd = pkg_dir },
+  }
+  local applied, err = require("auto-run.adapters.config").test_config(M.name)
+  if err then return cb(nil, { code = "config_failed", message = err }) end
+  if applied then
+    local flags = applied.eff and applied.eff.build_flags
+    if type(flags) == "string" and flags ~= "" then launch.extra.buildFlags = flags end
+    if applied.env then launch.env = applied.env end
+  end
+  return cb(launch, nil)
+end
+
+---Prepare a launch-ready DAP config for an effective Go `kind=debug|run`
+---config — config-equivalent to the translator's go branch.
+---@param eff table   already-resolved effective config (substituted, composed env)
+---@param _opts table
+---@param cb fun(launch: table|nil, err: table|nil)
+function M.prepare_debug_config(eff, _opts, cb)
+  local cwd = eff.cwd
+  local launch = {
+    dap_type = "go",
+    request = "launch",
+    program = eff.program,
+    cwd = cwd,
+    env = eff.env,
+    extra = { mode = eff.kind == "test" and "test" or "debug", dlvCwd = cwd },
+  }
+  if type(eff.args) == "table" and #eff.args > 0 then launch.args = eff.args end
+  if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
+    launch.extra.buildFlags = eff.build_flags
+  end
+  return cb(launch, nil)
+end
+
 ---Test-only: drop the memoized root/module caches.
 function M._reset_for_tests()
   _root_cache, _module_path_cache = {}, {}

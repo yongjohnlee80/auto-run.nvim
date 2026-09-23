@@ -976,12 +976,6 @@ function M.debug_position(id)
     end)
     return true, nil
   end
-  if node.adapter == "go" then
-    local go_adapter = adapters.get("go")
-    local cfg_name = go_adapter and go_adapter.test_config_name
-      and go_adapter.test_config_name() or nil
-    return dap.debug_test(cfg_name, {})
-  end
   return nil, "debug for '" .. tostring(node.adapter)
     .. "' positions is not supported (adapter has no prepare_debug capability)"
 end
