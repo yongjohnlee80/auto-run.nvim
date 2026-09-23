@@ -69,6 +69,40 @@ local M = {}
 ---           its machine output file (`exit` = { stdout_file, run_dir }).
 ---           `opts.test` narrows to one test + its subtests. Backs the
 ---           tests panel's `i` output view via `discovery.run_output`.
+---
+--- ── Runtime capabilities (ADR 0194 §2.3.4) ─────────────────────
+--- All OPTIONAL and backwards-compatible: absence means "unsupported", and the
+--- core's public dispatch (scaffold / run argv / debug) is capability-only —
+--- no language checks. `go` and `rust` implement them; `jest` implements none.
+---@field default_config? fun(kind: "run"|"test"|"debug", name: string?): table
+---           OPTIONAL, sync. Scaffold defaults for a new config of `kind`
+---           (`<leader>rc`), so scaffolding is language-generic.
+---@field build_run_argv? fun(eff: table, opts: table?): string[]|nil, string?
+---           OPTIONAL, sync. argv for the RUN/TERM strategy only — never a DAP
+---           launch (that is prepare_debug*). Returns the base command; the
+---           caller appends the config's args.
+---@field prepare_debug? fun(pos: AutoRunPosition, opts: table, cb: fun(launch: table|nil, err: table|nil))
+---           OPTIONAL, async. Resolve ONE launch-ready DAP config for a
+---           discovered TEST position. `opts` is the core's launch token: the
+---           adapter reads `opts.is_cancelled()` and installs `opts.abort`; the
+---           callback fires exactly once. The core owns `dap.run`.
+---@field prepare_debug_config? fun(eff: table, opts: table, cb: fun(launch: table|nil, err: table|nil))
+---           OPTIONAL, async. Same contract for an effective `kind=debug|run`
+---           config (ordinary debug). `eff` is the RESOLVED effective config.
+---
+---@class AutoRunDebugLaunch      what prepare_debug* hands back
+---@field dap_type string         nvim-dap adapter key (→ dap.adapters[dap_type])
+---@field request "launch"|"attach"
+---@field program string?
+---@field args string[]?
+---@field cwd string?
+---@field env table<string,string>?
+---@field extra table?            adapter-specific dap fields (go: mode/dlvCwd/buildFlags)
+---
+---@class AutoRunError
+---@field code string
+---@field message string
+---@field detail table?
 
 ---Required adapter fields → expected Lua type.
 local REQUIRED = {
@@ -97,7 +131,7 @@ local _builtins_loaded = false
 local function ensure_builtins()
   if _builtins_loaded then return end
   _builtins_loaded = true
-  for _, mod in ipairs({ "auto-run.adapters.go", "auto-run.adapters.jest" }) do
+  for _, mod in ipairs({ "auto-run.adapters.go", "auto-run.adapters.jest", "auto-run.adapters.rust" }) do
     local ok, adapter = pcall(require, mod)
     if ok and type(adapter) == "table" and _adapters[adapter.name] == nil then
       M.register_adapter(adapter)

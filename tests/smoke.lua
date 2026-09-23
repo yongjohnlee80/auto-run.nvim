@@ -2167,8 +2167,8 @@ do
 
   local names = {}
   for _, a in ipairs(adapters.list()) do names[#names + 1] = a.name end
-  ok("builtin roster is go + jest (registration order)",
-    vim.deep_equal(names, { "go", "jest" }), vim.inspect(names))
+  ok("builtin roster is go + jest + rust (registration order)",
+    vim.deep_equal(names, { "go", "jest", "rust" }), vim.inspect(names))
 
   local go = adapters.get("go")
   local iface_ok = go ~= nil
@@ -2651,11 +2651,28 @@ do
   local dbg, dbg_err = P3.discovery.debug_position(calc_test)
   ok("debug_position refuses non-test positions",
     dbg == nil and tostring(dbg_err):find("test position", 1, true) ~= nil)
+  -- Go test debug now runs through the adapter capability (ADR 0194 §2.3.4,
+  -- Lector P1-5) instead of a `node.adapter == "go"` branch. Capture the launch
+  -- the core would run and assert it is CONFIG-EQUIVALENT to the dap-go test
+  -- launch: mode=test on the position's package, a -test.run anchored at the
+  -- position, and the repo's kind=test config's build_flags merged in.
+  local dapmod = require("auto-run.dap")
+  local saved_launch = dapmod.launch
+  local captured_launch
+  dapmod.launch = function(l) captured_launch = l return true end
   local dbg2, dbg2_err = P3.discovery.debug_position(calc_test .. "::TestFail")
-  ok("debug_position degrades structured without dap-go",
-    dbg2 == nil and tostring(dbg2_err):find("dap%-go") ~= nil
-      or (dbg2 == nil and tostring(dbg2_err):find("not installed", 1, true) ~= nil),
-    tostring(dbg2_err))
+  dapmod.launch = saved_launch
+  ok("debug_position launches a go test through the adapter capability",
+    dbg2 == true and captured_launch ~= nil, tostring(dbg2_err))
+  ok("go prepare_debug is config-equivalent to the dap-go test launch",
+    captured_launch ~= nil
+      and captured_launch.dap_type == "go"
+      and captured_launch.extra.mode == "test"
+      and captured_launch.program == gofix .. "/calc"
+      and captured_launch.args[1] == "-test.run"
+      and captured_launch.args[2] == "^TestFail$"
+      and captured_launch.extra.buildFlags == "-count=1",
+    vim.inspect(captured_launch))
 
   core.events.unsubscribe(h_ev)
   store.remove("gofix-tests")
@@ -3532,17 +3549,31 @@ do
     debug_test = function(cfg) captured = cfg end,
     setup = function() end,
   }
+  -- A DISCOVERED position now routes through the adapter capability, so the
+  -- launch (not a dap-go payload) is what to capture. The dap-go stub above
+  -- stays for the UNCLAIMED-buffer fallback asserted below.
+  local dapmod_dt = require("auto-run.dap")
+  local saved_launch_dt = dapmod_dt.launch
+  local captured_launch_dt
+  dapmod_dt.launch = function(l) captured_launch_dt = l return true end
   vim.cmd.edit(vim.fn.fnameescape(calc_test))
   local sub_line = line_of('t.Run("sub one"')
   vim.api.nvim_win_set_cursor(0, { sub_line, 0 })
   local ok_dt, dt_err = pcall(cb_of("dt"))
+  dapmod_dt.launch = saved_launch_dt
   ok("<leader>dt routes the nearest go test through debug_position",
-    ok_dt and captured ~= nil, tostring(dt_err))
+    ok_dt and captured_launch_dt ~= nil, tostring(dt_err))
   ok("dt jumps the cursor to the resolved position",
     vim.api.nvim_win_get_cursor(0)[1] == sub_line
       and vim.api.nvim_buf_get_name(0) == calc_test)
-  ok("dt merges the repo's kind=test config into the payload",
-    captured ~= nil and captured.buildFlags == "-count=1", vim.inspect(captured))
+  ok("dt anchors -test.run at the nearest SUBTEST position",
+    captured_launch_dt ~= nil and captured_launch_dt.args[1] == "-test.run"
+      and captured_launch_dt.args[2] == "^TestAdd$/^sub_one$",
+    vim.inspect(captured_launch_dt and captured_launch_dt.args))
+  ok("dt merges the repo's kind=test config into the launch",
+    captured_launch_dt ~= nil and captured_launch_dt.extra
+      and captured_launch_dt.extra.buildFlags == "-count=1",
+    vim.inspect(captured_launch_dt))
 
   -- dt fallback: unclaimed buffer → Phase 2 pick + debug_test.
   captured = nil
@@ -3905,7 +3936,515 @@ do
     type(captured) == "string" and captured:find("Build error", 1, true) ~= nil,
     tostring(captured))
 end
+-- ══ Rust §7 acceptance matrix (ADR 0194) ════════════════════════
+-- A real TWO-PACKAGE Cargo workspace carrying every shape the review calls
+-- for: a RENAMED [lib] target, an explicit [[bin]] at a custom path, a src
+-- submodule, an integration target, DUPLICATE test names across targets, an
+-- #[ignore] test, a failing test, and a #[cfg(test)] helper that is NOT a test.
+local rustws = fx .. "/rustws"
+local rust_cells = 0
+local function rok(name, cond, detail)
+  rust_cells = rust_cells + 1
+  ok(name, cond, detail)
+end
+local HAVE_CARGO = vim.fn.executable("cargo") == 1
+local HAVE_RUST_TS = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
 
+make_plain_repo(rustws)
+write_file(rustws .. "/Cargo.toml",
+  '[workspace]\nmembers = ["cratea", "crateb", "cratec"]\nresolver = "2"\n')
+-- cratec has exactly ONE bin, so a workspace-ROOT cwd plus a named package
+-- must still resolve it (the cwd crate cannot supply targets there).
+write_file(rustws .. "/cratec/Cargo.toml",
+  '[package]\nname = "cratec"\nversion = "0.1.0"\nedition = "2021"\n')
+write_file(rustws .. "/cratec/src/main.rs", "fn main() {}\n")
+write_file(rustws .. "/cratea/Cargo.toml",
+  '[package]\nname = "cratea"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "cratea_lib"\n')
+write_file(rustws .. "/cratea/src/lib.rs", table.concat({
+  "pub mod util;",
+  "pub mod util_extra;",
+  "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+  "#[cfg(test)]",
+  "mod tests {",
+  "    use super::*;",
+  "    fn helper() -> i32 { 3 }",
+  "    #[test] fn adds() { assert_eq!(add(1, 2), helper()); }",
+  "    #[test] fn fails() { assert_eq!(add(1, 1), 3); }",
+  "    #[test] #[ignore] fn skipped() {}",
+  "}",
+}, "\n") .. "\n")
+write_file(rustws .. "/cratea/src/util.rs", table.concat({
+  "pub fn double(x: i32) -> i32 { x * 2 }",
+  "#[cfg(test)]",
+  "mod tests {",
+  "    use super::*;",
+  "    #[test] fn util_only() { assert_eq!(double(2), 4); }",
+  "}",
+}, "\n") .. "\n")
+-- A PREFIX-COLLIDING sibling module: `util_extra` shares the `util` prefix, so
+-- a boundary-less libtest filter (`util`) would execute it. Its test PANICS, so
+-- any run that reaches it fails loudly — this is the cell that falsifies a
+-- missing `::` boundary (Lector r1 P1-2).
+write_file(rustws .. "/cratea/src/util_extra.rs", table.concat({
+  "#[cfg(test)]",
+  "mod tests {",
+  "    #[test] fn must_not_run() { panic!(\"unrelated sibling module executed\"); }",
+  "}",
+}, "\n") .. "\n")
+write_file(rustws .. "/cratea/tests/it.rs", "#[test] fn adds() { assert!(true); }\n")
+write_file(rustws .. "/crateb/Cargo.toml",
+  '[package]\nname = "crateb"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "customtool"\npath = "src/tool.rs"\n')
+write_file(rustws .. "/crateb/src/main.rs",
+  "fn main() {}\n#[cfg(test)]\nmod tests { #[test] fn main_unit() { assert!(true); } }\n")
+write_file(rustws .. "/crateb/src/tool.rs", "fn main() {}\n")
+
+local function assign_ids(n)
+  for _, c in ipairs(n.children or {}) do
+    c.id = (n.type == "file" and n.path or n.id) .. "::" .. c.name
+    assign_ids(c)
+  end
+end
+
+print("\n[38] rust — cargo-metadata identity, discovery, position scoping")
+do
+  local R = P3.adapters.get("rust")
+  R._reset_for_tests()
+  rok("rust adapter self-registered", R ~= nil and R.name == "rust")
+  rok("adapter_for(.rs) resolves to rust",
+    (P3.adapters.adapter_for(rustws .. "/cratea/src/lib.rs") or {}).name == "rust")
+  rok("root() promotes a member crate to the [workspace] root",
+    R.root(rustws .. "/cratea/src") == rustws, tostring(R.root(rustws .. "/cratea/src")))
+  rok("is_test_file accepts a crate .rs", R.is_test_file(rustws .. "/cratea/src/lib.rs"))
+  rok("is_test_file rejects Cargo.toml", not R.is_test_file(rustws .. "/cratea/Cargo.toml"))
+  rok("is_test_file rejects a build script", not R.is_test_file(rustws .. "/cratea/build.rs"))
+
+  if not HAVE_CARGO then
+    print("  [38] cargo not on PATH — identity/scoping cells skipped")
+  else
+    local lib = R.identity(rustws .. "/cratea/src/lib.rs")
+    rok("identity binds the RENAMED [lib] target from cargo metadata",
+      lib ~= nil and lib.kind == "lib" and lib.target == "cratea_lib"
+        and lib.package == "cratea", vim.inspect(lib))
+    rok("identity carries the metadata package_id",
+      lib ~= nil and type(lib.package_id) == "string"
+        and lib.package_id:find("cratea", 1, true) ~= nil, lib and lib.package_id)
+    rok("lib selectors are -p <pkg> --lib",
+      lib ~= nil and contains(lib.selectors, "-p") and contains(lib.selectors, "cratea")
+        and contains(lib.selectors, "--lib"), vim.inspect(lib and lib.selectors))
+    local util = R.identity(rustws .. "/cratea/src/util.rs")
+    rok("a src submodule inherits the lib target with its module prefix",
+      util ~= nil and util.kind == "lib" and util.module_prefix == "util", vim.inspect(util))
+    local it = R.identity(rustws .. "/cratea/tests/it.rs")
+    rok("identity binds the integration target (--test it)",
+      it ~= nil and it.kind == "test" and it.target == "it"
+        and contains(it.selectors, "--test"), vim.inspect(it))
+    local tool = R.identity(rustws .. "/crateb/src/tool.rs")
+    rok("identity binds an EXPLICIT [[bin]] at a custom path (customtool)",
+      tool ~= nil and tool.kind == "bin" and tool.target == "customtool", vim.inspect(tool))
+    local mainbin = R.identity(rustws .. "/crateb/src/main.rs")
+    rok("identity binds the default bin of the SECOND workspace package",
+      mainbin ~= nil and mainbin.kind == "bin" and mainbin.package == "crateb",
+      vim.inspect(mainbin))
+
+    local dir_spec, dir_err = R.build_spec({
+      position = { type = "dir", path = rustws .. "/cratea", id = rustws .. "/cratea" } })
+    rok("a DIR scope returns (nil, nil) so the core decomposes to files",
+      dir_spec == nil and dir_err == nil,
+      tostring(dir_spec) .. "/" .. tostring(dir_err))
+
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local file_spec, file_err = R.build_spec({
+      position = { type = "file", path = libfile, id = libfile,
+        children = { { type = "test", name = "adds", path = libfile,
+          id = libfile .. "::tests::adds" } } } })
+    rok("a crate-ROOT file with no module prefix decomposes (never a whole-target run)",
+      file_spec == nil and file_err == nil, vim.inspect(file_spec and file_spec.cmd))
+
+    local utilfile = rustws .. "/cratea/src/util.rs"
+    local mod_spec = R.build_spec({
+      position = { type = "namespace", name = "tests", path = utilfile,
+        id = utilfile .. "::tests",
+        children = { { type = "test", name = "util_only", path = utilfile,
+          id = utilfile .. "::tests::util_only" } } } })
+    rok("a namespace scope filters by <module_prefix>::<mod>:: (boundary-safe)",
+      mod_spec ~= nil and contains(mod_spec.cmd, "util::tests::"),
+      vim.inspect(mod_spec and mod_spec.cmd))
+
+    local ufile_spec = R.build_spec({
+      position = { type = "file", path = utilfile, id = utilfile,
+        children = { { type = "test", name = "util_only", path = utilfile,
+          id = utilfile .. "::tests::util_only" } } } })
+    rok("a file scope emits the `util::` module BOUNDARY, not a bare `util`",
+      ufile_spec ~= nil and contains(ufile_spec.cmd, "util::")
+        and not contains(ufile_spec.cmd, "util"),
+      vim.inspect(ufile_spec and ufile_spec.cmd))
+
+    local one = R.build_spec({
+      position = { type = "test", name = "util_only", path = utilfile,
+        id = utilfile .. "::tests::util_only" } })
+    rok("a single test runs --exact with valid Cargo/libtest ordering",
+      one ~= nil and table.concat(one.cmd, " ") ==
+        "cargo test -p cratea --lib util::tests::util_only -- --exact --format pretty --color never",
+      vim.inspect(one and one.cmd))
+    rok("the spec carries the package_id for result scoping",
+      one ~= nil and type(one.context.package_id) == "string")
+  end
+
+  if HAVE_RUST_TS then
+    local pos = R.discover_positions(rustws .. "/cratea/src/lib.rs")
+    local names = {}
+    local function walk(n)
+      if n.type == "test" then names[#names + 1] = n.name end
+      for _, c in ipairs(n.children or {}) do walk(c) end
+    end
+    if pos then walk(pos) end
+    table.sort(names)
+    rok("discovery finds the #[test] fns", contains(names, "adds")
+      and contains(names, "fails") and contains(names, "skipped"), vim.inspect(names))
+    rok("a #[cfg(test)] helper is NOT discovered as a test",
+      not contains(names, "helper"), vim.inspect(names))
+  else
+    print("  [38] rust treesitter parser unavailable — discovery cells skipped")
+  end
+end
+
+print("\n[39] rust — target-scoped results, duplicate names, structured errors")
+do
+  local R = P3.adapters.get("rust")
+  if not (HAVE_CARGO and HAVE_RUST_TS) then
+    print("  [39] cargo / rust parser unavailable — result cells skipped")
+  else
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local pos = R.discover_positions(libfile)
+    pos.id = pos.path
+    assign_ids(pos)
+    local tree = { get = function(_, id) return id == pos.id and pos or nil end }
+
+    local out = fx .. "/rust_lib.txt"
+    os.execute("cd " .. rustws .. "/cratea && cargo test -p cratea --lib -- "
+      .. "--format pretty --color never >" .. out .. " 2>&1")
+    local map, rerr = R.results(
+      { context = { position_id = pos.id, target = "lib:cratea_lib" } },
+      { stdout_file = out, run_dir = fx }, tree)
+    rok("real libtest results parse without a structured error", rerr == nil,
+      rerr and rerr.message)
+    local function st(n)
+      local r = map[libfile .. "::tests::" .. n]
+      return r and r.status
+    end
+    rok("real cargo: adds → passed", st("adds") == "passed", vim.inspect(map))
+    rok("real cargo: fails → failed", st("fails") == "failed")
+    rok("real cargo: #[ignore] → skipped", st("skipped") == "skipped")
+    local mapped = 0
+    for _ in pairs(map) do mapped = mapped + 1 end
+    rok("a DUPLICATE test name in another target does not leak into this scope",
+      mapped == 3, vim.inspect(map))
+
+    -- Run the ACTUAL build_spec argv for the util.rs file scope against the
+    -- PREFIX-COLLIDING sibling `util_extra` (whose test panics if executed).
+    -- A boundary-less `util` filter would run it and fail the run.
+    local ufile = rustws .. "/cratea/src/util.rs"
+    local uspec = R.build_spec({
+      position = { type = "file", path = ufile, id = ufile,
+        children = { { type = "test", name = "util_only", path = ufile,
+          id = ufile .. "::tests::util_only" } } } })
+    local uout = fx .. "/rust_util.txt"
+    os.execute("cd " .. uspec.cwd .. " && "
+      .. table.concat(uspec.cmd, " ") .. " >" .. uout .. " 2>&1")
+    local utext = table.concat(vim.fn.readfile(uout), "\n")
+    rok("the module-filtered spec executes the selected module's test",
+      utext:find("util::tests::util_only", 1, true) ~= nil, utext:sub(1, 400))
+    rok("the `util::` boundary EXCLUDES the prefix-colliding util_extra sibling",
+      utext:find("util_extra", 1, true) == nil, utext:sub(1, 400))
+    rok("the module-filtered run passes (the panicking sibling never executed)",
+      utext:find("test result: ok", 1, true) ~= nil, utext:sub(1, 400))
+    rok("the module-filtered run does NOT execute the crate-root module's tests",
+      utext:find("\ntest tests::adds ", 1, true) == nil, utext:sub(1, 400))
+
+    local single = { type = "test", path = libfile, id = libfile .. "::tests::adds",
+      children = {} }
+    local stub = { get = function(_, id) return id == single.id and single or nil end }
+    local empty = fx .. "/rust_empty.txt"
+    write_file(empty, "running 0 tests\n")
+    local m2, e2 = R.results({ context = { position_id = single.id, target = "lib:cratea_lib" } },
+      { stdout_file = empty, run_dir = fx }, stub)
+    rok("zero matching lines → structured ambiguity error (never a silent skip)",
+      e2 ~= nil and e2.code == "ambiguous_test", vim.inspect(e2))
+    rok("the ambiguity error carries the package identity",
+      e2 ~= nil and e2.detail ~= nil and e2.detail.package_id ~= nil, vim.inspect(e2))
+    rok("no phantom results on the error path", next(m2) == nil)
+
+    local dup = fx .. "/rust_dup.txt"
+    write_file(dup, "test tests::adds ... ok\ntest tests::adds ... ok\n")
+    local _, e3 = R.results({ context = { position_id = single.id, target = "lib:cratea_lib" } },
+      { stdout_file = dup, run_dir = fx }, stub)
+    rok("TWO identical harness lines are ambiguous (counts LINES, not unique names)",
+      e3 ~= nil and e3.code == "ambiguous_test", vim.inspect(e3))
+  end
+end
+
+print("\n[40] rust — debug capabilities, integrated launch routing, cancellation")
+do
+  local R = P3.adapters.get("rust")
+  local dapmod = require("auto-run.dap")
+  local okd, dap = pcall(require, "dap")
+  if okd then
+    dapmod.ensure_rust_adapter(dap)
+    rok("dap.adapters.rust is a codelldb server adapter",
+      type(dap.adapters.rust) == "table" and dap.adapters.rust.type == "server"
+        and dap.adapters.rust.executable.command:match("codelldb") ~= nil,
+      vim.inspect(dap.adapters.rust))
+  end
+
+  if not (HAVE_CARGO and HAVE_RUST_TS) then
+    print("  [40] cargo / rust parser unavailable — debug cells skipped")
+  else
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local pos = R.discover_positions(libfile)
+    pos.id = pos.path
+    assign_ids(pos)
+    local adds = pos.children[1].children[1]
+
+    local launch, perr, fired
+    R.prepare_debug(adds, dapmod.new_launch_token(),
+      function(l, e) launch, perr, fired = l, e, true end)
+    wait_for(function() return fired end, 180000)
+    rok("prepare_debug builds and returns a launch", perr == nil and launch ~= nil,
+      perr and perr.message)
+    rok("prepare_debug targets codelldb via dap_type=rust",
+      launch ~= nil and launch.dap_type == "rust")
+    rok("prepare_debug program is the BUILT test executable",
+      launch ~= nil and vim.fn.filereadable(launch.program) == 1,
+      launch and launch.program)
+    rok("prepare_debug selects the one test with --exact",
+      launch ~= nil and launch.args[1] == "--exact",
+      vim.inspect(launch and launch.args))
+
+    -- INTEGRATED: the real discovery path → debug_position → dap.launch.
+    worktree.set_active(rustws)
+    P3.discovery._reset_for_tests()
+    local scanned
+    P3.discovery.scan(nil, function(r) scanned = r end)
+    wait_for(function() return scanned end, 60000)
+    local rtree = P3.discovery.tree()
+    local rust_id = libfile .. "::tests::adds"
+    rok("the scan discovered the rust test position", rtree:get(rust_id) ~= nil, rust_id)
+
+    local saved_launch = dapmod.launch
+    local captured
+    dapmod.launch = function(l) captured = l return true end
+    local dbg_ok, dbg_err = P3.discovery.debug_position(rust_id)
+    wait_for(function() return captured ~= nil end, 180000)
+    dapmod.launch = saved_launch
+    rok("discovery.debug_position(rust) routes through the capability to dap.launch",
+      dbg_ok == true and captured ~= nil, tostring(dbg_err))
+    rok("the launched rust config's type resolves to a registered dap adapter",
+      captured ~= nil and captured.dap_type == "rust"
+        and okd and dap.adapters[captured.dap_type] ~= nil,
+      vim.inspect(captured and captured.dap_type))
+
+    -- CANCELLATION: a superseded build must never reach dap.launch.
+    local late = nil
+    local saved2 = dapmod.launch
+    dapmod.launch = function(l) late = l return true end
+    local tok = dapmod.new_launch_token()
+    local reached = false
+    R.prepare_debug(adds, tok, function(l, _e)
+      if tok.cancelled then return end
+      reached = true
+      dapmod.launch(l)
+    end)
+    dapmod.new_launch_token()  -- supersede: cancels + aborts the pending build
+    vim.wait(2500)
+    dapmod.launch = saved2
+    rok("a superseded launch token is cancelled", tok.cancelled == true)
+    rok("a superseded build never reaches dap.launch (no late session)",
+      late == nil and reached == false, vim.inspect(late))
+
+    -- EXPLICIT cancel through the PRODUCTION surface (what <leader>dq calls),
+    -- not just supersession (Lector r1 P1-3).
+    local late2 = nil
+    local saved3 = dapmod.launch
+    dapmod.launch = function(l) late2 = l return true end
+    local tok2 = dapmod.new_launch_token()
+    local reached2 = false
+    R.prepare_debug(adds, tok2, function(l, _e)
+      if tok2.cancelled then return end
+      reached2 = true
+      dapmod.launch(l)
+    end)
+    dapmod.cancel_launch()
+    vim.wait(2500)
+    dapmod.launch = saved3
+    rok("cancel_launch() cancels an in-flight preparation", tok2.cancelled == true)
+    rok("an explicitly cancelled build never reaches dap.launch",
+      late2 == nil and reached2 == false, vim.inspect(late2))
+
+    -- …and the terminate keymap is a real production caller of it.
+    require("auto-run.keymaps").default_keymaps()
+    local leader = vim.g.mapleader or "\\"
+    local dq = vim.fn.maparg(leader .. "dq", "n", false, true)
+    local saved_cancel = dapmod.cancel_launch
+    local cancel_called = false
+    dapmod.cancel_launch = function() cancel_called = true end
+    if type(dq) == "table" and type(dq.callback) == "function" then
+      pcall(dq.callback)
+    end
+    dapmod.cancel_launch = saved_cancel
+    rok("<leader>dq routes through cancel_launch before dap.terminate",
+      cancel_called == true, vim.inspect(dq and dq.lhs))
+  end
+end
+
+print("\n[41] rust — provider effective-config gating + assertion floor")
+do
+  local dapmod = require("auto-run.dap")
+  if not HAVE_CARGO then
+    print("  [41] cargo unavailable — provider cells skipped")
+  else
+    worktree.set_active(rustws)
+    store.add({ name = "rust-build", kind = "debug", runtime = "rust" }, { tier = "shared" })
+    local exe = rustws .. "/prebuilt-bin"
+    write_file(exe, "#!/bin/sh\nexit 0\n")
+    store.add({ name = "rust-explicit", kind = "debug", runtime = "rust", program = exe },
+      { tier = "shared" })
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].filetype = "rust"
+    local names = {}
+    for _, e in ipairs(dapmod.provider(buf)) do names[#names + 1] = e.name end
+    rok("the SYNC provider omits a build-requiring rust config",
+      not contains(names, "[auto-run] rust-build"), vim.inspect(names))
+    rok("the SYNC provider includes an explicit-program rust config",
+      contains(names, "[auto-run] rust-explicit"), vim.inspect(names))
+    store.remove("rust-build")
+    store.remove("rust-explicit")
+
+    -- Generic (non-position) run/term configs must carry Cargo identity, and
+    -- ambiguity must be a structured error rather than a Cargo guess.
+    local R = P3.adapters.get("rust")
+    local amb, amb_err = R.build_run_argv(
+      { name = "amb", kind = "run", runtime = "rust", cwd = rustws .. "/crateb" })
+    rok("a multi-bin crate with no pinned target is a STRUCTURED error (no guess)",
+      amb == nil and type(amb_err) == "string"
+        and amb_err:find("bin targets", 1, true) ~= nil, tostring(amb_err))
+    local pinned = R.build_run_argv({ name = "p", kind = "run", runtime = "rust",
+      cwd = rustws .. "/crateb", cargo_package = "crateb",
+      cargo_target = "customtool", cargo_target_kind = "bin" })
+    rok("a pinned generic run config emits -p <pkg> --bin <target>",
+      pinned ~= nil and table.concat(pinned, " ") == "cargo run -p crateb --bin customtool",
+      vim.inspect(pinned))
+    local tcfg = R.build_run_argv({ name = "t", kind = "test", runtime = "rust",
+      cwd = rustws .. "/cratea" })
+    rok("a generic test config emits -p <pkg> (package-unambiguous)",
+      tcfg ~= nil and table.concat(tcfg, " ") == "cargo test -p cratea", vim.inspect(tcfg))
+
+    -- default_config scaffolds that identity rather than a bare shell.
+    vim.cmd.edit(vim.fn.fnameescape(rustws .. "/crateb/src/main.rs"))
+    local scaffold = R.default_config("run", "x")
+    rok("default_config scaffolds the Cargo package identity",
+      scaffold.runtime == "rust" and scaffold.cargo_package == "crateb",
+      vim.inspect(scaffold))
+    rok("default_config leaves a MULTI-BIN crate's target unpinned (no guess)",
+      scaffold.cargo_target == nil, vim.inspect(scaffold))
+
+    -- The integrated TERM strategy carries the selectors end-to-end.
+    store.add({ name = "rust-run", kind = "run", runtime = "rust",
+      cwd = rustws .. "/crateb", cargo_package = "crateb",
+      cargo_target = "customtool", cargo_target_kind = "bin" }, { tier = "shared" })
+    local cmdline = require("auto-run.exec").command_line("rust-run")
+    -- command_line shell-quotes each token, so match the quoted argv.
+    rok("the TERM-strategy command line carries the cargo selectors",
+      type(cmdline) == "string"
+        and cmdline:find("'cargo' 'run' '-p' 'crateb' '--bin' 'customtool'", 1, true) ~= nil,
+      tostring(cmdline))
+    store.remove("rust-run")
+
+    -- ── ONE authoritative identity, shared by run and ordinary debug ──
+    local cratea_cwd = rustws .. "/cratea"
+    -- CROSS-PACKAGE: cwd is inside cratea while the config names crateb's
+    -- target. The resolver must follow the NAMED package, not the cwd crate.
+    local xcfg = { name = "x", kind = "run", runtime = "rust", cwd = cratea_cwd,
+      cargo_package = "crateb", cargo_target = "customtool", cargo_target_kind = "bin" }
+    local xargv = R.build_run_argv(xcfg)
+    rok("a cross-package config resolves the NAMED package, not the cwd crate",
+      xargv ~= nil and table.concat(xargv, " ") == "cargo run -p crateb --bin customtool",
+      vim.inspect(xargv))
+
+    -- WORKSPACE-ROOT cwd + a named package: the cwd crate cannot supply targets.
+    local rargv = R.build_run_argv({ name = "r", kind = "run", runtime = "rust",
+      cwd = rustws, cargo_package = "cratec" })
+    rok("a workspace-ROOT cwd still resolves the named package's sole bin",
+      rargv ~= nil and table.concat(rargv, " ") == "cargo run -p cratec --bin cratec",
+      vim.inspect(rargv))
+
+    -- Validation: half-specified pair, unsupported kind, non-member target,
+    -- non-member package — each a structured error, never a silent degrade.
+    local _, half_err = R.build_run_argv({ name = "h", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "crateb", cargo_target = "customtool" })
+    rok("a HALF-specified target identity is a structured error",
+      type(half_err) == "string" and half_err:find("half-specifies", 1, true) ~= nil,
+      tostring(half_err))
+    local _, kind_err = R.build_run_argv({ name = "k", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "crateb", cargo_target = "customtool",
+      cargo_target_kind = "banana" })
+    rok("an UNSUPPORTED cargo_target_kind is a structured error (no silent degrade)",
+      type(kind_err) == "string" and kind_err:find("unsupported", 1, true) ~= nil,
+      tostring(kind_err))
+    local _, mem_err = R.build_run_argv({ name = "m", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "customtool",
+      cargo_target_kind = "bin" })
+    rok("a target that does NOT belong to the named package is rejected",
+      type(mem_err) == "string" and mem_err:find("no bin target named", 1, true) ~= nil,
+      tostring(mem_err))
+    local _, pkg_err = R.build_run_argv({ name = "n", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "nosuchpkg" })
+    rok("a package outside the workspace is rejected",
+      type(pkg_err) == "string" and pkg_err:find("not a member", 1, true) ~= nil,
+      tostring(pkg_err))
+
+    -- OPERATION-AWARE target validation: `cargo run` accepts only --bin, so a
+    -- lib/test target pinned on a run config must be refused rather than
+    -- emitted as an argv Cargo rejects.
+    local _, librun_err = R.build_run_argv({ name = "lr", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "cratea_lib",
+      cargo_target_kind = "lib" })
+    rok("`cargo run` REFUSES a pinned lib target (invalid --lib argv)",
+      type(librun_err) == "string" and librun_err:find("cannot launch", 1, true) ~= nil,
+      tostring(librun_err))
+    local _, testrun_err = R.build_run_argv({ name = "tr", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "it",
+      cargo_target_kind = "test" })
+    rok("`cargo run` REFUSES a pinned test target (invalid --test argv)",
+      type(testrun_err) == "string" and testrun_err:find("cannot launch", 1, true) ~= nil,
+      tostring(testrun_err))
+    -- Positive control: the SAME lib pin is legal for `cargo test`, so the rule
+    -- is operation-aware rather than a blanket ban on lib/test targets.
+    local libtest_argv = R.build_run_argv({ name = "lt", kind = "test", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "cratea_lib",
+      cargo_target_kind = "lib" })
+    rok("`cargo test` ACCEPTS the same lib pin (operation-aware, not a blanket ban)",
+      libtest_argv ~= nil
+        and table.concat(libtest_argv, " ") == "cargo test -p cratea --lib",
+      vim.inspect(libtest_argv))
+
+    -- RUN/DEBUG EQUIVALENCE: the same effective config must resolve the same
+    -- package+target in BOTH capabilities (debug must build crateb's
+    -- customtool, never a cratea target).
+    local dlaunch, derr, dfired
+    R.prepare_debug_config(xcfg, {}, function(l, e) dlaunch, derr, dfired = l, e, true end)
+    wait_for(function() return dfired end, 180000)
+    rok("ordinary debug resolves the SAME cross-package target as run",
+      derr == nil and dlaunch ~= nil and type(dlaunch.program) == "string"
+        and dlaunch.program:find("customtool", 1, true) ~= nil,
+      derr and derr.message or (dlaunch and dlaunch.program))
+    rok("ordinary debug builds in the NAMED package's crate dir",
+      dlaunch ~= nil and dlaunch.cwd == rustws .. "/crateb", dlaunch and dlaunch.cwd)
+  end
+
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 66 or 6
+  ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
+    rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
+end
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

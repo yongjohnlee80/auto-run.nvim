@@ -49,6 +49,13 @@ local CONFIG_FIELDS = {
   secret_manifests = "string_list",
   command_env      = "command_env_list",
   runtime_env      = "string_map",
+  -- Cargo target identity for Rust configs (ADR 0194 §2.3.4). A generic
+  -- run/debug/test config must be unambiguous in a multi-package /
+  -- multi-bin workspace, so it carries the package and (optionally) the
+  -- exact target the `-p` / `--lib|--bin|--test` selectors are built from.
+  cargo_package     = "string",
+  cargo_target      = "string",
+  cargo_target_kind = "string",
 }
 
 ---Env-profile fields (ADR-0048 §4).

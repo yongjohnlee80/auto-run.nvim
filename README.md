@@ -306,6 +306,21 @@ runner's machine output back to position ids. Baseline adapters:
   `--json --outputFile=<per-run file>` and regex-escaped
   ancestor-joined `--testNamePattern`s; a kind=test config's composed
   env applies to every run, exactly as for go.
+- **rust** (ADR 0194) — `#[test]`-family functions (`#[test]`,
+  `#[tokio::test]`, `#[rstest]`, …) nested by `mod`, over `.rs` files;
+  root is the nearest `Cargo.toml` promoted to the enclosing
+  `[workspace]`; Cargo **package + target identity** (`-p` / `--lib` /
+  `--bin` / `--test`) is attached to every position, and runs use
+  `cargo test <selectors> [<name>] -- --exact --format pretty --color
+  never`. Rust has no stable machine test output (libtest JSON is
+  nightly), so `results` is a versioned parser over libtest's pretty
+  output, target-scoped, and returns a structured error (never a silent
+  skip) when a run is ambiguous. **Debugging** builds the
+  identity-matched artifact (`cargo … --no-run --message-format=json`)
+  and launches it under **codelldb** (`dap.adapters.rust`); the four
+  optional adapter capabilities (`default_config`, `build_run_argv`,
+  `prepare_debug`, `prepare_debug_config`) drive scaffolding, `cargo
+  run`, debug-a-test, and ordinary `kind=debug` launches.
 
 #### One env convention for every language
 
