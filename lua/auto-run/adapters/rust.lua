@@ -533,7 +533,10 @@ function M.build_spec(args)
       end
     end
     if #segs == 0 then return nil, nil end
-    argv[#argv + 1] = table.concat(segs, "::")
+    -- Trailing `::` is LOAD-BEARING: libtest's positional is a SUBSTRING match,
+    -- so a bare `util` also runs `util_extra::*`. The `util::` boundary matches
+    -- only the requested module (ADR §2.3.2; proven by the util_extra cell).
+    argv[#argv + 1] = table.concat(segs, "::") .. "::"
     argv[#argv + 1] = "--"
   else
     return nil, "rust adapter cannot run a '" .. tostring(pos.type) .. "' position"
@@ -637,11 +640,81 @@ end
 
 ---Scaffold defaults for a new Rust config (`<leader>rc`). `kind=test` targets
 ---the crate; `run`/`debug` name the default binary program token.
+---Resolve the Cargo package/target a GENERIC (non-position) config targets:
+---the config's own `cargo_package` / `cargo_target[_kind]`, else the crate at
+---its cwd. Ambiguity is a STRUCTURED error, never a silent guess that lets
+---Cargo pick or fail opaquely (ADR 0194 §2.3.4).
+---@param eff table
+---@return { package: string, kind: string?, target: string? }? id, string? err
+local function generic_identity(eff)
+  local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or vim.uv.cwd()
+  local crate = M.crate_dir(from)
+  local pkg = crate and package_at(crate) or nil
+  local pkg_name = eff.cargo_package or (pkg and pkg.name)
+  if not pkg_name then
+    return nil, "rust: cannot resolve a Cargo package for config '"
+      .. tostring(eff.name) .. "' — set `cargo_package`"
+  end
+
+  -- An explicitly pinned target wins.
+  if eff.cargo_target and eff.cargo_target_kind then
+    return { package = pkg_name, kind = eff.cargo_target_kind, target = eff.cargo_target }, nil
+  end
+
+  if eff.kind == "test" then
+    -- `-p <pkg>` alone is unambiguous for a test run (all the package's tests).
+    return { package = pkg_name, kind = nil, target = nil }, nil
+  end
+
+  -- run/debug need ONE bin target. Follow Cargo's own rule: a sole bin, else
+  -- the manifest's `default-run`. With several bins and no default, Cargo
+  -- itself refuses to choose — so do the same, loudly, rather than guessing.
+  local bins = {}
+  for _, t in ipairs((pkg or {}).targets or {}) do
+    if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
+  end
+  if #bins == 1 then
+    return { package = pkg_name, kind = "bin", target = bins[1] }, nil
+  end
+  if pkg and type(pkg.default_run) == "string" and pkg.default_run ~= "" then
+    return { package = pkg_name, kind = "bin", target = pkg.default_run }, nil
+  end
+  return nil, ("rust: package '%s' has %d bin targets and no default-run — set "
+    .. "`cargo_target` (+ `cargo_target_kind=\"bin\"`) on config '%s'")
+    :format(pkg_name, #bins, tostring(eff.name))
+end
+
 ---@param kind "run"|"test"|"debug"
 ---@param _name string?
 ---@return table
 function M.default_config(kind, _name)
-  return { runtime = "rust", kind = kind, program = "${worktree}" }
+  local cfg = { runtime = "rust", kind = kind, program = "${worktree}" }
+  -- Carry Cargo identity so a scaffolded config is unambiguous in a
+  -- multi-package / multi-bin workspace (ADR 0194 §2.3.4).
+  local buf = vim.api.nvim_buf_get_name(0)
+  local from = (type(buf) == "string" and buf:match("%.rs$")) and fs_path.parent(buf)
+    or vim.uv.cwd()
+  local pkg = from and M.crate_dir(from) and package_at(M.crate_dir(from)) or nil
+  if pkg then
+    cfg.cargo_package = pkg.name
+    if kind ~= "test" then
+      local bins = {}
+      for _, t in ipairs(pkg.targets or {}) do
+        if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
+      end
+      -- Same rule as generic_identity: a sole bin or the manifest default-run.
+      -- A multi-bin crate is left UNPINNED so the user names the target rather
+      -- than inheriting a guess.
+      local chosen = (#bins == 1 and bins[1])
+        or (type(pkg.default_run) == "string" and pkg.default_run ~= "" and pkg.default_run)
+        or nil
+      if chosen then
+        cfg.cargo_target = chosen
+        cfg.cargo_target_kind = "bin"
+      end
+    end
+  end
+  return cfg
 end
 
 ---argv for the run/term strategy (NEVER a DAP launch — that is prepare_debug*).
@@ -651,11 +724,26 @@ end
 ---@return string[]? argv, string? err
 function M.build_run_argv(eff, _opts)
   -- Base command only; the caller (exec.build_argv / command_line) appends the
-  -- config's args, same as it does for every runtime.
-  if eff.kind == "test" then
-    return { "cargo", "test" }, nil
+  -- config's args. Cargo identity is REQUIRED here: a bare `cargo run`/`cargo
+  -- test` is ambiguous in a multi-package / multi-bin workspace, so emit
+  -- `-p <pkg>` plus the target selector, and fail structurally when the target
+  -- cannot be resolved (ADR 0194 §2.3.4).
+  local id, err = generic_identity(eff)
+  if not id then return nil, err end
+
+  local argv = { "cargo", eff.kind == "test" and "test" or "run" }
+  argv[#argv + 1] = "-p"
+  argv[#argv + 1] = id.package
+  if id.kind == "lib" then
+    argv[#argv + 1] = "--lib"
+  elseif id.kind == "bin" and id.target then
+    argv[#argv + 1] = "--bin"
+    argv[#argv + 1] = id.target
+  elseif id.kind == "test" and id.target then
+    argv[#argv + 1] = "--test"
+    argv[#argv + 1] = id.target
   end
-  return { "cargo", "run" }, nil
+  return argv, nil
 end
 
 -- ── debug capabilities (async: cargo build → artifact → codelldb) ─
@@ -796,17 +884,17 @@ function M.prepare_debug_config(eff, opts, cb)
   for _, t in ipairs(pkg.targets or {}) do
     if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
   end
-  local bin = eff.cargo_bin
+  local bin = (eff.cargo_target_kind == "bin" and eff.cargo_target) or nil
   if not bin then
-    if vim.tbl_contains(bins, pkg.name) then
-      bin = pkg.name
-    elseif #bins == 1 then
+    if #bins == 1 then
       bin = bins[1]
+    elseif type(pkg.default_run) == "string" and pkg.default_run ~= "" then
+      bin = pkg.default_run
     else
       return cb(nil, {
         code = "ambiguous_artifact",
-        message = ("crate '%s' has %d bin targets; set `cargo_bin` on the config")
-          :format(pkg.name, #bins),
+        message = ("crate '%s' has %d bin targets; set `cargo_target` "
+          .. "(+ cargo_target_kind=\"bin\") on the config"):format(pkg.name, #bins),
         detail = { bins = bins },
       })
     end

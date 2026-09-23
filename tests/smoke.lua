@@ -3957,6 +3957,7 @@ write_file(rustws .. "/cratea/Cargo.toml",
   '[package]\nname = "cratea"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "cratea_lib"\n')
 write_file(rustws .. "/cratea/src/lib.rs", table.concat({
   "pub mod util;",
+  "pub mod util_extra;",
   "pub fn add(a: i32, b: i32) -> i32 { a + b }",
   "#[cfg(test)]",
   "mod tests {",
@@ -3973,6 +3974,16 @@ write_file(rustws .. "/cratea/src/util.rs", table.concat({
   "mod tests {",
   "    use super::*;",
   "    #[test] fn util_only() { assert_eq!(double(2), 4); }",
+  "}",
+}, "\n") .. "\n")
+-- A PREFIX-COLLIDING sibling module: `util_extra` shares the `util` prefix, so
+-- a boundary-less libtest filter (`util`) would execute it. Its test PANICS, so
+-- any run that reaches it fails loudly — this is the cell that falsifies a
+-- missing `::` boundary (Lector r1 P1-2).
+write_file(rustws .. "/cratea/src/util_extra.rs", table.concat({
+  "#[cfg(test)]",
+  "mod tests {",
+  "    #[test] fn must_not_run() { panic!(\"unrelated sibling module executed\"); }",
   "}",
 }, "\n") .. "\n")
 write_file(rustws .. "/cratea/tests/it.rs", "#[test] fn adds() { assert!(true); }\n")
@@ -4050,9 +4061,18 @@ do
         id = utilfile .. "::tests",
         children = { { type = "test", name = "util_only", path = utilfile,
           id = utilfile .. "::tests::util_only" } } } })
-    rok("a namespace scope filters by <module_prefix>::<mod>",
-      mod_spec ~= nil and contains(mod_spec.cmd, "util::tests"),
+    rok("a namespace scope filters by <module_prefix>::<mod>:: (boundary-safe)",
+      mod_spec ~= nil and contains(mod_spec.cmd, "util::tests::"),
       vim.inspect(mod_spec and mod_spec.cmd))
+
+    local ufile_spec = R.build_spec({
+      position = { type = "file", path = utilfile, id = utilfile,
+        children = { { type = "test", name = "util_only", path = utilfile,
+          id = utilfile .. "::tests::util_only" } } } })
+    rok("a file scope emits the `util::` module BOUNDARY, not a bare `util`",
+      ufile_spec ~= nil and contains(ufile_spec.cmd, "util::")
+        and not contains(ufile_spec.cmd, "util"),
+      vim.inspect(ufile_spec and ufile_spec.cmd))
 
     local one = R.build_spec({
       position = { type = "test", name = "util_only", path = utilfile,
@@ -4115,14 +4135,26 @@ do
     rok("a DUPLICATE test name in another target does not leak into this scope",
       mapped == 3, vim.inspect(map))
 
+    -- Run the ACTUAL build_spec argv for the util.rs file scope against the
+    -- PREFIX-COLLIDING sibling `util_extra` (whose test panics if executed).
+    -- A boundary-less `util` filter would run it and fail the run.
+    local ufile = rustws .. "/cratea/src/util.rs"
+    local uspec = R.build_spec({
+      position = { type = "file", path = ufile, id = ufile,
+        children = { { type = "test", name = "util_only", path = ufile,
+          id = ufile .. "::tests::util_only" } } } })
     local uout = fx .. "/rust_util.txt"
-    os.execute("cd " .. rustws .. "/cratea && cargo test -p cratea --lib util -- "
-      .. "--format pretty --color never >" .. uout .. " 2>&1")
+    os.execute("cd " .. uspec.cwd .. " && "
+      .. table.concat(uspec.cmd, " ") .. " >" .. uout .. " 2>&1")
     local utext = table.concat(vim.fn.readfile(uout), "\n")
-    rok("a module-filtered run executes the selected module's test",
-      utext:find("util::tests::util_only", 1, true) ~= nil, utext:sub(1, 300))
-    rok("a module-filtered run does NOT execute the sibling module's tests",
-      utext:find("\ntest tests::adds ", 1, true) == nil, utext:sub(1, 300))
+    rok("the module-filtered spec executes the selected module's test",
+      utext:find("util::tests::util_only", 1, true) ~= nil, utext:sub(1, 400))
+    rok("the `util::` boundary EXCLUDES the prefix-colliding util_extra sibling",
+      utext:find("util_extra", 1, true) == nil, utext:sub(1, 400))
+    rok("the module-filtered run passes (the panicking sibling never executed)",
+      utext:find("test result: ok", 1, true) ~= nil, utext:sub(1, 400))
+    rok("the module-filtered run does NOT execute the crate-root module's tests",
+      utext:find("\ntest tests::adds ", 1, true) == nil, utext:sub(1, 400))
 
     local single = { type = "test", path = libfile, id = libfile .. "::tests::adds",
       children = {} }
@@ -4223,6 +4255,39 @@ do
     rok("a superseded launch token is cancelled", tok.cancelled == true)
     rok("a superseded build never reaches dap.launch (no late session)",
       late == nil and reached == false, vim.inspect(late))
+
+    -- EXPLICIT cancel through the PRODUCTION surface (what <leader>dq calls),
+    -- not just supersession (Lector r1 P1-3).
+    local late2 = nil
+    local saved3 = dapmod.launch
+    dapmod.launch = function(l) late2 = l return true end
+    local tok2 = dapmod.new_launch_token()
+    local reached2 = false
+    R.prepare_debug(adds, tok2, function(l, _e)
+      if tok2.cancelled then return end
+      reached2 = true
+      dapmod.launch(l)
+    end)
+    dapmod.cancel_launch()
+    vim.wait(2500)
+    dapmod.launch = saved3
+    rok("cancel_launch() cancels an in-flight preparation", tok2.cancelled == true)
+    rok("an explicitly cancelled build never reaches dap.launch",
+      late2 == nil and reached2 == false, vim.inspect(late2))
+
+    -- …and the terminate keymap is a real production caller of it.
+    require("auto-run.keymaps").default_keymaps()
+    local leader = vim.g.mapleader or "\\"
+    local dq = vim.fn.maparg(leader .. "dq", "n", false, true)
+    local saved_cancel = dapmod.cancel_launch
+    local cancel_called = false
+    dapmod.cancel_launch = function() cancel_called = true end
+    if type(dq) == "table" and type(dq.callback) == "function" then
+      pcall(dq.callback)
+    end
+    dapmod.cancel_launch = saved_cancel
+    rok("<leader>dq routes through cancel_launch before dap.terminate",
+      cancel_called == true, vim.inspect(dq and dq.lhs))
   end
 end
 
@@ -4248,6 +4313,46 @@ do
       contains(names, "[auto-run] rust-explicit"), vim.inspect(names))
     store.remove("rust-build")
     store.remove("rust-explicit")
+
+    -- Generic (non-position) run/term configs must carry Cargo identity, and
+    -- ambiguity must be a structured error rather than a Cargo guess.
+    local R = P3.adapters.get("rust")
+    local amb, amb_err = R.build_run_argv(
+      { name = "amb", kind = "run", runtime = "rust", cwd = rustws .. "/crateb" })
+    rok("a multi-bin crate with no pinned target is a STRUCTURED error (no guess)",
+      amb == nil and type(amb_err) == "string"
+        and amb_err:find("bin targets", 1, true) ~= nil, tostring(amb_err))
+    local pinned = R.build_run_argv({ name = "p", kind = "run", runtime = "rust",
+      cwd = rustws .. "/crateb", cargo_package = "crateb",
+      cargo_target = "customtool", cargo_target_kind = "bin" })
+    rok("a pinned generic run config emits -p <pkg> --bin <target>",
+      pinned ~= nil and table.concat(pinned, " ") == "cargo run -p crateb --bin customtool",
+      vim.inspect(pinned))
+    local tcfg = R.build_run_argv({ name = "t", kind = "test", runtime = "rust",
+      cwd = rustws .. "/cratea" })
+    rok("a generic test config emits -p <pkg> (package-unambiguous)",
+      tcfg ~= nil and table.concat(tcfg, " ") == "cargo test -p cratea", vim.inspect(tcfg))
+
+    -- default_config scaffolds that identity rather than a bare shell.
+    vim.cmd.edit(vim.fn.fnameescape(rustws .. "/crateb/src/main.rs"))
+    local scaffold = R.default_config("run", "x")
+    rok("default_config scaffolds the Cargo package identity",
+      scaffold.runtime == "rust" and scaffold.cargo_package == "crateb",
+      vim.inspect(scaffold))
+    rok("default_config leaves a MULTI-BIN crate's target unpinned (no guess)",
+      scaffold.cargo_target == nil, vim.inspect(scaffold))
+
+    -- The integrated TERM strategy carries the selectors end-to-end.
+    store.add({ name = "rust-run", kind = "run", runtime = "rust",
+      cwd = rustws .. "/crateb", cargo_package = "crateb",
+      cargo_target = "customtool", cargo_target_kind = "bin" }, { tier = "shared" })
+    local cmdline = require("auto-run.exec").command_line("rust-run")
+    -- command_line shell-quotes each token, so match the quoted argv.
+    rok("the TERM-strategy command line carries the cargo selectors",
+      type(cmdline) == "string"
+        and cmdline:find("'cargo' 'run' '-p' 'crateb' '--bin' 'customtool'", 1, true) ~= nil,
+      tostring(cmdline))
+    store.remove("rust-run")
   end
 
   local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 43 or 6

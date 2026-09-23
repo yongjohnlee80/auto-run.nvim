@@ -211,8 +211,18 @@ function M.default_keymaps()
     bind("n", "<leader>dc", dap.continue, "Debug: Continue / Start")
 
     -- <leader>dq / dR — terminate / restart  [provenance: kept]
-    bind("n", "<leader>dq", dap.terminate, "Debug: Terminate")
-    bind("n", "<leader>dR", dap.restart,   "Debug: Restart")
+    -- Terminate must also abort an in-flight debug PREPARATION (e.g. a Cargo
+    -- build that has not produced a DAP session yet): without this, the user's
+    -- terminate gesture leaves an orphaned build running and only a subsequent
+    -- launch would supersede it (ADR 0194 §2.3.4 cancellation ownership).
+    bind("n", "<leader>dq", function()
+      bridge().cancel_launch()
+      dap.terminate()
+    end, "Debug: Terminate")
+    bind("n", "<leader>dR", function()
+      bridge().cancel_launch()
+      dap.restart()
+    end, "Debug: Restart")
   end
 
   -- <leader>dt — debug nearest test  [provenance: gobugger `dt`]
