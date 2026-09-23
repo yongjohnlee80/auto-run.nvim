@@ -4402,6 +4402,31 @@ do
       type(pkg_err) == "string" and pkg_err:find("not a member", 1, true) ~= nil,
       tostring(pkg_err))
 
+    -- OPERATION-AWARE target validation: `cargo run` accepts only --bin, so a
+    -- lib/test target pinned on a run config must be refused rather than
+    -- emitted as an argv Cargo rejects.
+    local _, librun_err = R.build_run_argv({ name = "lr", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "cratea_lib",
+      cargo_target_kind = "lib" })
+    rok("`cargo run` REFUSES a pinned lib target (invalid --lib argv)",
+      type(librun_err) == "string" and librun_err:find("cannot launch", 1, true) ~= nil,
+      tostring(librun_err))
+    local _, testrun_err = R.build_run_argv({ name = "tr", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "it",
+      cargo_target_kind = "test" })
+    rok("`cargo run` REFUSES a pinned test target (invalid --test argv)",
+      type(testrun_err) == "string" and testrun_err:find("cannot launch", 1, true) ~= nil,
+      tostring(testrun_err))
+    -- Positive control: the SAME lib pin is legal for `cargo test`, so the rule
+    -- is operation-aware rather than a blanket ban on lib/test targets.
+    local libtest_argv = R.build_run_argv({ name = "lt", kind = "test", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "cratea_lib",
+      cargo_target_kind = "lib" })
+    rok("`cargo test` ACCEPTS the same lib pin (operation-aware, not a blanket ban)",
+      libtest_argv ~= nil
+        and table.concat(libtest_argv, " ") == "cargo test -p cratea --lib",
+      vim.inspect(libtest_argv))
+
     -- RUN/DEBUG EQUIVALENCE: the same effective config must resolve the same
     -- package+target in BOTH capabilities (debug must build crateb's
     -- customtool, never a cratea target).
@@ -4416,7 +4441,7 @@ do
       dlaunch ~= nil and dlaunch.cwd == rustws .. "/crateb", dlaunch and dlaunch.cwd)
   end
 
-  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 63 or 6
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 66 or 6
   ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
     rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
 end

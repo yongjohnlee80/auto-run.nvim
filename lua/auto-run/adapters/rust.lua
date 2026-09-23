@@ -665,8 +665,9 @@ end
 ---  • With no pinned target: a test config needs none; run/debug take Cargo's
 ---    own rule (a sole bin, else `default-run`, else refuse).
 ---@param eff table
+---@param op "run"|"test"|"build"   the command the selectors will carry
 ---@return { package: string, package_id: string, crate_dir: string, kind: string?, target: string?, selectors: string[] }? id, string? err
-local function config_identity(eff)
+local function config_identity(eff, op)
   local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or vim.uv.cwd()
   local root = M.root(from) or M.crate_dir(from) or from
   local meta = cargo_metadata(root)
@@ -728,6 +729,24 @@ local function config_identity(eff)
     if not found then
       return nil, ("rust: package '%s' has no %s target named '%s'")
         :format(pkg.name, kind, eff.cargo_target)
+    end
+    -- OPERATION-aware validation: the selector set a pinned kind produces must
+    -- be legal for the command that will carry it. `cargo run` accepts only
+    -- `--bin` (Phase 1), so a lib/test target there would emit an argv Cargo
+    -- rejects; `cargo test` accepts all three; a debug prebuild needs something
+    -- that yields an executable (bin or the test harness binary).
+    local legal = (op == "test")
+      or (op == "run" and kind == "bin")
+      or (op == "build" and (kind == "bin" or kind == "test"))
+    if not legal then
+      if op == "run" then
+        return nil, ("rust: `cargo run` cannot launch the %s target '%s' — config "
+          .. "'%s' must pin a bin target (cargo_target_kind=\"bin\")")
+          :format(kind, eff.cargo_target, tostring(eff.name))
+      end
+      return nil, ("rust: the %s target '%s' produces no executable to debug — "
+        .. "config '%s' must pin a bin target")
+        :format(kind, eff.cargo_target, tostring(eff.name))
     end
     return {
       package = pkg.name, package_id = pkg.id, crate_dir = crate_dir,
@@ -807,9 +826,10 @@ function M.build_run_argv(eff, _opts)
   -- test` is ambiguous in a multi-package / multi-bin workspace, so emit
   -- `-p <pkg>` plus the target selector, and fail structurally when the target
   -- cannot be resolved (ADR 0194 §2.3.4).
-  local id, err = config_identity(eff)
+  local op = (eff.kind == "test") and "test" or "run"
+  local id, err = config_identity(eff, op)
   if not id then return nil, err end
-  local argv = { "cargo", eff.kind == "test" and "test" or "run" }
+  local argv = { "cargo", op }
   for _, s in ipairs(id.selectors) do argv[#argv + 1] = s end
   return argv, nil
 end
@@ -937,16 +957,10 @@ function M.prepare_debug_config(eff, opts, cb)
   end
   -- Baseline: build via the SAME resolved identity `build_run_argv` uses, so
   -- run and debug can never target different workspace members (Lector r2 P1).
-  local id, ierr = config_identity(eff)
+  -- `build`: the resolver rejects a pinned target that yields no executable.
+  local id, ierr = config_identity(eff, "build")
   if not id then
     return cb(nil, { code = "no_target", message = ierr })
-  end
-  if id.kind == "lib" then
-    return cb(nil, {
-      code = "no_target",
-      message = ("rust: config '%s' targets a lib, which produces no executable to debug")
-        :format(tostring(eff.name)),
-    })
   end
   local identity = {
     package = id.package,
