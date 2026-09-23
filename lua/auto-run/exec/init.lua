@@ -112,6 +112,16 @@ local function build_argv(eff, opts)
     return argv, nil
   end
 
+  -- Adapter run-argv capability (ADR 0194 §2.3.4) for non-go runtimes: rust
+  -- returns `cargo test`/`cargo run`. Go's path above stays first (unchanged).
+  local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
+  if adapter and type(adapter.build_run_argv) == "function" then
+    local a, aerr = adapter.build_run_argv(eff, opts)
+    if not a then return nil, aerr end
+    for _, x in ipairs(eff.args or {}) do a[#a + 1] = x end
+    return a, nil
+  end
+
   if type(eff.program) ~= "string" or eff.program == "" then
     return nil, "config '" .. tostring(eff.name) .. "' has no program to run"
   end
@@ -169,10 +179,18 @@ function M.command_line(name, opts)
     with_flags(argv)
     argv[#argv + 1] = eff.program
   else
-    if type(eff.program) ~= "string" or eff.program == "" then
+    -- Non-go runtime: the adapter's run-argv capability (rust: cargo run/test),
+    -- else a bare program. Args are appended below, same as every branch.
+    local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
+    if adapter and type(adapter.build_run_argv) == "function" then
+      local a, aerr = adapter.build_run_argv(eff, opts)
+      if not a then return nil, aerr end
+      argv = a
+    elseif type(eff.program) ~= "string" or eff.program == "" then
       return nil, "config '" .. tostring(name) .. "' has no program to run"
+    else
+      argv = { eff.program }
     end
-    argv = { eff.program }
   end
   for _, a in ipairs(eff.args or {}) do argv[#argv + 1] = a end
 

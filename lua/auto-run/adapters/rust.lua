@@ -577,11 +577,9 @@ end
 ---Scaffold defaults for a new Rust config (`<leader>rc`). `kind=test` targets
 ---the crate; `run`/`debug` name the default binary program token.
 ---@param kind "run"|"test"|"debug"
+---@param _name string?
 ---@return table
-function M.default_config(kind)
-  if kind == "test" then
-    return { runtime = "rust", kind = "test", program = "${worktree}" }
-  end
+function M.default_config(kind, _name)
   return { runtime = "rust", kind = kind, program = "${worktree}" }
 end
 
@@ -591,12 +589,166 @@ end
 ---@param _opts table?
 ---@return string[]? argv, string? err
 function M.build_run_argv(eff, _opts)
+  -- Base command only; the caller (exec.build_argv / command_line) appends the
+  -- config's args, same as it does for every runtime.
   if eff.kind == "test" then
     return { "cargo", "test" }, nil
   end
-  local argv = { "cargo", "run" }
-  for _, a in ipairs(eff.args or {}) do argv[#argv + 1] = a end
-  return argv, nil
+  return { "cargo", "run" }, nil
+end
+
+-- ── debug capabilities (async: cargo build → artifact → codelldb) ─
+
+---@class AutoRunDebugLaunch
+---@field dap_type string             nvim-dap adapter key (→ dap.adapters[dap_type])
+---@field request "launch"|"attach"
+---@field program string             absolute path to the built executable
+---@field args string[]?
+---@field cwd string?
+---@field env table<string,string>?
+
+---@class AutoRunError
+---@field code string
+---@field message string
+---@field detail table?
+
+---Build via `cargo <sub> --message-format=json <selectors>` and select the ONE
+---executable matching `identity.target` (and, for tests, `profile.test`). Async
+---(vim.system). The callback fires EXACTLY ONCE (Lector r4 caution #2); a
+---cancel through `opts.is_cancelled()` or `opts.abort()` drops a late build and
+---never launches. `want_test` picks the test harness binary vs the plain bin.
+---@param sub "test"|"build"
+---@param want_test boolean
+---@param identity RustTargetIdentity
+---@param cwd string
+---@param opts table
+---@param cb fun(exe: string|nil, err: AutoRunError|nil)
+local function cargo_build_exe(sub, want_test, identity, cwd, opts, cb)
+  local done = false
+  local function finish(exe, err)
+    if done then return end
+    done = true
+    cb(exe, err)
+  end
+
+  local cmd = { "cargo", sub, "--no-run", "--message-format=json" }
+  if sub == "build" then cmd = { "cargo", "build", "--message-format=json" } end
+  for _, s in ipairs(identity.selectors) do cmd[#cmd + 1] = s end
+
+  local ok, handle = pcall(vim.system, cmd, { cwd = cwd, text = true }, function(res)
+    if type(opts.is_cancelled) == "function" and opts.is_cancelled() then
+      return finish(nil, { code = "cancelled", message = "debug build cancelled" })
+    end
+    if res.code ~= 0 then
+      return finish(nil, {
+        code = "build_failed",
+        message = "cargo " .. sub .. " failed (exit " .. tostring(res.code) .. ")",
+        detail = { stderr = (res.stderr or ""):sub(1, 2000) },
+      })
+    end
+    local exes = {}
+    for line in (res.stdout or ""):gmatch("[^\n]+") do
+      local okj, m = pcall(vim.json.decode, line)
+      if okj and type(m) == "table" and m.reason == "compiler-artifact" and m.executable then
+        local t = m.target or {}
+        local is_test = (m.profile or {}).test == true
+        local target_matches = (identity.target == nil or identity.target == ""
+          or t.name == identity.target)
+        if want_test == is_test and target_matches then
+          exes[#exes + 1] = m.executable
+        end
+      end
+    end
+    if #exes == 0 then
+      return finish(nil, {
+        code = "ambiguous_artifact",
+        message = "no " .. (want_test and "test " or "") .. "executable for target '"
+          .. tostring(identity.target) .. "'",
+      })
+    end
+    if #exes > 1 then
+      return finish(nil, {
+        code = "ambiguous_artifact",
+        message = ("%d executables matched target '%s' (expected exactly 1)")
+          :format(#exes, tostring(identity.target)),
+        detail = { executables = exes },
+      })
+    end
+    finish(exes[1], nil)
+  end)
+  if not ok then
+    return finish(nil, { code = "spawn_failed", message = "cargo: " .. tostring(handle) })
+  end
+  -- The adapter owns the build job; install an abort the core can call.
+  opts.abort = function() pcall(function() handle:kill(15) end) end
+end
+
+---Prepare a launch-ready DAP config for a discovered TEST position: build the
+---test binary, select the identity-matched artifact, and target the one test
+---with `--exact`. Baseline = Cargo prebuild (ADR 0194 §2.3.4); an explicit
+---`program` on `opts.eff` is an override that skips the build.
+---@param pos AutoRunPosition
+---@param opts table
+---@param cb fun(launch: AutoRunDebugLaunch|nil, err: AutoRunError|nil)
+function M.prepare_debug(pos, opts, cb)
+  opts = opts or {}
+  local identity = M.identity(pos.path)
+  if not identity then
+    return cb(nil, { code = "no_target", message = "no Cargo target for " .. tostring(pos.path) })
+  end
+  local reported = reported_path(pos, identity)
+  local applied = select(1, test_config())
+  cargo_build_exe("test", true, identity, identity.crate_dir, opts, function(exe, err)
+    if err then return cb(nil, err) end
+    cb({
+      dap_type = "rust",
+      request = "launch",
+      program = exe,
+      args = { "--exact", reported, "--nocapture" },
+      cwd = identity.crate_dir,
+      env = applied and applied.env or nil,
+    }, nil)
+  end)
+end
+
+---Prepare a launch-ready DAP config for an effective `kind=debug` config
+---(ordinary debug, ADR 0194 §2.3.4 r4). Baseline = `cargo build` the config's
+---bin target → identity-matched artifact → codelldb; an explicit `program`
+---(already a built executable) is the override and skips the build.
+---@param eff table
+---@param opts table
+---@param cb fun(launch: AutoRunDebugLaunch|nil, err: AutoRunError|nil)
+function M.prepare_debug_config(eff, opts, cb)
+  opts = opts or {}
+  -- Override: an explicit, already-built executable path.
+  if type(eff.program) == "string" and eff.program:match("/") and eff.kind ~= "test"
+      and vim.fn.filereadable(eff.program) == 1 then
+    return cb({
+      dap_type = "rust", request = "launch", program = eff.program,
+      args = eff.args, cwd = eff.cwd, env = eff.env,
+    }, nil)
+  end
+  -- Baseline: build the crate's bin at cwd (or a named bin) and launch it.
+  local cwd = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or nil
+  local crate = M.crate_dir(cwd or vim.uv.cwd())
+  if not crate then
+    return cb(nil, { code = "no_target", message = "no Cargo crate for the debug config's cwd" })
+  end
+  local pkg = package_name(crate)
+  local bin = eff.cargo_bin or pkg
+  local identity = {
+    package = pkg, crate_dir = crate, kind = "bin", target = bin,
+    selectors = pkg and (bin == pkg and { "-p", pkg, "--bin", pkg }
+      or { "-p", pkg, "--bin", bin }) or {},
+    module_prefix = "",
+  }
+  cargo_build_exe("build", false, identity, crate, opts, function(exe, err)
+    if err then return cb(nil, err) end
+    cb({
+      dap_type = "rust", request = "launch", program = exe,
+      args = eff.args, cwd = crate, env = eff.env,
+    }, nil)
+  end)
 end
 
 ---Test-only: drop the memoized caches.

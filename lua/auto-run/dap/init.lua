@@ -342,8 +342,21 @@ function M.provider(bufnr)
   local ft = vim.bo[bufnr].filetype
   local out = {}
   for _, c in ipairs(store.list()) do
-    if not c.error and (c.kind == "debug" or c.kind == "run")
-        and (c.runtime or "go") == ft then
+    -- A rust config that still needs a Cargo build cannot be prepared inside
+    -- nvim-dap's SYNCHRONOUS provider callback (ADR 0194 §2.3.4) — only an
+    -- explicit, already-built `program` is representable here; build-requiring
+    -- rust configs are reached via <leader>dm / debug_start. The include check
+    -- inspects the EFFECTIVE (merged) config so an inherited program counts
+    -- (Lector r4 caution #1).
+    local include = not c.error and (c.kind == "debug" or c.kind == "run")
+      and (c.runtime or "go") == ft
+    if include and c.runtime == "rust" then
+      local reff = select(1, store.get(c.name))
+      local prog = type(reff) == "table" and reff.program or nil
+      include = type(prog) == "string" and prog:match("/") ~= nil
+        and vim.fn.filereadable(prog) == 1
+    end
+    if include then
       local cfg_name = c.name
       local resolved, resolve_err
       local function field(key)
@@ -374,15 +387,86 @@ function M.provider(bufnr)
   return out
 end
 
+-- ── Rust (codelldb) adapter + generic capability launcher ───────
+
+local function codelldb_command()
+  local mason = vim.fs.normalize(vim.fn.stdpath("data") .. "/mason/bin/codelldb")
+  if vim.fn.executable(mason) == 1 then return mason end
+  return "codelldb"
+end
+
+---Register `dap.adapters.rust` = codelldb (a server adapter). Idempotent. The
+---runtime→dap-type contract maps `runtime="rust"` to `type="rust"` (dap_type),
+---so codelldb is registered under the `rust` key (ADR 0194 §2.3.1).
+---@param dap table
+function M.ensure_rust_adapter(dap)
+  if dap.adapters.rust ~= nil then return end
+  dap.adapters.rust = {
+    type = "server",
+    port = "${port}",
+    executable = { command = codelldb_command(), args = { "--port", "${port}" } },
+  }
+end
+
+---Launch a resolved DAP config produced by an adapter's `prepare_debug*`
+---capability (ADR 0194 §2.3.4). Ensures the adapter for `launch.dap_type` is
+---registered, then runs it. `(true)` or `(nil, err)`.
+---@param launch AutoRunDebugLaunch
+---@return boolean? ok, string? err
+function M.launch(launch)
+  local okd, dap = pcall(require, "dap")
+  if not okd then return nil, "nvim-dap is not installed" end
+  if launch.dap_type == "rust" then M.ensure_rust_adapter(dap) end
+  local cfg = {
+    type    = launch.dap_type,
+    request = launch.request or "launch",
+    name    = "[auto-run] " .. tostring(launch.dap_type),
+    program = launch.program,
+    args    = launch.args,
+    cwd     = launch.cwd,
+    env     = launch.env,
+  }
+  open_view()
+  local okr, rerr = pcall(dap.run, cfg)
+  if not okr then return nil, "dap.run: " .. tostring(rerr) end
+  return true, nil
+end
+
 -- ── launch flows ────────────────────────────────────────────────
 
 ---Start a dap session for a (kind=debug|run) config.
+---
+---Capability dispatch (ADR 0194 §2.3.4): an adapter that provides
+---`prepare_debug_config` (rust) builds asynchronously then launches through
+---`M.launch`; adapters without it (go + the generic passthrough) use the
+---synchronous translator, unchanged. The async build errors are logged (they
+---cannot cross the synchronous return), same as any deferred launch failure.
 ---@param name string
 ---@param opts { profile: string?, args: table? }?
 ---@return boolean? ok, string? err, table? detail
 function M.debug_start(name, opts)
   local okd, dap = pcall(require, "dap")
   if not okd then return nil, "nvim-dap is not installed" end
+
+  local store = require("auto-run.store")
+  local eff = select(1, store.get(name,
+    opts and { profile = opts.profile, args = opts.args } or nil))
+  local runtime = type(eff) == "table" and eff.runtime or nil
+  local adapter = runtime and require("auto-run.adapters").get(runtime) or nil
+  if adapter and type(adapter.prepare_debug_config) == "function" then
+    open_view()
+    adapter.prepare_debug_config(eff, {}, function(launch, perr)
+      if perr then
+        log.error("dap", "debug prepare failed: "
+          .. tostring(perr.message or perr.code))
+        return
+      end
+      local _, lerr = M.launch(launch)
+      if lerr then log.error("dap", lerr) end
+    end)
+    return true, nil
+  end
+
   local cfg, terr, detail = M.translate(name, opts)
   if not cfg then return nil, terr, detail end
   open_view()
@@ -541,6 +625,11 @@ function M.setup()
   -- Provider registration (§6): providers.configs is the sanctioned
   -- extension point; dap.configurations is never mutated.
   dap.providers.configs["auto-run"] = M.provider
+
+  -- Rust debugging uses codelldb under the `rust` dap-type (ADR 0194 §2.3.1);
+  -- register it so both the provider path (explicit-program configs) and the
+  -- capability launcher resolve the adapter. Idempotent.
+  M.ensure_rust_adapter(dap)
 
   -- dap-go registers its default `dap.configurations.go` entries
   -- ("Debug", "Attach", …) from inside its setup(); attach() needs

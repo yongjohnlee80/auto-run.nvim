@@ -165,13 +165,23 @@ function M.default_keymaps()
         if not kind then return end
         vim.ui.input({ prompt = "config name: " }, function(name)
           if not name or name == "" then return end
+          -- Scaffold defaults come from the buffer's adapter (ADR 0194 §2.3.4),
+          -- so a Rust buffer scaffolds a rust config and a Go buffer a go one.
+          -- Fall back to the go-shaped default for a buffer no adapter claims.
+          local adapter = require("auto-run.adapters").get(vim.bo.filetype)
+          local cfg
+          if adapter and type(adapter.default_config) == "function" then
+            cfg = adapter.default_config(kind, name)
+          else
+            cfg = {
+              runtime = "go",
+              program = kind == "test" and "${worktree}" or "${worktree}/cmd/" .. name,
+            }
+          end
+          cfg.name = name
+          cfg.kind = kind
           local store = require("auto-run.store")
-          local path, err = store.add({
-            name = name,
-            kind = kind,
-            runtime = "go",
-            program = kind == "test" and "${worktree}" or "${worktree}/cmd/" .. name,
-          })
+          local path, err = store.add(cfg)
           if not path then
             require("auto-run.log").error("keymaps", err)
             return
@@ -213,7 +223,10 @@ function M.default_keymaps()
   -- config path (dap-go cursor selection).
   bind("n", "<leader>dt", function()
     local node = discovery().nearest(0)
-    if node and node.type == "test" and node.adapter == "go" then
+    -- Any discovered test position routes through debug_position, which
+    -- dispatches by the adapter's debug capability (ADR 0194 §2.3.3) — no
+    -- keymap-level language branch. Undiscovered buffers fall back below.
+    if node and node.type == "test" then
       local _, err = discovery().debug_position(node.id)
       if err then require("auto-run.log").error("keymaps", err) end
       return

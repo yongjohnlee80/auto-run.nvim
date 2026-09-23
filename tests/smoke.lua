@@ -4029,6 +4029,68 @@ do
   end
 end
 
+print("\n[39] rust — debug capabilities, dap.adapters.rust, scaffold, err channel")
+do
+  local R = P3.adapters.get("rust")
+  local go = P3.adapters.get("go")
+
+  -- Scaffold capability (ADR 0194 §2.3.4): default_config per adapter.
+  local rc = R.default_config("test", "x")
+  ok("rust.default_config(test) → runtime=rust", rc.runtime == "rust" and rc.kind == "test")
+  local gc = go.default_config("run", "myapp")
+  ok("go.default_config(run, name) → go program path",
+    gc.runtime == "go" and gc.program == "${worktree}/cmd/myapp", vim.inspect(gc))
+
+  -- dap.adapters.rust = codelldb (ADR 0194 §2.3.1), registered at bridge setup.
+  local okd, dap = pcall(require, "dap")
+  if okd then
+    require("auto-run.dap").ensure_rust_adapter(dap)
+    ok("dap.adapters.rust is registered (codelldb server adapter)",
+      type(dap.adapters.rust) == "table" and dap.adapters.rust.type == "server"
+        and type(dap.adapters.rust.executable) == "table"
+        and dap.adapters.rust.executable.command:match("codelldb") ~= nil,
+      vim.inspect(dap.adapters.rust))
+  end
+
+  -- results(map, err?): a single-test scope whose requested test never appears
+  -- in the output is a STRUCTURED ambiguity error, not a silent skip.
+  local single = { type = "test", path = fx .. "/rustcrate/src/lib.rs",
+    id = fx .. "/rustcrate/src/lib.rs::tests::adds", children = {} }
+  local empty_out = fx .. "/rust_empty_out.txt"
+  local eh = assert(io.open(empty_out, "w")); eh:write("running 0 tests\n"); eh:close()
+  local tree_stub = { get = function(_, id) return id == single.id and single or nil end }
+  local map, err = R.results({ context = { position_id = single.id, target = "lib:rustcrate" } },
+    { stdout_file = empty_out, run_dir = fx }, tree_stub)
+  ok("results returns a structured ambiguity error when 0 lines match (never a skip)",
+    err ~= nil and err.code == "ambiguous_test", vim.inspect(err))
+  ok("results err path yields no phantom passed/skipped result", next(map) == nil)
+
+  -- prepare_debug: real cargo build → identity-matched artifact → launch config.
+  local parser_ok = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
+  if parser_ok and vim.fn.executable("cargo") == 1 then
+    local pos = R.discover_positions(fx .. "/rustcrate/src/lib.rs")
+    pos.id = pos.path
+    local function assign(n) for _, c in ipairs(n.children or {}) do
+      c.id = (n.type == "file" and n.path or n.id) .. "::" .. c.name; assign(c) end end
+    assign(pos)
+    local adds = pos.children[1].children[1]  -- tests::adds
+    local launch, perr, fired
+    R.prepare_debug(adds, {}, function(l, e) launch, perr, fired = l, e, true end)
+    vim.wait(60000, function() return fired end, 50)
+    ok("prepare_debug produced a launch (no error)", perr == nil, perr and perr.message)
+    ok("prepare_debug launch targets codelldb via dap_type=rust",
+      launch ~= nil and launch.dap_type == "rust")
+    ok("prepare_debug program is the built test executable",
+      launch ~= nil and type(launch.program) == "string"
+        and vim.fn.filereadable(launch.program) == 1, launch and launch.program)
+    ok("prepare_debug args select the one test with --exact",
+      launch ~= nil and launch.args[1] == "--exact" and launch.args[2] == "tests::adds",
+      vim.inspect(launch and launch.args))
+  else
+    print("  [39] cargo / rust parser unavailable — skipping prepare_debug assertions")
+  end
+end
+
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end
 os.exit(0)

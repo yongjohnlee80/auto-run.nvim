@@ -497,6 +497,22 @@ function M.output(exit, opts)
   return table.concat(parts)
 end
 
+-- ── scaffold capability (ADR 0194 §2.3.4) ───────────────────────
+
+---Scaffold defaults for a new Go config — the shape `<leader>rc` used to
+---hardcode, now reached through the adapter so scaffolding is language-generic.
+---@param kind "run"|"test"|"debug"
+---@param name string?
+---@return table
+function M.default_config(kind, name)
+  return {
+    runtime = "go",
+    kind = kind,
+    program = kind == "test" and "${worktree}"
+      or ("${worktree}/cmd/" .. tostring(name or "app")),
+  }
+end
+
 ---Test-only: drop the memoized root/module caches.
 function M._reset_for_tests()
   _root_cache, _module_path_cache = {}, {}

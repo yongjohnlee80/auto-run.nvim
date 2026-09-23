@@ -858,27 +858,47 @@ function M.run_position(id, opts)
           stdout_file = fs_path.join(s.run_dir, "stdout"),
           run_dir     = s.run_dir,
         }
-        local okr, parsed = pcall(s.adapter.results, s.spec, exit, tree)
+        -- Adapters may return `(map, err?)` (ADR 0194 §2.3.4). A thrown error
+        -- becomes a structured parse error; a returned `err` is an
+        -- adapter-detected failure (e.g. ambiguous target) that must NOT
+        -- degrade into ordinary missing-result skips.
+        local okr, parsed, perr = pcall(s.adapter.results, s.spec, exit, tree)
         if not okr then
+          local msg = tostring(parsed)
           log.warn("discovery", "results parse failed for " .. s.run_id
-            .. ": " .. tostring(parsed))
-          parsed = {}
+            .. ": " .. msg)
+          parsed, perr = {}, { code = "parse_threw", message = msg }
         end
+        parsed = parsed or {}
         for rid, res in pairs(parsed) do batch[rid] = res end
 
-        -- Missing-result filling for THIS spec's scope: parsed tests
-        -- keep their result; unreported ones fill as skipped — or as
-        -- failed when the runner produced nothing and exited non-zero
-        -- (build/config failure must not masquerade as skips).
-        local runner_died = next(parsed) == nil
-          and (rec.code ~= 0 or (rec.signal or 0) ~= 0)
-        for _, tid in ipairs(scope_test_ids(s.position)) do
-          if batch[tid] == nil then
-            batch[tid] = runner_died
-              and { status = "failed",
-                    output = ("runner exited code=%s signal=%s (see %s)")
-                      :format(tostring(rec.code), tostring(rec.signal), s.run_dir) }
-              or { status = "skipped" }
+        if perr then
+          -- Structured error: the scope's unreported tests FAIL (carrying the
+          -- error), never silently skip. Aggregation then reports the scope
+          -- failed and on_done carries the failed statuses.
+          log.error("discovery", "results error for " .. s.run_id .. ": "
+            .. tostring(perr.message or perr.code))
+          for _, tid in ipairs(scope_test_ids(s.position)) do
+            if batch[tid] == nil then
+              batch[tid] = { status = "failed",
+                output = tostring(perr.message or perr.code) }
+            end
+          end
+        else
+          -- Missing-result filling for THIS spec's scope: parsed tests
+          -- keep their result; unreported ones fill as skipped — or as
+          -- failed when the runner produced nothing and exited non-zero
+          -- (build/config failure must not masquerade as skips).
+          local runner_died = next(parsed) == nil
+            and (rec.code ~= 0 or (rec.signal or 0) ~= 0)
+          for _, tid in ipairs(scope_test_ids(s.position)) do
+            if batch[tid] == nil then
+              batch[tid] = runner_died
+                and { status = "failed",
+                      output = ("runner exited code=%s signal=%s (see %s)")
+                        :format(tostring(rec.code), tostring(rec.signal), s.run_dir) }
+                or { status = "skipped" }
+            end
           end
         end
 
@@ -926,19 +946,40 @@ function M.debug_position(id)
   if node.type ~= "test" then
     return nil, "debug_position needs a test position (got " .. node.type .. ")"
   end
-  if node.adapter ~= "go" then
-    return nil, "debug for '" .. tostring(node.adapter)
-      .. "' positions is not supported yet (go only — ADR-0048 Phase 2 dap path)"
-  end
+
+  -- Jump to the position (shared) so the user lands on the test being debugged.
   local oke, eerr = pcall(function()
     vim.cmd.edit(vim.fn.fnameescape(node.path))
     vim.api.nvim_win_set_cursor(0, { node.lnum or 1, 0 })
   end)
   if not oke then return nil, "jump to position failed: " .. tostring(eerr) end
-  local go_adapter = adapters.get("go")
-  local cfg_name = go_adapter and go_adapter.test_config_name
-    and go_adapter.test_config_name() or nil
-  return require("auto-run.dap").debug_test(cfg_name, {})
+
+  -- Capability dispatch (ADR 0194 §2.3.3), replacing the old `== "go"` gate:
+  -- an adapter with prepare_debug (rust) builds asynchronously then launches
+  -- through the dap bridge; go keeps its proven dap-go path; anything else is
+  -- a structured "unsupported".
+  local adapter = adapters.get(node.adapter or "")
+  local dap = require("auto-run.dap")
+  if adapter and type(adapter.prepare_debug) == "function" then
+    adapter.prepare_debug(node, {}, function(launch, perr)
+      if perr then
+        log.error("discovery", "debug prepare failed: "
+          .. tostring(perr.message or perr.code))
+        return
+      end
+      local _, lerr = dap.launch(launch)
+      if lerr then log.error("discovery", lerr) end
+    end)
+    return true, nil
+  end
+  if node.adapter == "go" then
+    local go_adapter = adapters.get("go")
+    local cfg_name = go_adapter and go_adapter.test_config_name
+      and go_adapter.test_config_name() or nil
+    return dap.debug_test(cfg_name, {})
+  end
+  return nil, "debug for '" .. tostring(node.adapter)
+    .. "' positions is not supported (adapter has no prepare_debug capability)"
 end
 
 -- ── nearest-position resolution (rt/rf/dt keymaps) ──────────────
