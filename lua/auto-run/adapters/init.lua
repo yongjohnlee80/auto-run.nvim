@@ -97,7 +97,7 @@ local _builtins_loaded = false
 local function ensure_builtins()
   if _builtins_loaded then return end
   _builtins_loaded = true
-  for _, mod in ipairs({ "auto-run.adapters.go", "auto-run.adapters.jest" }) do
+  for _, mod in ipairs({ "auto-run.adapters.go", "auto-run.adapters.jest", "auto-run.adapters.rust" }) do
     local ok, adapter = pcall(require, mod)
     if ok and type(adapter) == "table" and _adapters[adapter.name] == nil then
       M.register_adapter(adapter)

@@ -2167,8 +2167,8 @@ do
 
   local names = {}
   for _, a in ipairs(adapters.list()) do names[#names + 1] = a.name end
-  ok("builtin roster is go + jest (registration order)",
-    vim.deep_equal(names, { "go", "jest" }), vim.inspect(names))
+  ok("builtin roster is go + jest + rust (registration order)",
+    vim.deep_equal(names, { "go", "jest", "rust" }), vim.inspect(names))
 
   local go = adapters.get("go")
   local iface_ok = go ~= nil
@@ -3907,6 +3907,128 @@ do
 end
 
 -- ── summary ─────────────────────────────────────────────────────
+print("\n[38] rust — Cargo identity, discovery, valid argv, real libtest results")
+do
+  local R = P3.adapters.get("rust")
+  ok("rust adapter self-registered", R ~= nil and R.name == "rust")
+
+  -- Fixture: one crate with a lib (unit tests in `mod tests`), a default bin
+  -- (src/main.rs), an extra bin (src/bin/tool.rs), and an integration target
+  -- (tests/it.rs). Pure-fs assertions need no toolchain.
+  local cr = fx .. "/rustcrate"
+  vim.fn.mkdir(cr .. "/src/bin", "p")
+  vim.fn.mkdir(cr .. "/tests", "p")
+  local function write(rel, body)
+    local fh = assert(io.open(cr .. "/" .. rel, "w"))
+    fh:write(body); fh:close()
+  end
+  write("Cargo.toml", '[package]\nname = "rustcrate"\nversion = "0.1.0"\nedition = "2021"\n')
+  write("src/lib.rs", table.concat({
+    "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+    "#[cfg(test)]",
+    "mod tests {",
+    "    use super::*;",
+    "    #[test] fn adds() { assert_eq!(add(1, 2), 3); }",
+    "    #[test] fn fails() { assert_eq!(add(1, 1), 3); }",
+    "    #[test] #[ignore] fn skipped() {}",
+    "}",
+  }, "\n") .. "\n")
+  write("src/main.rs", "fn main() {}\n")
+  write("src/bin/tool.rs", "fn main() {}\n")
+  write("tests/it.rs", "#[test] fn it_works() { assert!(true); }\n")
+
+  R._reset_for_tests()
+  ok("root() resolves the crate dir", R.root(cr .. "/src") == cr, R.root(cr .. "/src"))
+
+  local id_lib = R.identity(cr .. "/src/lib.rs")
+  ok("identity(lib.rs) → --lib selector",
+    id_lib and id_lib.kind == "lib" and contains(id_lib.selectors, "--lib")
+      and id_lib.package == "rustcrate", vim.inspect(id_lib))
+  local id_it = R.identity(cr .. "/tests/it.rs")
+  ok("identity(tests/it.rs) → --test it",
+    id_it and id_it.kind == "test" and contains(id_it.selectors, "--test")
+      and contains(id_it.selectors, "it"), vim.inspect(id_it))
+  local id_main = R.identity(cr .. "/src/main.rs")
+  ok("identity(main.rs) → --bin rustcrate",
+    id_main and id_main.kind == "bin" and contains(id_main.selectors, "rustcrate"),
+    vim.inspect(id_main))
+  local id_tool = R.identity(cr .. "/src/bin/tool.rs")
+  ok("identity(src/bin/tool.rs) → --bin tool",
+    id_tool and id_tool.kind == "bin" and contains(id_tool.selectors, "tool"),
+    vim.inspect(id_tool))
+
+  ok("is_test_file(.rs in a crate) is true", R.is_test_file(cr .. "/src/lib.rs"))
+  ok("is_test_file(Cargo.toml) is false", not R.is_test_file(cr .. "/Cargo.toml"))
+  ok("is_test_file(build.rs at crate root) is false", not R.is_test_file(cr .. "/build.rs"))
+  ok("adapter_for a .rs file resolves to rust",
+    (P3.adapters.adapter_for(cr .. "/src/lib.rs") or {}).name == "rust")
+
+  -- build_spec produces valid Cargo/libtest ordering (--exact AFTER --). Needs
+  -- only a hand-built position, no treesitter/cargo.
+  local single = { type = "test", path = cr .. "/src/lib.rs",
+    id = cr .. "/src/lib.rs::tests::adds" }
+  local spec = R.build_spec({ position = single, root = cr, run_id = "r", run_dir = fx })
+  ok("build_spec argv is valid Cargo/libtest ordering",
+    spec ~= nil and table.concat(spec.cmd, " ")
+      == "cargo test -p rustcrate --lib tests::adds -- --exact --format pretty --color never",
+    vim.inspect(spec and spec.cmd))
+
+  -- default_config + build_run_argv capabilities (sync).
+  ok("default_config(test) is a rust test config",
+    R.default_config("test").runtime == "rust" and R.default_config("test").kind == "test")
+  ok("build_run_argv(test) is `cargo test`",
+    table.concat((R.build_run_argv({ kind = "test" })), " ") == "cargo test")
+  ok("build_run_argv(run) is `cargo run`",
+    table.concat((R.build_run_argv({ kind = "run" })), " ") == "cargo run")
+
+  -- Discovery needs the rust treesitter parser.
+  local parser_ok = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
+  if parser_ok then
+    local pos, derr = R.discover_positions(cr .. "/src/lib.rs")
+    ok("discover_positions(lib.rs) parses", pos ~= nil and derr == nil, tostring(derr))
+    if pos then
+      local ns = pos.children[1]
+      ok("tests nest under the `tests` mod namespace",
+        ns and ns.type == "namespace" and ns.name == "tests", vim.inspect(pos))
+      local names = {}
+      for _, t in ipairs((ns or {}).children or {}) do names[#names + 1] = t.name end
+      ok("discovers adds/fails/skipped", contains(names, "adds")
+        and contains(names, "fails") and contains(names, "skipped"), vim.inspect(names))
+
+      -- Real libtest results end-to-end (needs cargo).
+      if vim.fn.executable("cargo") == 1 then
+        pos.id = pos.path
+        local function assign(node)
+          for _, c in ipairs(node.children or {}) do
+            c.id = (node.type == "file" and node.path or node.id) .. "::" .. c.name
+            assign(c)
+          end
+        end
+        assign(pos)
+        local out = fx .. "/rust_lib_out.txt"
+        os.execute("cd " .. cr .. " && cargo test --lib -- --format pretty --color never >"
+          .. out .. " 2>&1")
+        local tree = { get = function(_, id) return id == pos.id and pos or nil end }
+        local map, rerr = R.results({ context = { position_id = pos.id, target = "lib:rustcrate" } },
+          { stdout_file = out, run_dir = fx }, tree)
+        ok("results parse produced no structured error (file scope)", rerr == nil,
+          rerr and rerr.message)
+        local function st(name)
+          local r = map[cr .. "/src/lib.rs::tests::" .. name]
+          return r and r.status
+        end
+        ok("real cargo test: adds → passed", st("adds") == "passed", vim.inspect(map))
+        ok("real cargo test: fails → failed", st("fails") == "failed")
+        ok("real cargo test: skipped(#[ignore]) → skipped", st("skipped") == "skipped")
+      else
+        print("  [38] cargo not on PATH — skipping real libtest results assertions")
+      end
+    end
+  else
+    print("  [38] rust treesitter parser unavailable — skipping discovery/results assertions")
+  end
+end
+
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end
 os.exit(0)
