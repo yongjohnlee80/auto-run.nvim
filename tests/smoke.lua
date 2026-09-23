@@ -3952,7 +3952,12 @@ local HAVE_RUST_TS = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
 
 make_plain_repo(rustws)
 write_file(rustws .. "/Cargo.toml",
-  '[workspace]\nmembers = ["cratea", "crateb"]\nresolver = "2"\n')
+  '[workspace]\nmembers = ["cratea", "crateb", "cratec"]\nresolver = "2"\n')
+-- cratec has exactly ONE bin, so a workspace-ROOT cwd plus a named package
+-- must still resolve it (the cwd crate cannot supply targets there).
+write_file(rustws .. "/cratec/Cargo.toml",
+  '[package]\nname = "cratec"\nversion = "0.1.0"\nedition = "2021"\n')
+write_file(rustws .. "/cratec/src/main.rs", "fn main() {}\n")
 write_file(rustws .. "/cratea/Cargo.toml",
   '[package]\nname = "cratea"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "cratea_lib"\n')
 write_file(rustws .. "/cratea/src/lib.rs", table.concat({
@@ -4353,9 +4358,65 @@ do
         and cmdline:find("'cargo' 'run' '-p' 'crateb' '--bin' 'customtool'", 1, true) ~= nil,
       tostring(cmdline))
     store.remove("rust-run")
+
+    -- ── ONE authoritative identity, shared by run and ordinary debug ──
+    local cratea_cwd = rustws .. "/cratea"
+    -- CROSS-PACKAGE: cwd is inside cratea while the config names crateb's
+    -- target. The resolver must follow the NAMED package, not the cwd crate.
+    local xcfg = { name = "x", kind = "run", runtime = "rust", cwd = cratea_cwd,
+      cargo_package = "crateb", cargo_target = "customtool", cargo_target_kind = "bin" }
+    local xargv = R.build_run_argv(xcfg)
+    rok("a cross-package config resolves the NAMED package, not the cwd crate",
+      xargv ~= nil and table.concat(xargv, " ") == "cargo run -p crateb --bin customtool",
+      vim.inspect(xargv))
+
+    -- WORKSPACE-ROOT cwd + a named package: the cwd crate cannot supply targets.
+    local rargv = R.build_run_argv({ name = "r", kind = "run", runtime = "rust",
+      cwd = rustws, cargo_package = "cratec" })
+    rok("a workspace-ROOT cwd still resolves the named package's sole bin",
+      rargv ~= nil and table.concat(rargv, " ") == "cargo run -p cratec --bin cratec",
+      vim.inspect(rargv))
+
+    -- Validation: half-specified pair, unsupported kind, non-member target,
+    -- non-member package — each a structured error, never a silent degrade.
+    local _, half_err = R.build_run_argv({ name = "h", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "crateb", cargo_target = "customtool" })
+    rok("a HALF-specified target identity is a structured error",
+      type(half_err) == "string" and half_err:find("half-specifies", 1, true) ~= nil,
+      tostring(half_err))
+    local _, kind_err = R.build_run_argv({ name = "k", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "crateb", cargo_target = "customtool",
+      cargo_target_kind = "banana" })
+    rok("an UNSUPPORTED cargo_target_kind is a structured error (no silent degrade)",
+      type(kind_err) == "string" and kind_err:find("unsupported", 1, true) ~= nil,
+      tostring(kind_err))
+    local _, mem_err = R.build_run_argv({ name = "m", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "cratea", cargo_target = "customtool",
+      cargo_target_kind = "bin" })
+    rok("a target that does NOT belong to the named package is rejected",
+      type(mem_err) == "string" and mem_err:find("no bin target named", 1, true) ~= nil,
+      tostring(mem_err))
+    local _, pkg_err = R.build_run_argv({ name = "n", kind = "run", runtime = "rust",
+      cwd = cratea_cwd, cargo_package = "nosuchpkg" })
+    rok("a package outside the workspace is rejected",
+      type(pkg_err) == "string" and pkg_err:find("not a member", 1, true) ~= nil,
+      tostring(pkg_err))
+
+    -- RUN/DEBUG EQUIVALENCE: the same effective config must resolve the same
+    -- package+target in BOTH capabilities (debug must build crateb's
+    -- customtool, never a cratea target).
+    local dlaunch, derr, dfired
+    R.prepare_debug_config(xcfg, {}, function(l, e) dlaunch, derr, dfired = l, e, true end)
+    wait_for(function() return dfired end, 180000)
+    rok("ordinary debug resolves the SAME cross-package target as run",
+      derr == nil and dlaunch ~= nil and type(dlaunch.program) == "string"
+        and dlaunch.program:find("customtool", 1, true) ~= nil,
+      derr and derr.message or (dlaunch and dlaunch.program))
+    rok("ordinary debug builds in the NAMED package's crate dir",
+      dlaunch ~= nil and dlaunch.cwd == rustws .. "/crateb", dlaunch and dlaunch.cwd)
   end
 
-  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 43 or 6
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 63 or 6
   ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
     rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
 end

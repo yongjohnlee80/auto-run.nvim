@@ -638,52 +638,131 @@ end
 
 -- ── scaffold + generic-run capabilities (ADR 0194 §2.3.4) ───────
 
----Scaffold defaults for a new Rust config (`<leader>rc`). `kind=test` targets
----the crate; `run`/`debug` name the default binary program token.
----Resolve the Cargo package/target a GENERIC (non-position) config targets:
----the config's own `cargo_package` / `cargo_target[_kind]`, else the crate at
----its cwd. Ambiguity is a STRUCTURED error, never a silent guess that lets
----Cargo pick or fail opaquely (ADR 0194 §2.3.4).
----@param eff table
----@return { package: string, kind: string?, target: string? }? id, string? err
-local function generic_identity(eff)
-  local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or vim.uv.cwd()
-  local crate = M.crate_dir(from)
-  local pkg = crate and package_at(crate) or nil
-  local pkg_name = eff.cargo_package or (pkg and pkg.name)
-  if not pkg_name then
-    return nil, "rust: cannot resolve a Cargo package for config '"
-      .. tostring(eff.name) .. "' — set `cargo_package`"
+---Normalize a metadata target's kind to one of lib|bin|test, or nil.
+---@param t table
+---@return string?
+local function normalized_kind(t)
+  for _, k in ipairs(t.kind or {}) do
+    if k == "lib" or k == "rlib" or k == "dylib" or k == "proc-macro" then return "lib" end
+    if k == "bin" then return "bin" end
+    if k == "test" then return "test" end
   end
-
-  -- An explicitly pinned target wins.
-  if eff.cargo_target and eff.cargo_target_kind then
-    return { package = pkg_name, kind = eff.cargo_target_kind, target = eff.cargo_target }, nil
-  end
-
-  if eff.kind == "test" then
-    -- `-p <pkg>` alone is unambiguous for a test run (all the package's tests).
-    return { package = pkg_name, kind = nil, target = nil }, nil
-  end
-
-  -- run/debug need ONE bin target. Follow Cargo's own rule: a sole bin, else
-  -- the manifest's `default-run`. With several bins and no default, Cargo
-  -- itself refuses to choose — so do the same, loudly, rather than guessing.
-  local bins = {}
-  for _, t in ipairs((pkg or {}).targets or {}) do
-    if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
-  end
-  if #bins == 1 then
-    return { package = pkg_name, kind = "bin", target = bins[1] }, nil
-  end
-  if pkg and type(pkg.default_run) == "string" and pkg.default_run ~= "" then
-    return { package = pkg_name, kind = "bin", target = pkg.default_run }, nil
-  end
-  return nil, ("rust: package '%s' has %d bin targets and no default-run — set "
-    .. "`cargo_target` (+ `cargo_target_kind=\"bin\"`) on config '%s'")
-    :format(pkg_name, #bins, tostring(eff.name))
+  return nil
 end
 
+---The ONE authoritative Cargo identity for a GENERIC (non-position) config,
+---shared by `build_run_argv` and `prepare_debug_config` so run and debug can
+---never resolve different workspace members (ADR 0194 §2.3.4).
+---
+---Metadata-backed and validating:
+---  • `cargo_package` SELECTS the metadata package by name — its targets,
+---    `default-run` and manifest dir all come from THAT package, rather than
+---    being a label pasted onto whatever crate encloses `cwd`. A workspace-root
+---    cwd therefore still resolves a named member.
+---  • `cargo_target` / `cargo_target_kind` must be COMPLETE, the kind
+---    supported, and the target must belong to the resolved package — a typo
+---    is a structured error, never a silent degrade to `-p <pkg>`.
+---  • With no pinned target: a test config needs none; run/debug take Cargo's
+---    own rule (a sole bin, else `default-run`, else refuse).
+---@param eff table
+---@return { package: string, package_id: string, crate_dir: string, kind: string?, target: string?, selectors: string[] }? id, string? err
+local function config_identity(eff)
+  local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or vim.uv.cwd()
+  local root = M.root(from) or M.crate_dir(from) or from
+  local meta = cargo_metadata(root)
+  if not meta then
+    return nil, "rust: no Cargo metadata at " .. tostring(root)
+  end
+
+  -- 1. The package — a configured name selects the METADATA package.
+  local pkg
+  if type(eff.cargo_package) == "string" and eff.cargo_package ~= "" then
+    for _, p in ipairs(meta.packages or {}) do
+      if p.name == eff.cargo_package then pkg = p break end
+    end
+    if not pkg then
+      return nil, ("rust: package '%s' is not a member of the Cargo workspace at %s")
+        :format(eff.cargo_package, root)
+    end
+  else
+    local crate = M.crate_dir(from)
+    pkg = crate and package_at(crate) or nil
+    if not pkg then
+      return nil, "rust: cannot resolve a Cargo package for config '"
+        .. tostring(eff.name) .. "' — set `cargo_package`"
+    end
+  end
+  local crate_dir = fs_path.parent(fs_path.normalize(pkg.manifest_path))
+
+  local function selectors_for(kind, target)
+    local s = { "-p", pkg.name }
+    if kind == "lib" then
+      s[#s + 1] = "--lib"
+    elseif kind == "bin" then
+      s[#s + 1] = "--bin"
+      s[#s + 1] = target
+    elseif kind == "test" then
+      s[#s + 1] = "--test"
+      s[#s + 1] = target
+    end
+    return s
+  end
+
+  -- 2. A pinned target must be complete, supported, and a member of THIS package.
+  local has_t = type(eff.cargo_target) == "string" and eff.cargo_target ~= ""
+  local has_k = type(eff.cargo_target_kind) == "string" and eff.cargo_target_kind ~= ""
+  if has_t ~= has_k then
+    return nil, ("rust: config '%s' half-specifies its Cargo target — set BOTH "
+      .. "`cargo_target` and `cargo_target_kind`"):format(tostring(eff.name))
+  end
+  if has_t then
+    local kind = eff.cargo_target_kind
+    if kind ~= "lib" and kind ~= "bin" and kind ~= "test" then
+      return nil, ("rust: config '%s' has unsupported cargo_target_kind '%s' "
+        .. "(expected lib|bin|test)"):format(tostring(eff.name), tostring(kind))
+    end
+    local found = false
+    for _, t in ipairs(pkg.targets or {}) do
+      if t.name == eff.cargo_target and normalized_kind(t) == kind then found = true break end
+    end
+    if not found then
+      return nil, ("rust: package '%s' has no %s target named '%s'")
+        :format(pkg.name, kind, eff.cargo_target)
+    end
+    return {
+      package = pkg.name, package_id = pkg.id, crate_dir = crate_dir,
+      kind = kind, target = eff.cargo_target,
+      selectors = selectors_for(kind, eff.cargo_target),
+    }, nil
+  end
+
+  -- 3. No pinned target.
+  if eff.kind == "test" then
+    return {
+      package = pkg.name, package_id = pkg.id, crate_dir = crate_dir,
+      kind = nil, target = nil, selectors = { "-p", pkg.name },
+    }, nil
+  end
+  local bins = {}
+  for _, t in ipairs(pkg.targets or {}) do
+    if normalized_kind(t) == "bin" then bins[#bins + 1] = t.name end
+  end
+  local chosen = (#bins == 1 and bins[1])
+    or (type(pkg.default_run) == "string" and pkg.default_run ~= "" and pkg.default_run)
+    or nil
+  if not chosen then
+    return nil, ("rust: package '%s' has %d bin targets and no default-run — set "
+      .. "`cargo_target` (+ `cargo_target_kind=\"bin\"`) on config '%s'")
+      :format(pkg.name, #bins, tostring(eff.name))
+  end
+  return {
+    package = pkg.name, package_id = pkg.id, crate_dir = crate_dir,
+    kind = "bin", target = chosen, selectors = selectors_for("bin", chosen),
+  }, nil
+end
+
+---Scaffold defaults for a new Rust config (`<leader>rc`), carrying Cargo
+---identity so the generated config is unambiguous in a workspace.
 ---@param kind "run"|"test"|"debug"
 ---@param _name string?
 ---@return table
@@ -728,21 +807,10 @@ function M.build_run_argv(eff, _opts)
   -- test` is ambiguous in a multi-package / multi-bin workspace, so emit
   -- `-p <pkg>` plus the target selector, and fail structurally when the target
   -- cannot be resolved (ADR 0194 §2.3.4).
-  local id, err = generic_identity(eff)
+  local id, err = config_identity(eff)
   if not id then return nil, err end
-
   local argv = { "cargo", eff.kind == "test" and "test" or "run" }
-  argv[#argv + 1] = "-p"
-  argv[#argv + 1] = id.package
-  if id.kind == "lib" then
-    argv[#argv + 1] = "--lib"
-  elseif id.kind == "bin" and id.target then
-    argv[#argv + 1] = "--bin"
-    argv[#argv + 1] = id.target
-  elseif id.kind == "test" and id.target then
-    argv[#argv + 1] = "--test"
-    argv[#argv + 1] = id.target
-  end
+  for _, s in ipairs(id.selectors) do argv[#argv + 1] = s end
   return argv, nil
 end
 
@@ -867,54 +935,36 @@ function M.prepare_debug_config(eff, opts, cb)
       args = eff.args, cwd = eff.cwd, env = eff.env,
     }, nil)
   end
-  -- Baseline: build the crate's bin at cwd (or a named bin) and launch it.
-  local cwd = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or nil
-  local crate = M.crate_dir(cwd or vim.uv.cwd())
-  if not crate then
-    return cb(nil, { code = "no_target", message = "no Cargo crate for the debug config's cwd" })
+  -- Baseline: build via the SAME resolved identity `build_run_argv` uses, so
+  -- run and debug can never target different workspace members (Lector r2 P1).
+  local id, ierr = config_identity(eff)
+  if not id then
+    return cb(nil, { code = "no_target", message = ierr })
   end
-  local pkg = package_at(crate)
-  if not pkg then
-    return cb(nil, { code = "no_target", message = "no Cargo package at " .. tostring(crate) })
-  end
-  -- Pick the bin target from metadata: an explicit `cargo_bin`, else the crate's
-  -- default bin (name == package), else the sole bin — otherwise a structured
-  -- ambiguity error rather than a guess.
-  local bins = {}
-  for _, t in ipairs(pkg.targets or {}) do
-    if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
-  end
-  local bin = (eff.cargo_target_kind == "bin" and eff.cargo_target) or nil
-  if not bin then
-    if #bins == 1 then
-      bin = bins[1]
-    elseif type(pkg.default_run) == "string" and pkg.default_run ~= "" then
-      bin = pkg.default_run
-    else
-      return cb(nil, {
-        code = "ambiguous_artifact",
-        message = ("crate '%s' has %d bin targets; set `cargo_target` "
-          .. "(+ cargo_target_kind=\"bin\") on the config"):format(pkg.name, #bins),
-        detail = { bins = bins },
-      })
-    end
+  if id.kind == "lib" then
+    return cb(nil, {
+      code = "no_target",
+      message = ("rust: config '%s' targets a lib, which produces no executable to debug")
+        :format(tostring(eff.name)),
+    })
   end
   local identity = {
-    package = pkg.name,
-    package_id = pkg.id,
-    crate_dir = crate,
-    kind = "bin",
-    target = bin,
-    selectors = { "-p", pkg.name, "--bin", bin },
+    package = id.package,
+    package_id = id.package_id,
+    crate_dir = id.crate_dir,
+    kind = id.kind or "bin",
+    target = id.target,
+    selectors = id.selectors,
     module_prefix = "",
   }
-  cargo_build_exe("build", false, identity, crate, opts, function(exe, err)
-    if err then return cb(nil, err) end
-    cb({
-      dap_type = "rust", request = "launch", program = exe,
-      args = eff.args, cwd = crate, env = eff.env,
-    }, nil)
-  end)
+  cargo_build_exe("build", id.kind == "test", identity, id.crate_dir, opts,
+    function(exe, err)
+      if err then return cb(nil, err) end
+      cb({
+        dap_type = "rust", request = "launch", program = exe,
+        args = eff.args, cwd = id.crate_dir, env = eff.env,
+      }, nil)
+    end)
 end
 
 ---Test-only: drop the memoized caches.
