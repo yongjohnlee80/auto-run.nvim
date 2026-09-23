@@ -786,15 +786,30 @@ end
 ---@param _name string?
 ---@return table
 function M.default_config(kind, _name)
-  local cfg = { runtime = "rust", kind = kind, program = "${worktree}" }
+  -- NO default `program`. A Rust debug launch's baseline is the Cargo prebuild
+  -- (ADR 0194 §2.3.4) and an explicit `program` is the OVERRIDE that skips it,
+  -- so scaffolding one inverts the intended path. The old `"${worktree}"`
+  -- default was Go-shaped — delve accepts a package DIRECTORY, codelldb needs
+  -- an executable FILE — and it also kept the config out of the synchronous
+  -- nvim-dap provider, which only offers configs whose program already exists.
+  local cfg = { runtime = "rust", kind = kind }
   -- Carry Cargo identity so a scaffolded config is unambiguous in a
   -- multi-package / multi-bin workspace (ADR 0194 §2.3.4).
   local buf = vim.api.nvim_buf_get_name(0)
   local from = (type(buf) == "string" and buf:match("%.rs$")) and fs_path.parent(buf)
     or vim.uv.cwd()
-  local pkg = from and M.crate_dir(from) and package_at(M.crate_dir(from)) or nil
+  local crate = from and M.crate_dir(from) or nil
+  local pkg = crate and package_at(crate) or nil
   if pkg then
     cfg.cargo_package = pkg.name
+    -- Pin `cwd` to the crate. `config_identity` resolves the Cargo workspace
+    -- from `eff.cwd` (falling back to nvim's cwd), so a crate that does not sit
+    -- AT the project root — the ordinary case for a monorepo, an examples/
+    -- folder, or any `.auto-run/` above the manifest — otherwise resolves to a
+    -- directory with no Cargo.toml and fails with "no Cargo metadata at …".
+    -- We already know the crate here; recording it is what makes the
+    -- `cargo_package` above findable at launch time.
+    cfg.cwd = fs_path.normalize(crate)
     if kind ~= "test" then
       local bins = {}
       for _, t in ipairs(pkg.targets or {}) do
@@ -855,7 +870,17 @@ local function cargo_build_exe(sub, want_test, identity, cwd, opts, cb)
   local function finish(exe, err)
     if done then return end
     done = true
-    cb(exe, err)
+    -- Hand the result back on the MAIN LOOP. Every call site below runs inside
+    -- the `vim.system` callback, which is a **fast event context**
+    -- (`vim.in_fast_event()` is true there). The core launches a DAP session
+    -- from this callback, and nvim-dap touches windows and buffers — each of
+    -- those raises `E5560: … must not be called in a fast event context`.
+    -- That error is raised INSIDE the libuv callback, so it does not reach the
+    -- core's `pcall(dap.run, …)`: the callback simply dies, leaving the user
+    -- with a `debug_start` that returned `true`, no session, and no message.
+    -- Scheduling here fixes every path at once because `finish` is the sole
+    -- funnel (cancel, spawn failure, build failure, ambiguity, success).
+    vim.schedule(function() cb(exe, err) end)
   end
 
   local cmd = { "cargo", sub, "--no-run", "--message-format=json" }
