@@ -745,7 +745,7 @@ local function config_identity(eff, op)
           :format(kind, eff.cargo_target, tostring(eff.name))
       end
       return nil, ("rust: the %s target '%s' produces no executable to debug — "
-        .. "config '%s' must pin a bin target")
+        .. "config '%s' must pin a bin or test target")
         :format(kind, eff.cargo_target, tostring(eff.name))
     end
     return {
