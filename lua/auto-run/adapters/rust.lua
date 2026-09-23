@@ -34,12 +34,10 @@ M.name = "rust"
 ---dir → workspace/crate root (false = negative cache).
 ---@type table<string, string|false>
 local _root_cache = {}
----crate dir → `[package] name` (false = unparsable / virtual manifest).
----@type table<string, string|false>
-local _pkg_cache = {}
----crate dir → true when its Cargo.toml has `src/lib.rs` (memoized).
----@type table<string, boolean|nil>
-local _has_lib_cache = {}
+---workspace root → parsed `cargo metadata --no-deps` (false = cargo absent /
+---unreadable). Populated lazily on the first identity lookup per root.
+---@type table<string, table|false>
+local _meta_cache = {}
 
 ---@param dir string
 ---@param marker string
@@ -113,126 +111,151 @@ function M.root(dir)
   return root
 end
 
----`[package] name` from a crate dir's Cargo.toml. Memoized. `nil` for a virtual
----workspace manifest (no `[package]`).
----@param crate_dir string
----@return string?
-local function package_name(crate_dir)
-  local cached = _pkg_cache[crate_dir]
+-- ── Cargo metadata (the authoritative identity source, ADR 0194 §2.3.2) ──
+
+---Load + cache `cargo metadata --no-deps --format-version 1` for a workspace
+---root. Synchronous, but called only from build_spec/results/debug — NEVER the
+---discovery scan (is_test_file/discover_positions are metadata-free) — and
+---memoized per root, so it is one short subprocess per workspace per run.
+---`nil` when cargo is absent or the manifest cannot be read.
+---@param root string
+---@return table? meta
+local function cargo_metadata(root)
+  local cached = _meta_cache[root]
   if cached ~= nil then return cached or nil end
-  local out = nil
-  local mani = read_manifest(crate_dir)
-  if mani then
-    -- `[package]` … `name = "..."` — the first name after the package header.
-    local pkg_section = mani:match("%[package%](.-)\n%[") or mani:match("%[package%](.*)$")
-    if pkg_section then
-      out = pkg_section:match('name%s*=%s*"([^"]+)"')
-    end
+  local meta = nil
+  local ok, res = pcall(function()
+    return vim
+      .system({ "cargo", "metadata", "--no-deps", "--format-version", "1" },
+        { cwd = root, text = true })
+      :wait()
+  end)
+  if ok and res and res.code == 0 and type(res.stdout) == "string" and res.stdout ~= "" then
+    local okj, decoded = pcall(vim.json.decode, res.stdout)
+    if okj and type(decoded) == "table" then meta = decoded end
   end
-  _pkg_cache[crate_dir] = out or false
-  return out
+  _meta_cache[root] = meta or false
+  return meta
 end
 
----Does the crate at `crate_dir` have a library target (src/lib.rs)? Memoized.
+---The metadata package whose manifest dir is exactly `crate_dir`, or nil.
 ---@param crate_dir string
----@return boolean
-local function crate_has_lib(crate_dir)
-  local cached = _has_lib_cache[crate_dir]
-  if cached ~= nil then return cached end
-  local has = fs_path.exists(fs_path.join(crate_dir, "src", "lib.rs"))
-  _has_lib_cache[crate_dir] = has
-  return has
+---@return table? pkg
+local function package_at(crate_dir)
+  crate_dir = fs_path.normalize(crate_dir)
+  local meta = cargo_metadata(M.root(crate_dir) or crate_dir)
+  if not meta then return nil end
+  for _, p in ipairs(meta.packages or {}) do
+    if fs_path.parent(fs_path.normalize(p.manifest_path)) == crate_dir then return p end
+  end
+  return nil
+end
+
+---`::`-join a src-relative path into a crate-internal module prefix.
+---@param relpath string?
+---@return string
+local function module_from(relpath)
+  local p = (relpath or ""):gsub("%.rs$", ""):gsub("/mod$", "")
+  if p == "" or p == "lib" or p == "main" then return "" end
+  return (p:gsub("/", "::"))
 end
 
 -- ── Cargo package/target identity for a file (ADR 0194 §2.3.2) ──
 
 ---@class RustTargetIdentity
----@field package string?      the crate's `[package] name`
----@field crate_dir string     the crate's Cargo.toml dir
+---@field package string        owning package name
+---@field package_id string      metadata package id (disambiguates same-named targets across packages)
+---@field crate_dir string       the package's Cargo.toml dir
 ---@field kind "lib"|"bin"|"test"
----@field target string        target name (bin/integration name, or the package for lib/main-bin)
----@field selectors string[]   cargo selectors: { "-p", pkg, "--lib" | "--bin", name | "--test", name }
----@field module_prefix string crate-internal module path of the FILE ("" at a crate root), `::`-joined
+---@field target string          metadata target name (renamed [lib], explicit [[bin]] respected)
+---@field selectors string[]     cargo selectors: { "-p", pkg, "--lib" | "--bin"|"--test", name }
+---@field module_prefix string   crate-internal module path of the FILE ("" at a target root)
 
----Resolve the Cargo target identity for a `.rs` file, from its path within the
----crate. Covers the supported Phase-1 target set; returns nil for a file that
----is not inside a `src/` or `tests/` tree of a crate.
+---Resolve the Cargo package/target identity for a `.rs` file from cached
+---`cargo metadata` (authoritative package id / target name / kind) plus the
+---file's location within the target. `nil` outside a package's `src/`|`tests/`
+---tree, for an out-of-scope target kind (example/bench/…), or when cargo is
+---unavailable.
 ---@param path string
 ---@return RustTargetIdentity?
 function M.identity(path)
   path = fs_path.normalize(path)
-  local crate = M.crate_dir(fs_path.parent(path))
-  if not crate then return nil end
-  local pkg = package_name(crate)
-  local rel = path:sub(#crate + 2)  -- path relative to the crate dir
+  local root = M.root(fs_path.parent(path))
+  if not root then return nil end
+  local meta = cargo_metadata(root)
+  if not meta then return nil end
 
-  -- Strip a trailing "/mod.rs" or ".rs" and turn "/" into "::" to build a
-  -- crate-internal module prefix from a src-relative path.
-  local function module_from(relpath)
-    local p = relpath:gsub("%.rs$", "")
-    p = p:gsub("/mod$", "")
-    if p == "" then return "" end
-    return (p:gsub("/", "::"))
-  end
-
-  local selectors = {}
-  if pkg then selectors[#selectors + 1] = "-p"; selectors[#selectors + 1] = pkg end
-
-  -- tests/<...>.rs → an integration target named after the FIRST path segment.
-  local test_rel = rel:match("^tests/(.+)$")
-  if test_rel then
-    local name = test_rel:match("^([^/]+)"):gsub("%.rs$", "")
-    selectors[#selectors + 1] = "--test"
-    selectors[#selectors + 1] = name
-    -- The integration file IS its target's crate root → empty prefix for that
-    -- file; a submodule under tests/<name>/ keeps its sub-path as the prefix.
-    local sub = test_rel:match("^[^/]+/(.+)$")
-    return {
-      package = pkg, crate_dir = crate, kind = "test", target = name,
-      selectors = selectors, module_prefix = sub and module_from(sub) or "",
-    }
-  end
-
-  -- src/bin/<name>.rs → a bin target named <name>.
-  local bin_name = rel:match("^src/bin/([^/]+)%.rs$")
-  if bin_name then
-    selectors[#selectors + 1] = "--bin"
-    selectors[#selectors + 1] = bin_name
-    return {
-      package = pkg, crate_dir = crate, kind = "bin", target = bin_name,
-      selectors = selectors, module_prefix = "",
-    }
-  end
-
-  -- src/main.rs → the crate's default bin (named after the package).
-  if rel == "src/main.rs" then
-    if pkg then selectors[#selectors + 1] = "--bin"; selectors[#selectors + 1] = pkg end
-    return {
-      package = pkg, crate_dir = crate, kind = "bin", target = pkg or "",
-      selectors = selectors, module_prefix = "",
-    }
-  end
-
-  -- Anything else under src/ → the lib target when the crate has one, else the
-  -- default bin. The module prefix is the file's path under src/.
-  local src_rel = rel:match("^src/(.+)$")
-  if src_rel then
-    local prefix = module_from(src_rel == "lib.rs" and "" or src_rel)
-    if crate_has_lib(crate) then
-      selectors[#selectors + 1] = "--lib"
-      return {
-        package = pkg, crate_dir = crate, kind = "lib", target = pkg or "",
-        selectors = selectors, module_prefix = prefix,
-      }
+  -- The package whose manifest dir is the NEAREST ancestor of `path`.
+  local pkg, pkg_dir, best = nil, nil, -1
+  for _, p in ipairs(meta.packages or {}) do
+    local pdir = fs_path.parent(fs_path.normalize(p.manifest_path))
+    if (path .. "/"):sub(1, #pdir + 1) == pdir .. "/" and #pdir > best then
+      pkg, pkg_dir, best = p, pdir, #pdir
     end
-    if pkg then selectors[#selectors + 1] = "--bin"; selectors[#selectors + 1] = pkg end
-    return {
-      package = pkg, crate_dir = crate, kind = "bin", target = pkg or "",
-      selectors = selectors, module_prefix = prefix,
-    }
+  end
+  if not pkg then return nil end
+  local rel = path:sub(#pkg_dir + 2)
+
+  local function first_of_kind(kind)
+    for _, t in ipairs(pkg.targets or {}) do
+      for _, k in ipairs(t.kind) do
+        if k == kind then return t end
+      end
+    end
   end
 
-  return nil
+  -- Bind the file to a metadata target: an entry file matches a target's
+  -- `src_path` exactly; a submodule belongs to its enclosing target.
+  local t, prefix
+  for _, tt in ipairs(pkg.targets or {}) do
+    if fs_path.normalize(tt.src_path) == path then t, prefix = tt, "" break end
+  end
+  if not t then
+    local test_top = rel:match("^tests/([^/]+)/")
+    if test_top then
+      for _, tt in ipairs(pkg.targets or {}) do
+        for _, k in ipairs(tt.kind) do
+          if k == "test" and tt.name == test_top then t = tt end
+        end
+      end
+      prefix = module_from(rel:match("^tests/[^/]+/(.+)$"))
+    elseif rel:match("^src/") then
+      t = first_of_kind("lib") or first_of_kind("bin")
+      prefix = module_from(rel:match("^src/(.+)$"))
+    end
+  end
+  if not t then return nil end
+
+  -- Normalize the kind and build selectors from the metadata target.
+  local is_lib = false
+  for _, k in ipairs(t.kind) do
+    if k == "lib" or k == "rlib" or k == "dylib" or k == "proc-macro" then is_lib = true end
+  end
+  local kind, selectors = nil, { "-p", pkg.name }
+  if is_lib then
+    kind = "lib"
+    selectors[#selectors + 1] = "--lib"
+  elseif t.kind[1] == "bin" then
+    kind = "bin"
+    selectors[#selectors + 1] = "--bin"
+    selectors[#selectors + 1] = t.name
+  elseif t.kind[1] == "test" then
+    kind = "test"
+    selectors[#selectors + 1] = "--test"
+    selectors[#selectors + 1] = t.name
+  else
+    return nil -- example / bench / custom-build → out of Phase-1 scope
+  end
+
+  return {
+    package = pkg.name,
+    package_id = pkg.id,
+    crate_dir = pkg_dir,
+    kind = kind,
+    target = t.name,
+    selectors = selectors,
+    module_prefix = prefix or "",
+  }
 end
 
 -- ── walk filter + file recognition ──────────────────────────────
@@ -249,10 +272,16 @@ end
 ---@param path string
 ---@return boolean
 function M.is_test_file(path)
-  if type(path) ~= "string" or path:match("%.rs$") == nil then return false end
-  -- Only files that resolve to a supported target are ours; build scripts and
-  -- files outside src/|tests/ are not test material.
-  return M.identity(path) ~= nil
+  if type(path) ~= "string" or not path:match("%.rs$") then return false end
+  local crate = M.crate_dir(fs_path.parent(path))
+  if not crate then return false end
+  local rel = fs_path.normalize(path):sub(#fs_path.normalize(crate) + 2)
+  -- Under src/ or tests/, excluding the build script. Metadata (M.identity) is
+  -- deliberately NOT consulted here: the discovery scan must stay
+  -- subprocess-free, so a file whose target is out of scope is filtered later
+  -- when discover_positions finds no #[test]s / build_spec resolves no target.
+  return rel ~= "build.rs"
+    and (rel:match("^src/") ~= nil or rel:match("^tests/") ~= nil)
 end
 
 -- ── discovery (treesitter, injections disabled) ─────────────────
@@ -275,9 +304,16 @@ local function get_query()
   return _query
 end
 
+-- Attribute-PATH terminals that mark a test function. Gate on the path (before
+-- any `(args)`), so `#[cfg(test)]` — whose path is `cfg`, with `test` only an
+-- ARGUMENT — is correctly NOT treated as a test.
+local TEST_ATTR_TERMINALS = { test = true, rstest = true, test_case = true }
+
 ---Does a function node carry a `#[test]`-family attribute on a preceding
----sibling? Matches `#[test]`, `#[tokio::test]`, `#[rstest]`, `#[test_case(...)]`,
----etc. — any attribute whose leaf path ends in `test`.
+---sibling? Matches `#[test]`, `#[tokio::test]`, `#[async_std::test]`,
+---`#[rstest]`, `#[test_case(...)]` — by the attribute PATH's terminal segment.
+---Excludes `#[cfg(test)]` (a false positive under naive text search) and
+---`#[ignore]` (but an `#[ignore]` test still has its `#[test]` sibling).
 ---@param fn_node TSNode
 ---@param source string
 ---@return boolean
@@ -285,9 +321,11 @@ local function has_test_attr(fn_node, source)
   local sib = fn_node:prev_sibling()
   while sib and sib:type() == "attribute_item" do
     local text = vim.treesitter.get_node_text(sib, source)
-    -- The attribute's identifier path — e.g. `test`, `tokio::test`, `rstest`.
-    -- Match a word `test` at an attribute-path boundary.
-    if text:match("%f[%w]test%f[^%w]") then
+    -- `#[<path>(<args>)]` (or inner attribute `#![…]`) → the path only.
+    local inner = text:match("^#!?%[%s*(.-)%s*%]$") or text
+    local path = inner:match("^[%w_:]+") or ""
+    local terminal = path:match("([%w_]+)$")
+    if terminal and TEST_ATTR_TERMINALS[terminal] then
       return true
     end
     sib = sib:prev_sibling()
@@ -449,38 +487,60 @@ end
 ---@param args AutoRunSpecArgs
 ---@return AutoRunSpec? spec, string? err
 function M.build_spec(args)
-  local pos, root = args.position, args.root
-  local file = pos.path
-  local identity = M.identity(file)
+  local pos = args.position
+
+  -- A directory / root scope has no single Cargo target — return (nil, nil) so
+  -- the discovery core DECOMPOSES to files rather than aborting on an error
+  -- (P1-2). identity() must not run first for a directory path.
+  if pos.type == "dir" then return nil, nil end
+
+  local identity = M.identity(pos.path)
   if not identity then
-    return nil, "rust adapter: no Cargo target for " .. tostring(file)
+    return nil, "rust adapter: no Cargo target for " .. tostring(pos.path)
   end
   local applied, cfg_err = test_config()
   if cfg_err then return nil, cfg_err end
 
+  local reported = scope_reported(pos, identity)
+
   local argv = { "cargo", "test" }
   for _, s in ipairs(identity.selectors) do argv[#argv + 1] = s end
 
-  local reported, _ = scope_reported(pos, identity)
-
   if pos.type == "test" then
-    -- Exactly one test: its reported path as the positional filter + --exact.
+    -- Exactly one test: its full crate-internal path + --exact.
     argv[#argv + 1] = reported[1]
     argv[#argv + 1] = "--"
     argv[#argv + 1] = "--exact"
   elseif pos.type == "file" or pos.type == "namespace" then
-    if #reported == 0 then return nil, nil end  -- nothing runnable → decompose
-    -- No positional filter: run the whole target and reconcile by identity in
-    -- results(). (A per-name alternation is not expressible to libtest.)
-    argv[#argv + 1] = "--"
-  elseif pos.type == "dir" then
+    if #reported == 0 then return nil, nil end -- no tests here → decompose
+    -- Narrow the run to the selected module with libtest's positional prefix
+    -- (the file's module_prefix + a namespace's in-file mod path). libtest's
+    -- positional is a SUBSTRING match, so results are still reconciled
+    -- precisely by target identity in results(). A crate-root file with no
+    -- prefix (e.g. src/lib.rs) has no narrowing token — return (nil, nil) so
+    -- the core decomposes to per-test --exact runs and unrelated tests in the
+    -- same target never execute (P1-2).
+    local segs = {}
+    if identity.module_prefix ~= "" then
+      for _, s in ipairs(vim.split(identity.module_prefix, "::", { plain = true })) do
+        segs[#segs + 1] = s
+      end
+    end
+    local rest = pos.id:sub(#pos.path + 1) -- "" for a file, "::mod…" for a namespace
+    if rest:sub(1, 2) == "::" then
+      for _, s in ipairs(vim.split(rest:sub(3), "::", { plain = true })) do
+        if s ~= "" then segs[#segs + 1] = s end
+      end
+    end
+    if #segs == 0 then return nil, nil end
+    argv[#argv + 1] = table.concat(segs, "::")
     argv[#argv + 1] = "--"
   else
     return nil, "rust adapter cannot run a '" .. tostring(pos.type) .. "' position"
   end
 
-  -- Pinned, stable, parseable output (ADR 0194 §2.5). --color never at the
-  -- libtest layer (after --); default pretty format; NO --nocapture on the
+  -- Pinned, stable, parseable output (ADR 0194 §2.5): default pretty format,
+  -- --color never at the libtest layer (after --), and NO --nocapture on the
   -- results run so program stdout can't interleave with harness summary lines.
   argv[#argv + 1] = "--format"
   argv[#argv + 1] = "pretty"
@@ -489,12 +549,12 @@ function M.build_spec(args)
 
   return {
     cmd = argv,
-    cwd = identity.crate_dir ~= "" and identity.crate_dir or root,
+    cwd = identity.crate_dir,
     env = applied and applied.env or nil,
     context = {
       position_id = pos.id,
-      target = identity.kind .. ":" .. (identity.target or ""),
-      package = identity.package,
+      package_id = identity.package_id,
+      target = identity.kind .. ":" .. identity.target,
     },
   }, nil
 end
@@ -523,12 +583,14 @@ function M.results(spec, exit, tree)
   end
 
   -- libtest pretty lines: `test <path> ... ok` / `... FAILED` / `... ignored`.
+  -- Count matching LINES per reported name (not a unique-name set), so two
+  -- harness lines with the same name are detectable (P2).
   local results = {}
-  local seen_reported = {}
+  local line_count = {}
   for line in f:lines() do
     local name, status = line:match("^test%s+(%S+)%s+%.%.%.%s+(%w+)")
     if name and status then
-      seen_reported[name] = true
+      line_count[name] = (line_count[name] or 0) + 1
       local id = reported_to_id[name]
       if id then
         local st = status == "ok" and "passed"
@@ -541,20 +603,19 @@ function M.results(spec, exit, tree)
   end
   f:close()
 
-  -- Ambiguity guard (ADR 0194 §2.3.2 / §2.3.4): for an --exact single-test run,
-  -- exactly one reported line must match the requested test. Zero or many means
-  -- the target/name did not resolve to one test — a structured failure, not a
-  -- silent skip.
+  -- Ambiguity guard (ADR 0194 §2.3.2 / §2.3.4): an --exact single-test run must
+  -- match EXACTLY ONE harness line. Zero or many means the target/name did not
+  -- resolve to one test — a structured failure carrying the package/target
+  -- identity, never a silent skip.
   if scope.type == "test" then
     local want = next(reported_to_id)
-    local n = 0
-    for r in pairs(seen_reported) do if r == want then n = n + 1 end end
+    local n = line_count[want] or 0
     if n ~= 1 then
       return results, {
         code = "ambiguous_test",
         message = ("cargo test matched %d harness lines for '%s' (expected exactly 1)")
           :format(n, tostring(want)),
-        detail = { target = spec.context.target },
+        detail = { package_id = identity.package_id, target = spec.context.target },
       }
     end
   end
@@ -734,12 +795,39 @@ function M.prepare_debug_config(eff, opts, cb)
   if not crate then
     return cb(nil, { code = "no_target", message = "no Cargo crate for the debug config's cwd" })
   end
-  local pkg = package_name(crate)
-  local bin = eff.cargo_bin or pkg
+  local pkg = package_at(crate)
+  if not pkg then
+    return cb(nil, { code = "no_target", message = "no Cargo package at " .. tostring(crate) })
+  end
+  -- Pick the bin target from metadata: an explicit `cargo_bin`, else the crate's
+  -- default bin (name == package), else the sole bin — otherwise a structured
+  -- ambiguity error rather than a guess.
+  local bins = {}
+  for _, t in ipairs(pkg.targets or {}) do
+    if t.kind[1] == "bin" then bins[#bins + 1] = t.name end
+  end
+  local bin = eff.cargo_bin
+  if not bin then
+    if vim.tbl_contains(bins, pkg.name) then
+      bin = pkg.name
+    elseif #bins == 1 then
+      bin = bins[1]
+    else
+      return cb(nil, {
+        code = "ambiguous_artifact",
+        message = ("crate '%s' has %d bin targets; set `cargo_bin` on the config")
+          :format(pkg.name, #bins),
+        detail = { bins = bins },
+      })
+    end
+  end
   local identity = {
-    package = pkg, crate_dir = crate, kind = "bin", target = bin,
-    selectors = pkg and (bin == pkg and { "-p", pkg, "--bin", pkg }
-      or { "-p", pkg, "--bin", bin }) or {},
+    package = pkg.name,
+    package_id = pkg.id,
+    crate_dir = crate,
+    kind = "bin",
+    target = bin,
+    selectors = { "-p", pkg.name, "--bin", bin },
     module_prefix = "",
   }
   cargo_build_exe("build", false, identity, crate, opts, function(exe, err)
@@ -753,7 +841,7 @@ end
 
 ---Test-only: drop the memoized caches.
 function M._reset_for_tests()
-  _root_cache, _pkg_cache, _has_lib_cache = {}, {}, {}
+  _root_cache, _meta_cache = {}, {}
 end
 
 return M
