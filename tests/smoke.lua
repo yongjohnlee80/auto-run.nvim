@@ -3583,68 +3583,105 @@ do
     ok_dtf and captured ~= nil and captured.buildFlags == "-count=1",
     tostring(dtf_err) .. " " .. vim.inspect(captured))
 
-  -- REGRESSION — dt must never hand a NON-GO buffer to the Go debugger.
-  --
-  -- The fallback above ends in dap-go's `debug_test`, which debugs the GO test
-  -- at the cursor. `nearest` documents ONE trigger for it — `no_adapter` — but
-  -- the keymap used to fall back on ANY non-test outcome. A Rust or jest buffer
-  -- whose cursor merely sat off a test therefore reached the Go debugger. No
-  -- `== "go"` branch survived Phase 1's migration, yet the fallback arrived at
-  -- the same place by omission.
-  --
-  -- A CLAIMED buffer with no position at the cursor is the exact shape: the
-  -- adapter owns the buffer, so its reason is authoritative.
-  local claimed_nontest = fx .. "/dt-leak/app.test.js"
-  vim.fn.mkdir(fx .. "/dt-leak", "p")
-  write_file(claimed_nontest, "// no test() calls at all\nconst x = 1;\n")
-  worktree.set_active(fx .. "/dt-leak")
-  vim.cmd.edit(vim.fn.fnameescape(claimed_nontest))
-  local _, _, leak_reason = disc.nearest()
-  ok("a CLAIMED buffer with no position reports a non-no_adapter reason",
-    leak_reason ~= nil and leak_reason ~= "no_adapter", tostring(leak_reason))
-
-  captured = nil
-  local ok_leak, leak_err = pcall(cb_of("dt"))
-  ok("dt does NOT invoke the go debugger for a claimed non-go buffer",
-    ok_leak and captured == nil,
-    tostring(leak_err) .. " dap-go received: " .. vim.inspect(captured))
-
   package.loaded["dap-go"] = saved_dg
+end
+
+-- ── [35b] keymaps — dt language leak + dc dead-end message ──────
+-- Runs inside a FUNCTION, not a plain do-block: [35] already carries enough
+-- locals that adding these tipped the main chunk over Lua's 200-local cap —
+-- the same reason [36] is a function.
+print("\n[35b] keymaps — dt language leak + dc dead-end message")
+local section35b = function()
+  local disc = P3.discovery
+  auto_run.default_keymaps()
+  local function cb_of(suffix)
+    local m = vim.fn.maparg("<leader>" .. suffix, "n", false, true)
+    return type(m) == "table" and m.callback or nil
+  end
+
+  -- dt must never hand a NON-GO buffer to the Go debugger. The fallback in
+  -- <leader>dt ends in dap-go's `debug_test`, which debugs the GO test at the
+  -- cursor; `nearest` documents ONE trigger for it (`no_adapter`), but dt fell
+  -- back on ANY non-test outcome. A CLAIMED buffer with no position at the
+  -- cursor is the exact shape.
+  local saved_dg = package.loaded["dap-go"]
+  local dg_calls = 0
+  package.loaded["dap-go"] = {
+    debug_test = function() dg_calls = dg_calls + 1 end,
+    setup = function() end,
+  }
+
+  local leakdir = fx .. "/dt-leak"
+  vim.fn.mkdir(leakdir, "p")
+  write_file(leakdir .. "/app.test.js", "// no test() calls at all\nconst x = 1;\n")
+  worktree.set_active(leakdir)
+  vim.cmd.edit(vim.fn.fnameescape(leakdir .. "/app.test.js"))
+  local _, _, why = disc.nearest()
+  ok("[35b] a CLAIMED buffer with no position reports a non-no_adapter reason",
+    why ~= nil and why ~= "no_adapter", tostring(why))
+
+  -- COUNT invocations. A capture-based assertion (`captured == nil`) cannot
+  -- tell "never called" from "called with nil" — and with no kind=test config
+  -- here the pre-fix path called debug_test(nil), so such a cell passed under
+  -- the mutation. Counting is the noun in the claim.
+  ok("[35b] dt does NOT invoke the go debugger for a claimed non-go buffer",
+    select(1, pcall(cb_of("dt"))) and dg_calls == 0,
+    "dap-go invocations: " .. tostring(dg_calls))
+
+  -- POSITIVE CONTROL: the same stub must still record the legitimate
+  -- no_adapter fallback, so 0 above means "blocked", not "stub dead".
   worktree.set_active(gofix)
+  P2.exec.remember_pick("test", "gofix-tests")
+  vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
+  ok("[35b] …while an UNCLAIMED buffer still reaches it (control)",
+    select(1, pcall(cb_of("dt"))) and dg_calls == 1,
+    "dap-go invocations: " .. tostring(dg_calls))
+  package.loaded["dap-go"] = saved_dg
 
-  -- <leader>dc — replace nvim-dap's dead-end message with an actionable one.
-  --
-  -- With no session, nvim-dap gathers configs from every provider and, finding
-  -- none, says "add configs to `dap.configurations.<ft>`" (dap.lua:545-548).
-  -- auto-run never writes that table — it owns a `providers.configs` slot — so
-  -- the message names a surface auto-run does not own and omits the gestures
-  -- that work. For Rust the empty case is the NORMAL first experience, because
-  -- build-requiring configs are withheld from the sync provider until the
-  -- binary exists (ADR 0194 §2.3.4).
+  -- dc: replace nvim-dap's dead end with an actionable message. With no
+  -- session nvim-dap gathers configs from every provider and, finding none,
+  -- says "add configs to `dap.configurations.<ft>`" (dap.lua:545-548) — a
+  -- surface auto-run never writes, since it owns a providers.configs slot.
+  -- ASSERT THE MESSAGE, not a stubbed `continue` counter: bound as raw
+  -- `dap.continue`, the pre-fix keymap captures the function VALUE at bind
+  -- time, so a later stub is never consulted and `continued == 0` passes for
+  -- entirely the wrong reason.
   local dapm = require("dap")
-  local saved_continue = dapm.continue
   local saved_providers = dapm.providers.configs
-  local continued = 0
-  dapm.continue = function() continued = continued + 1 end
-
   dapm.providers.configs = {}
-  local ok_dc, dc_err = pcall(cb_of("dc"))
-  ok("dc does not reach dap.continue when NO provider yields a config",
-    ok_dc and continued == 0, tostring(dc_err) .. " continued=" .. continued)
+  local msgs = {}
+  -- BOTH sinks: auto-run's log routes to auto-core's logger when that is on
+  -- the rtp (it is here); nvim-dap's message goes through vim.notify.
+  local logmod = require("auto-run.log")
+  local saved_warn, saved_notify = logmod.warn, vim.notify
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  pcall(cb_of("dc"))
+  wait_for(function() return #msgs > 0 end, 5000)
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  local said = table.concat(msgs, "\n")
+  ok("[35b] dc names the gestures that work when nothing provides a config",
+    said:find("<leader>rc", 1, true) ~= nil
+      and said:find("<leader>dt", 1, true) ~= nil, "said: " .. said)
+  ok("[35b] …and never sends the user to dap.configurations",
+    said:find("dap.configurations", 1, true) == nil, said)
 
-  -- POSITIVE CONTROL: the guard must be about emptiness, not a blanket block.
+  -- POSITIVE CONTROL: the guard is about emptiness, not a blanket block.
+  local continued = 0
+  local saved_continue = dapm.continue
+  dapm.continue = function() continued = continued + 1 end
   dapm.providers.configs = {
     ["smoke-dc"] = function()
       return { { type = "go", request = "launch", name = "probe" } }
     end,
   }
-  local ok_dc2, dc2_err = pcall(cb_of("dc"))
-  ok("dc DOES continue as soon as a provider yields one config",
-    ok_dc2 and continued == 1, tostring(dc2_err) .. " continued=" .. continued)
-
-  dapm.providers.configs = saved_providers
+  pcall(cb_of("dc"))
+  ok("[35b] dc DOES continue as soon as a provider yields one config",
+    continued == 1, "continued=" .. tostring(continued))
   dapm.continue = saved_continue
+  dapm.providers.configs = saved_providers
 end
+section35b()
 
 -- ── [36] env — §4.2 (r5) selection, candidates, var editing ─────
 -- Runs inside a FUNCTION (not a plain do-block): the section carries
