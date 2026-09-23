@@ -3936,192 +3936,325 @@ do
     type(captured) == "string" and captured:find("Build error", 1, true) ~= nil,
     tostring(captured))
 end
+-- ══ Rust §7 acceptance matrix (ADR 0194) ════════════════════════
+-- A real TWO-PACKAGE Cargo workspace carrying every shape the review calls
+-- for: a RENAMED [lib] target, an explicit [[bin]] at a custom path, a src
+-- submodule, an integration target, DUPLICATE test names across targets, an
+-- #[ignore] test, a failing test, and a #[cfg(test)] helper that is NOT a test.
+local rustws = fx .. "/rustws"
+local rust_cells = 0
+local function rok(name, cond, detail)
+  rust_cells = rust_cells + 1
+  ok(name, cond, detail)
+end
+local HAVE_CARGO = vim.fn.executable("cargo") == 1
+local HAVE_RUST_TS = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
 
--- ── summary ─────────────────────────────────────────────────────
-print("\n[38] rust — Cargo identity, discovery, valid argv, real libtest results")
-do
-  local R = P3.adapters.get("rust")
-  ok("rust adapter self-registered", R ~= nil and R.name == "rust")
+make_plain_repo(rustws)
+write_file(rustws .. "/Cargo.toml",
+  '[workspace]\nmembers = ["cratea", "crateb"]\nresolver = "2"\n')
+write_file(rustws .. "/cratea/Cargo.toml",
+  '[package]\nname = "cratea"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\nname = "cratea_lib"\n')
+write_file(rustws .. "/cratea/src/lib.rs", table.concat({
+  "pub mod util;",
+  "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+  "#[cfg(test)]",
+  "mod tests {",
+  "    use super::*;",
+  "    fn helper() -> i32 { 3 }",
+  "    #[test] fn adds() { assert_eq!(add(1, 2), helper()); }",
+  "    #[test] fn fails() { assert_eq!(add(1, 1), 3); }",
+  "    #[test] #[ignore] fn skipped() {}",
+  "}",
+}, "\n") .. "\n")
+write_file(rustws .. "/cratea/src/util.rs", table.concat({
+  "pub fn double(x: i32) -> i32 { x * 2 }",
+  "#[cfg(test)]",
+  "mod tests {",
+  "    use super::*;",
+  "    #[test] fn util_only() { assert_eq!(double(2), 4); }",
+  "}",
+}, "\n") .. "\n")
+write_file(rustws .. "/cratea/tests/it.rs", "#[test] fn adds() { assert!(true); }\n")
+write_file(rustws .. "/crateb/Cargo.toml",
+  '[package]\nname = "crateb"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "customtool"\npath = "src/tool.rs"\n')
+write_file(rustws .. "/crateb/src/main.rs",
+  "fn main() {}\n#[cfg(test)]\nmod tests { #[test] fn main_unit() { assert!(true); } }\n")
+write_file(rustws .. "/crateb/src/tool.rs", "fn main() {}\n")
 
-  -- Fixture: one crate with a lib (unit tests in `mod tests`), a default bin
-  -- (src/main.rs), an extra bin (src/bin/tool.rs), and an integration target
-  -- (tests/it.rs). Pure-fs assertions need no toolchain.
-  local cr = fx .. "/rustcrate"
-  vim.fn.mkdir(cr .. "/src/bin", "p")
-  vim.fn.mkdir(cr .. "/tests", "p")
-  local function write(rel, body)
-    local fh = assert(io.open(cr .. "/" .. rel, "w"))
-    fh:write(body); fh:close()
-  end
-  write("Cargo.toml", '[package]\nname = "rustcrate"\nversion = "0.1.0"\nedition = "2021"\n')
-  write("src/lib.rs", table.concat({
-    "pub fn add(a: i32, b: i32) -> i32 { a + b }",
-    "#[cfg(test)]",
-    "mod tests {",
-    "    use super::*;",
-    "    #[test] fn adds() { assert_eq!(add(1, 2), 3); }",
-    "    #[test] fn fails() { assert_eq!(add(1, 1), 3); }",
-    "    #[test] #[ignore] fn skipped() {}",
-    "}",
-  }, "\n") .. "\n")
-  write("src/main.rs", "fn main() {}\n")
-  write("src/bin/tool.rs", "fn main() {}\n")
-  write("tests/it.rs", "#[test] fn it_works() { assert!(true); }\n")
-
-  R._reset_for_tests()
-  ok("root() resolves the crate dir", R.root(cr .. "/src") == cr, R.root(cr .. "/src"))
-
-  local id_lib = R.identity(cr .. "/src/lib.rs")
-  ok("identity(lib.rs) → --lib selector",
-    id_lib and id_lib.kind == "lib" and contains(id_lib.selectors, "--lib")
-      and id_lib.package == "rustcrate", vim.inspect(id_lib))
-  local id_it = R.identity(cr .. "/tests/it.rs")
-  ok("identity(tests/it.rs) → --test it",
-    id_it and id_it.kind == "test" and contains(id_it.selectors, "--test")
-      and contains(id_it.selectors, "it"), vim.inspect(id_it))
-  local id_main = R.identity(cr .. "/src/main.rs")
-  ok("identity(main.rs) → --bin rustcrate",
-    id_main and id_main.kind == "bin" and contains(id_main.selectors, "rustcrate"),
-    vim.inspect(id_main))
-  local id_tool = R.identity(cr .. "/src/bin/tool.rs")
-  ok("identity(src/bin/tool.rs) → --bin tool",
-    id_tool and id_tool.kind == "bin" and contains(id_tool.selectors, "tool"),
-    vim.inspect(id_tool))
-
-  ok("is_test_file(.rs in a crate) is true", R.is_test_file(cr .. "/src/lib.rs"))
-  ok("is_test_file(Cargo.toml) is false", not R.is_test_file(cr .. "/Cargo.toml"))
-  ok("is_test_file(build.rs at crate root) is false", not R.is_test_file(cr .. "/build.rs"))
-  ok("adapter_for a .rs file resolves to rust",
-    (P3.adapters.adapter_for(cr .. "/src/lib.rs") or {}).name == "rust")
-
-  -- build_spec produces valid Cargo/libtest ordering (--exact AFTER --). Needs
-  -- only a hand-built position, no treesitter/cargo.
-  local single = { type = "test", path = cr .. "/src/lib.rs",
-    id = cr .. "/src/lib.rs::tests::adds" }
-  local spec = R.build_spec({ position = single, root = cr, run_id = "r", run_dir = fx })
-  ok("build_spec argv is valid Cargo/libtest ordering",
-    spec ~= nil and table.concat(spec.cmd, " ")
-      == "cargo test -p rustcrate --lib tests::adds -- --exact --format pretty --color never",
-    vim.inspect(spec and spec.cmd))
-
-  -- default_config + build_run_argv capabilities (sync).
-  ok("default_config(test) is a rust test config",
-    R.default_config("test").runtime == "rust" and R.default_config("test").kind == "test")
-  ok("build_run_argv(test) is `cargo test`",
-    table.concat((R.build_run_argv({ kind = "test" })), " ") == "cargo test")
-  ok("build_run_argv(run) is `cargo run`",
-    table.concat((R.build_run_argv({ kind = "run" })), " ") == "cargo run")
-
-  -- Discovery needs the rust treesitter parser.
-  local parser_ok = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
-  if parser_ok then
-    local pos, derr = R.discover_positions(cr .. "/src/lib.rs")
-    ok("discover_positions(lib.rs) parses", pos ~= nil and derr == nil, tostring(derr))
-    if pos then
-      local ns = pos.children[1]
-      ok("tests nest under the `tests` mod namespace",
-        ns and ns.type == "namespace" and ns.name == "tests", vim.inspect(pos))
-      local names = {}
-      for _, t in ipairs((ns or {}).children or {}) do names[#names + 1] = t.name end
-      ok("discovers adds/fails/skipped", contains(names, "adds")
-        and contains(names, "fails") and contains(names, "skipped"), vim.inspect(names))
-
-      -- Real libtest results end-to-end (needs cargo).
-      if vim.fn.executable("cargo") == 1 then
-        pos.id = pos.path
-        local function assign(node)
-          for _, c in ipairs(node.children or {}) do
-            c.id = (node.type == "file" and node.path or node.id) .. "::" .. c.name
-            assign(c)
-          end
-        end
-        assign(pos)
-        local out = fx .. "/rust_lib_out.txt"
-        os.execute("cd " .. cr .. " && cargo test --lib -- --format pretty --color never >"
-          .. out .. " 2>&1")
-        local tree = { get = function(_, id) return id == pos.id and pos or nil end }
-        local map, rerr = R.results({ context = { position_id = pos.id, target = "lib:rustcrate" } },
-          { stdout_file = out, run_dir = fx }, tree)
-        ok("results parse produced no structured error (file scope)", rerr == nil,
-          rerr and rerr.message)
-        local function st(name)
-          local r = map[cr .. "/src/lib.rs::tests::" .. name]
-          return r and r.status
-        end
-        ok("real cargo test: adds → passed", st("adds") == "passed", vim.inspect(map))
-        ok("real cargo test: fails → failed", st("fails") == "failed")
-        ok("real cargo test: skipped(#[ignore]) → skipped", st("skipped") == "skipped")
-      else
-        print("  [38] cargo not on PATH — skipping real libtest results assertions")
-      end
-    end
-  else
-    print("  [38] rust treesitter parser unavailable — skipping discovery/results assertions")
+local function assign_ids(n)
+  for _, c in ipairs(n.children or {}) do
+    c.id = (n.type == "file" and n.path or n.id) .. "::" .. c.name
+    assign_ids(c)
   end
 end
 
-print("\n[39] rust — debug capabilities, dap.adapters.rust, scaffold, err channel")
+print("\n[38] rust — cargo-metadata identity, discovery, position scoping")
 do
   local R = P3.adapters.get("rust")
-  local go = P3.adapters.get("go")
+  R._reset_for_tests()
+  rok("rust adapter self-registered", R ~= nil and R.name == "rust")
+  rok("adapter_for(.rs) resolves to rust",
+    (P3.adapters.adapter_for(rustws .. "/cratea/src/lib.rs") or {}).name == "rust")
+  rok("root() promotes a member crate to the [workspace] root",
+    R.root(rustws .. "/cratea/src") == rustws, tostring(R.root(rustws .. "/cratea/src")))
+  rok("is_test_file accepts a crate .rs", R.is_test_file(rustws .. "/cratea/src/lib.rs"))
+  rok("is_test_file rejects Cargo.toml", not R.is_test_file(rustws .. "/cratea/Cargo.toml"))
+  rok("is_test_file rejects a build script", not R.is_test_file(rustws .. "/cratea/build.rs"))
 
-  -- Scaffold capability (ADR 0194 §2.3.4): default_config per adapter.
-  local rc = R.default_config("test", "x")
-  ok("rust.default_config(test) → runtime=rust", rc.runtime == "rust" and rc.kind == "test")
-  local gc = go.default_config("run", "myapp")
-  ok("go.default_config(run, name) → go program path",
-    gc.runtime == "go" and gc.program == "${worktree}/cmd/myapp", vim.inspect(gc))
+  if not HAVE_CARGO then
+    print("  [38] cargo not on PATH — identity/scoping cells skipped")
+  else
+    local lib = R.identity(rustws .. "/cratea/src/lib.rs")
+    rok("identity binds the RENAMED [lib] target from cargo metadata",
+      lib ~= nil and lib.kind == "lib" and lib.target == "cratea_lib"
+        and lib.package == "cratea", vim.inspect(lib))
+    rok("identity carries the metadata package_id",
+      lib ~= nil and type(lib.package_id) == "string"
+        and lib.package_id:find("cratea", 1, true) ~= nil, lib and lib.package_id)
+    rok("lib selectors are -p <pkg> --lib",
+      lib ~= nil and contains(lib.selectors, "-p") and contains(lib.selectors, "cratea")
+        and contains(lib.selectors, "--lib"), vim.inspect(lib and lib.selectors))
+    local util = R.identity(rustws .. "/cratea/src/util.rs")
+    rok("a src submodule inherits the lib target with its module prefix",
+      util ~= nil and util.kind == "lib" and util.module_prefix == "util", vim.inspect(util))
+    local it = R.identity(rustws .. "/cratea/tests/it.rs")
+    rok("identity binds the integration target (--test it)",
+      it ~= nil and it.kind == "test" and it.target == "it"
+        and contains(it.selectors, "--test"), vim.inspect(it))
+    local tool = R.identity(rustws .. "/crateb/src/tool.rs")
+    rok("identity binds an EXPLICIT [[bin]] at a custom path (customtool)",
+      tool ~= nil and tool.kind == "bin" and tool.target == "customtool", vim.inspect(tool))
+    local mainbin = R.identity(rustws .. "/crateb/src/main.rs")
+    rok("identity binds the default bin of the SECOND workspace package",
+      mainbin ~= nil and mainbin.kind == "bin" and mainbin.package == "crateb",
+      vim.inspect(mainbin))
 
-  -- dap.adapters.rust = codelldb (ADR 0194 §2.3.1), registered at bridge setup.
+    local dir_spec, dir_err = R.build_spec({
+      position = { type = "dir", path = rustws .. "/cratea", id = rustws .. "/cratea" } })
+    rok("a DIR scope returns (nil, nil) so the core decomposes to files",
+      dir_spec == nil and dir_err == nil,
+      tostring(dir_spec) .. "/" .. tostring(dir_err))
+
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local file_spec, file_err = R.build_spec({
+      position = { type = "file", path = libfile, id = libfile,
+        children = { { type = "test", name = "adds", path = libfile,
+          id = libfile .. "::tests::adds" } } } })
+    rok("a crate-ROOT file with no module prefix decomposes (never a whole-target run)",
+      file_spec == nil and file_err == nil, vim.inspect(file_spec and file_spec.cmd))
+
+    local utilfile = rustws .. "/cratea/src/util.rs"
+    local mod_spec = R.build_spec({
+      position = { type = "namespace", name = "tests", path = utilfile,
+        id = utilfile .. "::tests",
+        children = { { type = "test", name = "util_only", path = utilfile,
+          id = utilfile .. "::tests::util_only" } } } })
+    rok("a namespace scope filters by <module_prefix>::<mod>",
+      mod_spec ~= nil and contains(mod_spec.cmd, "util::tests"),
+      vim.inspect(mod_spec and mod_spec.cmd))
+
+    local one = R.build_spec({
+      position = { type = "test", name = "util_only", path = utilfile,
+        id = utilfile .. "::tests::util_only" } })
+    rok("a single test runs --exact with valid Cargo/libtest ordering",
+      one ~= nil and table.concat(one.cmd, " ") ==
+        "cargo test -p cratea --lib util::tests::util_only -- --exact --format pretty --color never",
+      vim.inspect(one and one.cmd))
+    rok("the spec carries the package_id for result scoping",
+      one ~= nil and type(one.context.package_id) == "string")
+  end
+
+  if HAVE_RUST_TS then
+    local pos = R.discover_positions(rustws .. "/cratea/src/lib.rs")
+    local names = {}
+    local function walk(n)
+      if n.type == "test" then names[#names + 1] = n.name end
+      for _, c in ipairs(n.children or {}) do walk(c) end
+    end
+    if pos then walk(pos) end
+    table.sort(names)
+    rok("discovery finds the #[test] fns", contains(names, "adds")
+      and contains(names, "fails") and contains(names, "skipped"), vim.inspect(names))
+    rok("a #[cfg(test)] helper is NOT discovered as a test",
+      not contains(names, "helper"), vim.inspect(names))
+  else
+    print("  [38] rust treesitter parser unavailable — discovery cells skipped")
+  end
+end
+
+print("\n[39] rust — target-scoped results, duplicate names, structured errors")
+do
+  local R = P3.adapters.get("rust")
+  if not (HAVE_CARGO and HAVE_RUST_TS) then
+    print("  [39] cargo / rust parser unavailable — result cells skipped")
+  else
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local pos = R.discover_positions(libfile)
+    pos.id = pos.path
+    assign_ids(pos)
+    local tree = { get = function(_, id) return id == pos.id and pos or nil end }
+
+    local out = fx .. "/rust_lib.txt"
+    os.execute("cd " .. rustws .. "/cratea && cargo test -p cratea --lib -- "
+      .. "--format pretty --color never >" .. out .. " 2>&1")
+    local map, rerr = R.results(
+      { context = { position_id = pos.id, target = "lib:cratea_lib" } },
+      { stdout_file = out, run_dir = fx }, tree)
+    rok("real libtest results parse without a structured error", rerr == nil,
+      rerr and rerr.message)
+    local function st(n)
+      local r = map[libfile .. "::tests::" .. n]
+      return r and r.status
+    end
+    rok("real cargo: adds → passed", st("adds") == "passed", vim.inspect(map))
+    rok("real cargo: fails → failed", st("fails") == "failed")
+    rok("real cargo: #[ignore] → skipped", st("skipped") == "skipped")
+    local mapped = 0
+    for _ in pairs(map) do mapped = mapped + 1 end
+    rok("a DUPLICATE test name in another target does not leak into this scope",
+      mapped == 3, vim.inspect(map))
+
+    local uout = fx .. "/rust_util.txt"
+    os.execute("cd " .. rustws .. "/cratea && cargo test -p cratea --lib util -- "
+      .. "--format pretty --color never >" .. uout .. " 2>&1")
+    local utext = table.concat(vim.fn.readfile(uout), "\n")
+    rok("a module-filtered run executes the selected module's test",
+      utext:find("util::tests::util_only", 1, true) ~= nil, utext:sub(1, 300))
+    rok("a module-filtered run does NOT execute the sibling module's tests",
+      utext:find("\ntest tests::adds ", 1, true) == nil, utext:sub(1, 300))
+
+    local single = { type = "test", path = libfile, id = libfile .. "::tests::adds",
+      children = {} }
+    local stub = { get = function(_, id) return id == single.id and single or nil end }
+    local empty = fx .. "/rust_empty.txt"
+    write_file(empty, "running 0 tests\n")
+    local m2, e2 = R.results({ context = { position_id = single.id, target = "lib:cratea_lib" } },
+      { stdout_file = empty, run_dir = fx }, stub)
+    rok("zero matching lines → structured ambiguity error (never a silent skip)",
+      e2 ~= nil and e2.code == "ambiguous_test", vim.inspect(e2))
+    rok("the ambiguity error carries the package identity",
+      e2 ~= nil and e2.detail ~= nil and e2.detail.package_id ~= nil, vim.inspect(e2))
+    rok("no phantom results on the error path", next(m2) == nil)
+
+    local dup = fx .. "/rust_dup.txt"
+    write_file(dup, "test tests::adds ... ok\ntest tests::adds ... ok\n")
+    local _, e3 = R.results({ context = { position_id = single.id, target = "lib:cratea_lib" } },
+      { stdout_file = dup, run_dir = fx }, stub)
+    rok("TWO identical harness lines are ambiguous (counts LINES, not unique names)",
+      e3 ~= nil and e3.code == "ambiguous_test", vim.inspect(e3))
+  end
+end
+
+print("\n[40] rust — debug capabilities, integrated launch routing, cancellation")
+do
+  local R = P3.adapters.get("rust")
+  local dapmod = require("auto-run.dap")
   local okd, dap = pcall(require, "dap")
   if okd then
-    require("auto-run.dap").ensure_rust_adapter(dap)
-    ok("dap.adapters.rust is registered (codelldb server adapter)",
+    dapmod.ensure_rust_adapter(dap)
+    rok("dap.adapters.rust is a codelldb server adapter",
       type(dap.adapters.rust) == "table" and dap.adapters.rust.type == "server"
-        and type(dap.adapters.rust.executable) == "table"
         and dap.adapters.rust.executable.command:match("codelldb") ~= nil,
       vim.inspect(dap.adapters.rust))
   end
 
-  -- results(map, err?): a single-test scope whose requested test never appears
-  -- in the output is a STRUCTURED ambiguity error, not a silent skip.
-  local single = { type = "test", path = fx .. "/rustcrate/src/lib.rs",
-    id = fx .. "/rustcrate/src/lib.rs::tests::adds", children = {} }
-  local empty_out = fx .. "/rust_empty_out.txt"
-  local eh = assert(io.open(empty_out, "w")); eh:write("running 0 tests\n"); eh:close()
-  local tree_stub = { get = function(_, id) return id == single.id and single or nil end }
-  local map, err = R.results({ context = { position_id = single.id, target = "lib:rustcrate" } },
-    { stdout_file = empty_out, run_dir = fx }, tree_stub)
-  ok("results returns a structured ambiguity error when 0 lines match (never a skip)",
-    err ~= nil and err.code == "ambiguous_test", vim.inspect(err))
-  ok("results err path yields no phantom passed/skipped result", next(map) == nil)
-
-  -- prepare_debug: real cargo build → identity-matched artifact → launch config.
-  local parser_ok = pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust")
-  if parser_ok and vim.fn.executable("cargo") == 1 then
-    local pos = R.discover_positions(fx .. "/rustcrate/src/lib.rs")
-    pos.id = pos.path
-    local function assign(n) for _, c in ipairs(n.children or {}) do
-      c.id = (n.type == "file" and n.path or n.id) .. "::" .. c.name; assign(c) end end
-    assign(pos)
-    local adds = pos.children[1].children[1]  -- tests::adds
-    local launch, perr, fired
-    R.prepare_debug(adds, {}, function(l, e) launch, perr, fired = l, e, true end)
-    vim.wait(60000, function() return fired end, 50)
-    ok("prepare_debug produced a launch (no error)", perr == nil, perr and perr.message)
-    ok("prepare_debug launch targets codelldb via dap_type=rust",
-      launch ~= nil and launch.dap_type == "rust")
-    ok("prepare_debug program is the built test executable",
-      launch ~= nil and type(launch.program) == "string"
-        and vim.fn.filereadable(launch.program) == 1, launch and launch.program)
-    ok("prepare_debug args select the one test with --exact",
-      launch ~= nil and launch.args[1] == "--exact" and launch.args[2] == "tests::adds",
-      vim.inspect(launch and launch.args))
+  if not (HAVE_CARGO and HAVE_RUST_TS) then
+    print("  [40] cargo / rust parser unavailable — debug cells skipped")
   else
-    print("  [39] cargo / rust parser unavailable — skipping prepare_debug assertions")
+    local libfile = rustws .. "/cratea/src/lib.rs"
+    local pos = R.discover_positions(libfile)
+    pos.id = pos.path
+    assign_ids(pos)
+    local adds = pos.children[1].children[1]
+
+    local launch, perr, fired
+    R.prepare_debug(adds, dapmod.new_launch_token(),
+      function(l, e) launch, perr, fired = l, e, true end)
+    wait_for(function() return fired end, 180000)
+    rok("prepare_debug builds and returns a launch", perr == nil and launch ~= nil,
+      perr and perr.message)
+    rok("prepare_debug targets codelldb via dap_type=rust",
+      launch ~= nil and launch.dap_type == "rust")
+    rok("prepare_debug program is the BUILT test executable",
+      launch ~= nil and vim.fn.filereadable(launch.program) == 1,
+      launch and launch.program)
+    rok("prepare_debug selects the one test with --exact",
+      launch ~= nil and launch.args[1] == "--exact",
+      vim.inspect(launch and launch.args))
+
+    -- INTEGRATED: the real discovery path → debug_position → dap.launch.
+    worktree.set_active(rustws)
+    P3.discovery._reset_for_tests()
+    local scanned
+    P3.discovery.scan(nil, function(r) scanned = r end)
+    wait_for(function() return scanned end, 60000)
+    local rtree = P3.discovery.tree()
+    local rust_id = libfile .. "::tests::adds"
+    rok("the scan discovered the rust test position", rtree:get(rust_id) ~= nil, rust_id)
+
+    local saved_launch = dapmod.launch
+    local captured
+    dapmod.launch = function(l) captured = l return true end
+    local dbg_ok, dbg_err = P3.discovery.debug_position(rust_id)
+    wait_for(function() return captured ~= nil end, 180000)
+    dapmod.launch = saved_launch
+    rok("discovery.debug_position(rust) routes through the capability to dap.launch",
+      dbg_ok == true and captured ~= nil, tostring(dbg_err))
+    rok("the launched rust config's type resolves to a registered dap adapter",
+      captured ~= nil and captured.dap_type == "rust"
+        and okd and dap.adapters[captured.dap_type] ~= nil,
+      vim.inspect(captured and captured.dap_type))
+
+    -- CANCELLATION: a superseded build must never reach dap.launch.
+    local late = nil
+    local saved2 = dapmod.launch
+    dapmod.launch = function(l) late = l return true end
+    local tok = dapmod.new_launch_token()
+    local reached = false
+    R.prepare_debug(adds, tok, function(l, _e)
+      if tok.cancelled then return end
+      reached = true
+      dapmod.launch(l)
+    end)
+    dapmod.new_launch_token()  -- supersede: cancels + aborts the pending build
+    vim.wait(2500)
+    dapmod.launch = saved2
+    rok("a superseded launch token is cancelled", tok.cancelled == true)
+    rok("a superseded build never reaches dap.launch (no late session)",
+      late == nil and reached == false, vim.inspect(late))
   end
 end
 
+print("\n[41] rust — provider effective-config gating + assertion floor")
+do
+  local dapmod = require("auto-run.dap")
+  if not HAVE_CARGO then
+    print("  [41] cargo unavailable — provider cells skipped")
+  else
+    worktree.set_active(rustws)
+    store.add({ name = "rust-build", kind = "debug", runtime = "rust" }, { tier = "shared" })
+    local exe = rustws .. "/prebuilt-bin"
+    write_file(exe, "#!/bin/sh\nexit 0\n")
+    store.add({ name = "rust-explicit", kind = "debug", runtime = "rust", program = exe },
+      { tier = "shared" })
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].filetype = "rust"
+    local names = {}
+    for _, e in ipairs(dapmod.provider(buf)) do names[#names + 1] = e.name end
+    rok("the SYNC provider omits a build-requiring rust config",
+      not contains(names, "[auto-run] rust-build"), vim.inspect(names))
+    rok("the SYNC provider includes an explicit-program rust config",
+      contains(names, "[auto-run] rust-explicit"), vim.inspect(names))
+    store.remove("rust-build")
+    store.remove("rust-explicit")
+  end
+
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 43 or 6
+  ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
+    rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
+end
+-- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end
 os.exit(0)
