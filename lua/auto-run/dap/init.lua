@@ -463,7 +463,17 @@ function M.launch(launch)
   if type(launch.extra) == "table" then
     for k, v in pairs(launch.extra) do cfg[k] = v end
   end
-  open_view()
+  -- Opening the view is a CONVENIENCE; it must never be able to prevent the
+  -- session. Unguarded, anything it raises (window ops are the usual source)
+  -- propagates out of `M.launch` before `dap.run` is ever reached — and when
+  -- the caller is an adapter's async callback, that kills the launch with no
+  -- session and no message. Defence in depth behind the `vim.schedule` in
+  -- `cargo_build_exe`: a future adapter that forgets to schedule degrades to a
+  -- reported error instead of silence.
+  local okv, verr = pcall(open_view)
+  if not okv then
+    log.warn("dap", "could not open the debug view: " .. tostring(verr))
+  end
   local okr, rerr = pcall(dap.run, cfg)
   if not okr then return nil, "dap.run: " .. tostring(rerr) end
   return true, nil

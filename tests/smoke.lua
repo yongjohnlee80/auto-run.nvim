@@ -4220,6 +4220,35 @@ do
       launch ~= nil and launch.args[1] == "--exact",
       vim.inspect(launch and launch.args))
 
+    -- REGRESSION — v0.1.12 shipped Rust debugging that could never start.
+    --
+    -- `cargo_build_exe` hands its result back from a `vim.system` callback,
+    -- which is a FAST EVENT CONTEXT. The core launches a DAP session from that
+    -- callback, and nvim-dap touches windows and buffers; each such call raises
+    -- `E5560: … must not be called in a fast event context`. Because that is
+    -- raised INSIDE the libuv callback it never reaches the core's
+    -- `pcall(dap.run, …)`: the callback dies, `debug_start` has already
+    -- returned `true`, and the user gets no session and no message.
+    --
+    -- Why every cell above missed it: they assert the launch TABLE, and the
+    -- integrated cell below STUBS `dapmod.launch`. Both observe the value;
+    -- neither observes the CONTEXT it is delivered in. So the assertions were
+    -- written against the harness rather than against the behaviour.
+    local ctx, ctx_fired = {}, false
+    R.prepare_debug(adds, dapmod.new_launch_token(), function(_l, _e)
+      ctx.fast = vim.in_fast_event()
+      -- The noun in the claim is "the core can start a DAP session here", and
+      -- the capability that stands for is calling the window API without E5560.
+      ctx.api_ok, ctx.api_err = pcall(vim.api.nvim_get_current_win)
+      ctx_fired = true
+    end)
+    wait_for(function() return ctx_fired end, 180000)
+    rok("prepare_debug delivers its callback OFF the fast event context",
+      ctx.fast == false, "vim.in_fast_event() = " .. tostring(ctx.fast))
+    rok("a DAP launch is possible from prepare_debug's callback",
+      ctx.api_ok == true,
+      "nvim_get_current_win: " .. tostring(ctx.api_err))
+
     -- INTEGRATED: the real discovery path → debug_position → dap.launch.
     worktree.set_active(rustws)
     P3.discovery._reset_for_tests()
@@ -4439,9 +4468,39 @@ do
       derr and derr.message or (dlaunch and dlaunch.program))
     rok("ordinary debug builds in the NAMED package's crate dir",
       dlaunch ~= nil and dlaunch.cwd == rustws .. "/crateb", dlaunch and dlaunch.cwd)
+
+    -- Same regression on the ordinary-debug path (<leader>dm). Both debug
+    -- capabilities funnel through cargo_build_exe, so both were broken.
+    local cctx, cfired = {}, false
+    R.prepare_debug_config(xcfg, {}, function(_l, _e)
+      cctx.fast = vim.in_fast_event()
+      cctx.api_ok = pcall(vim.api.nvim_get_current_win)
+      cfired = true
+    end)
+    wait_for(function() return cfired end, 180000)
+    rok("prepare_debug_config delivers its callback OFF the fast event context",
+      cctx.fast == false, "vim.in_fast_event() = " .. tostring(cctx.fast))
+    rok("a DAP launch is possible from prepare_debug_config's callback",
+      cctx.api_ok == true)
+
+    -- SCAFFOLD (<leader>rc): a crate BELOW the project root must still resolve.
+    -- Every fixture before this one put the Cargo workspace AT the project
+    -- root, so `config_identity`'s fallback to nvim's cwd always happened to
+    -- land on a manifest — the failure was unreachable in the suite while being
+    -- the first thing a real nested project hits ("no Cargo metadata at …").
+    -- `default_config` resolves the crate from the CURRENT BUFFER when it is a
+    -- .rs file, so open one from the nested fixture crate to make this
+    -- deterministic rather than dependent on the runner's cwd.
+    vim.cmd.edit(vim.fn.fnameescape(rustws .. "/crateb/src/main.rs"))
+    local scaffold = R.default_config("debug", "dbg")
+    vim.cmd("enew!")
+    rok("default_config pins cwd to the crate, not the project root",
+      scaffold.cwd == rustws .. "/crateb", "cwd = " .. tostring(scaffold.cwd))
+    rok("default_config scaffolds NO program (the cargo prebuild is the baseline)",
+      scaffold.program == nil, "program = " .. tostring(scaffold.program))
   end
 
-  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 66 or 6
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 72 or 6
   ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
     rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
 end
