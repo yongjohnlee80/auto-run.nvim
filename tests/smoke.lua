@@ -3636,6 +3636,27 @@ local section35b = function()
   ok("[35b] …while an UNCLAIMED buffer still reaches it (control)",
     select(1, pcall(cb_of("dt"))) and dg_calls == 1,
     "dap-go invocations: " .. tostring(dg_calls))
+
+  -- ONE OWNER: dt must share rt/rf's fallback contract, not re-derive it.
+  -- The previous head claimed this refactor but production still gated on
+  -- `why ~= "no_adapter"` inline, which had ALREADY drifted: `nearest_or_fallback`
+  -- treats `no_file` as fallback too, so on an unnamed buffer rt fell through to
+  -- the config path while dt stopped. Assert the two agree, which a duplicated
+  -- gate cannot satisfy by accident.
+  vim.cmd("enew!")            -- an unnamed buffer → reason `no_file`
+  local _, _, unnamed_why = disc.nearest()
+  ok("[35b] an unnamed buffer reports no_file", unnamed_why == "no_file",
+    tostring(unnamed_why))
+  local rt_ran = false
+  local saved_pick = P2.exec.pick_config
+  P2.exec.pick_config = function() rt_ran = true end
+  pcall(cb_of("rt"))
+  local rt_fell_back = rt_ran
+  rt_ran = false
+  pcall(cb_of("dt"))
+  ok("[35b] dt and rt agree on the no_file fallback (one owner, not two gates)",
+    rt_ran == rt_fell_back, ("rt=%s dt=%s"):format(tostring(rt_fell_back), tostring(rt_ran)))
+  P2.exec.pick_config = saved_pick
   package.loaded["dap-go"] = saved_dg
 
   -- dc: replace nvim-dap's dead end with an actionable message. With no
@@ -3666,19 +3687,50 @@ local section35b = function()
   ok("[35b] …and never sends the user to dap.configurations",
     said:find("dap.configurations", 1, true) == nil, said)
 
-  -- POSITIVE CONTROL: the guard is about emptiness, not a blanket block.
-  local continued = 0
-  local saved_continue = dapm.continue
-  dapm.continue = function() continued = continued + 1 end
+  -- ONCE-ONLY over the REAL boundary. The previous non-empty control stubbed
+  -- dap.continue, so nvim-dap never performed its own provider evaluation and
+  -- the cell could not see that the mapping read every provider twice per
+  -- keypress. `dap.providers.configs` is a public extension point: a stateful
+  -- provider that yields a config once and none after must still launch, and a
+  -- provider that raises must keep nvim-dap's semantics rather than being
+  -- reclassified as "empty". No stub of dap.continue here — that is the point.
+  local calls = 0
   dapm.providers.configs = {
-    ["smoke-dc"] = function()
-      return { { type = "go", request = "launch", name = "probe" } }
+    ["smoke-stateful"] = function()
+      calls = calls + 1
+      if calls == 1 then
+        -- A type with no registered adapter: nvim-dap proceeds past the
+        -- empty-config branch (which is what we are asserting) and then
+        -- reports a missing adapter, which is emphatically NOT our dead end.
+        return { { type = "smoke-absent-adapter", request = "launch", name = "probe" } }
+      end
+      return {}
     end,
   }
+  msgs = {}
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
   pcall(cb_of("dc"))
-  ok("[35b] dc DOES continue as soon as a provider yields one config",
-    continued == 1, "continued=" .. tostring(continued))
-  dapm.continue = saved_continue
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  ok("[35b] dc evaluates each provider EXACTLY once per keypress",
+    calls == 1, "provider calls: " .. tostring(calls))
+  ok("[35b] …so a stateful provider's config is not lost to a second read",
+    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
+    table.concat(msgs, "\n"))
+
+  -- A raising provider is nvim-dap's business; it must not become "no configs".
+  dapm.providers.configs = {
+    ["smoke-raises"] = function() error("provider blew up") end,
+  }
+  msgs = {}
+  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  pcall(cb_of("dc"))
+  logmod.warn, vim.notify = saved_warn, saved_notify
+  ok("[35b] a provider that RAISES is not reclassified as empty",
+    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
+    table.concat(msgs, "\n"))
+
   dapm.providers.configs = saved_providers
 end
 section35b()

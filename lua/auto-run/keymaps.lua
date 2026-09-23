@@ -217,22 +217,44 @@ function M.default_keymaps()
     -- no mention of the two gestures that actually work here. Worse for Rust,
     -- whose configs are omitted from the synchronous provider until the binary
     -- exists (ADR 0194 §2.3.4), so the empty case is the NORMAL first
-    -- experience. Pre-empt only the genuinely-empty case; otherwise defer to
-    -- nvim-dap untouched.
+    -- experience.
+    --
+    -- nvim-dap remains the ONLY consumer of the providers. An earlier attempt
+    -- pre-counted them to detect the empty case, which was a correctness
+    -- regression on a public extension point, not merely duplicate work:
+    --   • `dap.providers.configs` entries were called twice per keypress, so a
+    --     stateful provider yielding one config then none produced the dead end
+    --     anyway (observed: provider_calls=2);
+    --   • the inverse transition (empty, then non-empty) was wrongly BLOCKED
+    --     even though nvim-dap would have launched it;
+    --   • a provider that raised was swallowed by the preflight's pcall and
+    --     reported as "no configs", silently changing nvim-dap's semantics.
+    --
+    -- Instead, intercept the ONE message nvim-dap emits for the empty case.
+    -- It is emitted synchronously inside `dap.continue` (verified against
+    -- nvim-dap: the gather + notify run before the first yield), so the wrap is
+    -- bounded to this call and providers are evaluated exactly once, by their
+    -- owner. Everything else — picking, launching, provider errors — is
+    -- nvim-dap's, untouched.
     bind("n", "<leader>dc", function()
       if dap.session() then return dap.continue() end
-      local bufnr = vim.api.nvim_get_current_buf()
-      -- Count exactly what nvim-dap would: every provider, called with bufnr.
-      local islist = vim.islist or vim.tbl_islist
-      local found = 0
-      for _, provider in pairs((dap.providers or {}).configs or {}) do
-        local okp, configs = pcall(provider, bufnr)
-        if okp and islist(configs) then found = found + #configs end
+      local ft = vim.bo.filetype
+      local saved_notify = vim.notify
+      local swapped = false
+      vim.notify = function(msg, level, opts)
+        if not swapped and type(msg) == "string"
+            and msg:find("No configuration found for", 1, true) then
+          swapped = true
+          return require("auto-run.log").warn("keymaps",
+            ("no debug configs for %s — scaffold one with <leader>rc, or debug the test under the cursor with <leader>dt")
+              :format(ft ~= "" and ft or "this buffer"))
+        end
+        return saved_notify(msg, level, opts)
       end
-      if found > 0 then return dap.continue() end
-      local ft = vim.bo[bufnr].filetype
-      require("auto-run.log").warn("keymaps", ("no debug configs for %s — scaffold one with <leader>rc, or debug the test under the cursor with <leader>dt")
-        :format(ft ~= "" and ft or "this buffer"))
+      local ok, err = pcall(dap.continue)
+      vim.notify = saved_notify
+      -- Never swallow a real failure from dap.continue.
+      if not ok then error(err, 0) end
     end, "Debug: Continue / Start")
 
     -- <leader>dq / dR — terminate / restart  [provenance: kept]
@@ -251,13 +273,20 @@ function M.default_keymaps()
   end
 
   -- <leader>dt — debug nearest test  [provenance: gobugger `dt`]
-  -- Same nearest resolution as <leader>rt, routed through
-  -- debug_position for go test positions (jump + dap-go debug_test
-  -- with the repo's kind=test config merged in). Anything else —
-  -- non-go positions, undiscovered buffers — takes the Phase 2
-  -- config path (dap-go cursor selection).
+  -- Resolution and the fallback contract come from `nearest_or_fallback()` —
+  -- the SAME owner <leader>rt and <leader>rf use — so all three mappings agree
+  -- on what "not discovery material" means (no_adapter / no_file fall back to
+  -- the Phase 2 config path; every other reason is a warn-logged stop).
+  --
+  -- dt used to call `discovery().nearest(0)` raw and re-derive that gate. The
+  -- fallback below ends in dap-go's `debug_test`, which debugs the GO test at
+  -- the cursor, so falling back on ANY non-test outcome handed a Rust or jest
+  -- buffer to the Go debugger. No `== "go"` branch survived Phase 1's
+  -- migration; this reached the same place by omission, because it duplicated a
+  -- contract that already had exactly one owner — and the duplicate had already
+  -- drifted, stopping on an unnamed buffer where rt/rf fall back.
   bind("n", "<leader>dt", function()
-    local node, nerr, why = discovery().nearest(0)
+    local node, fall_back = nearest_or_fallback()
     -- Any discovered test position routes through debug_position, which
     -- dispatches by the adapter's debug capability (ADR 0194 §2.3.3) — no
     -- keymap-level language branch.
@@ -266,20 +295,14 @@ function M.default_keymaps()
       if err then require("auto-run.log").error("keymaps", err) end
       return
     end
-    -- The config path below ends in `bridge().debug_test`, which is dap-go —
-    -- it debugs the GO test at the cursor. `nearest` documents exactly one
-    -- fallback trigger for it: `no_adapter` (ADR-0048 §10 / Phase 4 gate).
-    --
-    -- Falling back on ANY non-test outcome, as this did, meant that a Rust or
-    -- jest buffer whose cursor simply was not on a test got handed to the GO
-    -- debugger. That is the language leak Phase 1 set out to remove: no `==
-    -- "go"` branch survived in the dispatch, but this fallback reached the same
-    -- place by omission. The gate is capability-shaped, not name-shaped — an
-    -- adapter that CLAIMS the buffer is authoritative about it, so report its
-    -- reason instead of debugging something else.
-    if why ~= "no_adapter" then
-      require("auto-run.log").warn("keymaps",
-        nerr or "no test position at the cursor")
+    if not fall_back then
+      -- An adapter CLAIMS this buffer, so it is authoritative about it: either
+      -- nearest_or_fallback already warn-logged a discovery error, or it
+      -- resolved a non-test node (file/namespace) — the cursor is simply not on
+      -- a test. Neither is a reason to debug something else.
+      if node then
+        require("auto-run.log").warn("keymaps", "no test position at the cursor")
+      end
       return
     end
     exec().pick_config("test", function(name, reason)
