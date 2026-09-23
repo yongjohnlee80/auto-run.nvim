@@ -251,80 +251,78 @@ local function dap_type(runtime)
   return runtime or "go"
 end
 
----Translate one effective config into a fully-resolved dap config
----(merge → substitution → env composition all applied eagerly).
+---Resolve a store config to its EFFECTIVE launch config — the ONE pipeline
+---translate, debug_start, and the provider's inclusion check must all agree on
+---(Lector P1-3): store.get → selected-base merge → deep substitution → env
+---composition, plus the cwd default. `(eff, comp, err, detail)`: `eff` is the
+---substituted config (with `cwd` defaulted), `comp.env` the composed env.
 ---@param name string
 ---@param opts { profile: string?, args: table? }?
----@return table? dap_cfg, string? err, table? detail
-function M.translate(name, opts)
+---@return table? eff, table? comp, string? err, table? detail
+local function resolve_effective(name, opts)
   opts = opts or {}
   local store = require("auto-run.store")
   local eff, gerr = store.get(name, { profile = opts.profile, args = opts.args })
   if not eff then
-    return nil, tostring(gerr), type(gerr) == "table" and gerr or nil
+    return nil, nil, tostring(gerr), type(gerr) == "table" and gerr or nil
   end
-  -- Fold the selected launch config (Config section) in as the active
-  -- base BEFORE substitution/composition — eff wins field-by-field.
+  -- Fold the selected launch config (Config section) in as the active base
+  -- BEFORE substitution/composition — eff wins field-by-field.
   eff = require("auto-run.import").apply_selected_base(eff)
-
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()
   eff = env_mod.substitute_deep(eff, ctx)
   local comp, cerr = env_mod.compose(eff, { ctx = ctx })
   if not comp then
-    return nil, cerr and cerr.message or "env composition failed", cerr
+    return nil, nil, cerr and cerr.message or "env composition failed", cerr
   end
-
-  -- Working dir: the config's cwd, else the anchor's worktree root.
-  -- WITHOUT this default, delve is spawned in nvim's cwd — which in a
-  -- multi-repo parent is OUTSIDE the module, so `go build <abs program>`
-  -- fails "go.mod not found" and the launch dies with "Failed to launch".
-  -- (The run path already defaults cwd via exec.launch_cwd.)
-  local cwd = eff.cwd
-  if type(cwd) ~= "string" or cwd == "" then
+  -- Working dir default: the config's cwd, else the anchor's worktree root.
+  -- WITHOUT this, delve builds from nvim's cwd (outside the module in a
+  -- multi-repo parent) → "go.mod not found" → "Failed to launch".
+  if type(eff.cwd) ~= "string" or eff.cwd == "" then
     local dirs = store.resolve_run_dirs()
-    cwd = dirs.root or dirs.anchor
+    eff.cwd = dirs.root or dirs.anchor
   end
+  return eff, comp, nil
+end
 
+---Map an already-resolved effective config to a dap config (go first-class;
+---any other runtime a generic passthrough).
+---@param eff table
+---@param comp table?
+---@return table dap_cfg
+local function eff_to_dap(eff, comp)
+  local cwd = eff.cwd
   local dap_cfg
   if eff.runtime == "go" or eff.runtime == nil then
     dap_cfg = {
-      type    = "go",
-      request = "launch",
-      mode    = eff.kind == "test" and "test" or "debug",
-      name    = eff.name,
-      program = eff.program,
-      cwd     = cwd,
-      -- delve's OWN working dir for the `go build` step. `cwd` only sets
-      -- the debugged program's run dir; without dlvCwd delve builds from
-      -- nvim's cwd (outside the module in a multi-repo parent) → "go.mod
-      -- not found" → "Failed to launch". Verified via a live dlv dap
-      -- launch: dlvCwd=<worktree> builds in-module and succeeds.
-      dlvCwd  = cwd,
+      type = "go", request = "launch",
+      mode = eff.kind == "test" and "test" or "debug",
+      name = eff.name, program = eff.program, cwd = cwd, dlvCwd = cwd,
     }
-    if type(eff.args) == "table" and #eff.args > 0 then
-      dap_cfg.args = eff.args
-    end
+    if type(eff.args) == "table" and #eff.args > 0 then dap_cfg.args = eff.args end
     if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
       dap_cfg.buildFlags = eff.build_flags
     end
   else
-    -- Generic passthrough for other runtimes.
     dap_cfg = {
-      type    = dap_type(eff.runtime),
-      request = "launch",
-      name    = eff.name,
-      program = eff.program,
-      cwd     = cwd,
+      type = dap_type(eff.runtime), request = "launch",
+      name = eff.name, program = eff.program, cwd = cwd,
     }
-    if type(eff.args) == "table" and #eff.args > 0 then
-      dap_cfg.args = eff.args
-    end
+    if type(eff.args) == "table" and #eff.args > 0 then dap_cfg.args = eff.args end
   end
-  if next(comp.env) ~= nil then
-    dap_cfg.env = comp.env
-  end
-  return dap_cfg, nil
+  if comp and next(comp.env) ~= nil then dap_cfg.env = comp.env end
+  return dap_cfg
+end
+
+---Translate one store config into a fully-resolved dap config.
+---@param name string
+---@param opts { profile: string?, args: table? }?
+---@return table? dap_cfg, string? err, table? detail
+function M.translate(name, opts)
+  local eff, comp, err, detail = resolve_effective(name, opts)
+  if not eff then return nil, err, detail end
+  return eff_to_dap(eff, comp), nil
 end
 
 -- ── provider (dap.providers.configs — NEVER dap.configurations) ──
@@ -351,7 +349,9 @@ function M.provider(bufnr)
     local include = not c.error and (c.kind == "debug" or c.kind == "run")
       and (c.runtime or "go") == ft
     if include and c.runtime == "rust" then
-      local reff = select(1, store.get(c.name))
+      -- Check the EFFECTIVE (selected-base + substituted) config, so an
+      -- inherited or ${worktree}-based explicit program still counts (P1-3).
+      local reff = select(1, resolve_effective(c.name))
       local prog = type(reff) == "table" and reff.program or nil
       include = type(prog) == "string" and prog:match("/") ~= nil
         and vim.fn.filereadable(prog) == 1
@@ -408,6 +408,39 @@ function M.ensure_rust_adapter(dap)
   }
 end
 
+-- ── core-owned debug launch token (cancellation, Lector P1-4) ───
+
+-- The pending async debug launch. A NEW launch supersedes the prior one (its
+-- is_cancelled flips true and its adapter build is aborted); the core also
+-- checks the token immediately before dap.launch, so a late Cargo completion
+-- after a cancel/supersede never starts a session (ADR 0194 §2.3.4 caution #2).
+local _pending_launch = nil
+
+---Open a launch token, superseding + aborting any pending one. Passed as the
+---adapter's `prepare_debug*` `opts`: the adapter reads `opts.is_cancelled()`
+---and installs `opts.abort`, both now reachable by the core (they were dead
+---code when a throwaway `{}` was passed).
+---@return { cancelled: boolean, is_cancelled: fun():boolean, abort: fun()? }
+function M.new_launch_token()
+  if _pending_launch then
+    _pending_launch.cancelled = true
+    if type(_pending_launch.abort) == "function" then pcall(_pending_launch.abort) end
+  end
+  local token = { cancelled = false }
+  token.is_cancelled = function() return token.cancelled end
+  _pending_launch = token
+  return token
+end
+
+---Cancel the pending debug launch (aborting its in-flight build), if any.
+function M.cancel_launch()
+  if _pending_launch then
+    _pending_launch.cancelled = true
+    if type(_pending_launch.abort) == "function" then pcall(_pending_launch.abort) end
+    _pending_launch = nil
+  end
+end
+
 ---Launch a resolved DAP config produced by an adapter's `prepare_debug*`
 ---capability (ADR 0194 §2.3.4). Ensures the adapter for `launch.dap_type` is
 ---registered, then runs it. `(true)` or `(nil, err)`.
@@ -448,14 +481,19 @@ function M.debug_start(name, opts)
   local okd, dap = pcall(require, "dap")
   if not okd then return nil, "nvim-dap is not installed" end
 
-  local store = require("auto-run.store")
-  local eff = select(1, store.get(name,
-    opts and { profile = opts.profile, args = opts.args } or nil))
-  local runtime = type(eff) == "table" and eff.runtime or nil
-  local adapter = runtime and require("auto-run.adapters").get(runtime) or nil
+  -- Resolve the EFFECTIVE config (selected-base + substitution + composed env),
+  -- so ordinary Rust debug sees the same program/cwd/env the translator does
+  -- (Lector P1-3), then hand the composed env to the adapter.
+  local eff, comp, err, detail = resolve_effective(name, opts)
+  if not eff then return nil, err, detail end
+  if comp and next(comp.env) ~= nil then eff.env = comp.env end
+
+  local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
   if adapter and type(adapter.prepare_debug_config) == "function" then
     open_view()
-    adapter.prepare_debug_config(eff, {}, function(launch, perr)
+    local token = M.new_launch_token()
+    adapter.prepare_debug_config(eff, token, function(launch, perr)
+      if token.cancelled then return end -- superseded / cancelled mid-build
       if perr then
         log.error("dap", "debug prepare failed: "
           .. tostring(perr.message or perr.code))
@@ -467,10 +505,8 @@ function M.debug_start(name, opts)
     return true, nil
   end
 
-  local cfg, terr, detail = M.translate(name, opts)
-  if not cfg then return nil, terr, detail end
   open_view()
-  local okr, rerr = pcall(dap.run, cfg)
+  local okr, rerr = pcall(dap.run, eff_to_dap(eff, comp))
   if not okr then return nil, "dap.run: " .. tostring(rerr) end
   return true, nil
 end

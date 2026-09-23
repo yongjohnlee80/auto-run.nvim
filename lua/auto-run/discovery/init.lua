@@ -961,7 +961,11 @@ function M.debug_position(id)
   local adapter = adapters.get(node.adapter or "")
   local dap = require("auto-run.dap")
   if adapter and type(adapter.prepare_debug) == "function" then
-    adapter.prepare_debug(node, {}, function(launch, perr)
+    -- Core-owned cancellation token (Lector P1-4): supersede/abort a prior
+    -- pending build, and skip a late launch if this one was cancelled.
+    local token = dap.new_launch_token()
+    adapter.prepare_debug(node, token, function(launch, perr)
+      if token.cancelled then return end
       if perr then
         log.error("discovery", "debug prepare failed: "
           .. tostring(perr.message or perr.code))
