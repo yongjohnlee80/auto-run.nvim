@@ -3582,7 +3582,68 @@ do
   ok("dt on an unclaimed buffer falls back to the config path",
     ok_dtf and captured ~= nil and captured.buildFlags == "-count=1",
     tostring(dtf_err) .. " " .. vim.inspect(captured))
+
+  -- REGRESSION — dt must never hand a NON-GO buffer to the Go debugger.
+  --
+  -- The fallback above ends in dap-go's `debug_test`, which debugs the GO test
+  -- at the cursor. `nearest` documents ONE trigger for it — `no_adapter` — but
+  -- the keymap used to fall back on ANY non-test outcome. A Rust or jest buffer
+  -- whose cursor merely sat off a test therefore reached the Go debugger. No
+  -- `== "go"` branch survived Phase 1's migration, yet the fallback arrived at
+  -- the same place by omission.
+  --
+  -- A CLAIMED buffer with no position at the cursor is the exact shape: the
+  -- adapter owns the buffer, so its reason is authoritative.
+  local claimed_nontest = fx .. "/dt-leak/app.test.js"
+  vim.fn.mkdir(fx .. "/dt-leak", "p")
+  write_file(claimed_nontest, "// no test() calls at all\nconst x = 1;\n")
+  worktree.set_active(fx .. "/dt-leak")
+  vim.cmd.edit(vim.fn.fnameescape(claimed_nontest))
+  local _, _, leak_reason = disc.nearest()
+  ok("a CLAIMED buffer with no position reports a non-no_adapter reason",
+    leak_reason ~= nil and leak_reason ~= "no_adapter", tostring(leak_reason))
+
+  captured = nil
+  local ok_leak, leak_err = pcall(cb_of("dt"))
+  ok("dt does NOT invoke the go debugger for a claimed non-go buffer",
+    ok_leak and captured == nil,
+    tostring(leak_err) .. " dap-go received: " .. vim.inspect(captured))
+
   package.loaded["dap-go"] = saved_dg
+  worktree.set_active(gofix)
+
+  -- <leader>dc — replace nvim-dap's dead-end message with an actionable one.
+  --
+  -- With no session, nvim-dap gathers configs from every provider and, finding
+  -- none, says "add configs to `dap.configurations.<ft>`" (dap.lua:545-548).
+  -- auto-run never writes that table — it owns a `providers.configs` slot — so
+  -- the message names a surface auto-run does not own and omits the gestures
+  -- that work. For Rust the empty case is the NORMAL first experience, because
+  -- build-requiring configs are withheld from the sync provider until the
+  -- binary exists (ADR 0194 §2.3.4).
+  local dapm = require("dap")
+  local saved_continue = dapm.continue
+  local saved_providers = dapm.providers.configs
+  local continued = 0
+  dapm.continue = function() continued = continued + 1 end
+
+  dapm.providers.configs = {}
+  local ok_dc, dc_err = pcall(cb_of("dc"))
+  ok("dc does not reach dap.continue when NO provider yields a config",
+    ok_dc and continued == 0, tostring(dc_err) .. " continued=" .. continued)
+
+  -- POSITIVE CONTROL: the guard must be about emptiness, not a blanket block.
+  dapm.providers.configs = {
+    ["smoke-dc"] = function()
+      return { { type = "go", request = "launch", name = "probe" } }
+    end,
+  }
+  local ok_dc2, dc2_err = pcall(cb_of("dc"))
+  ok("dc DOES continue as soon as a provider yields one config",
+    ok_dc2 and continued == 1, tostring(dc2_err) .. " continued=" .. continued)
+
+  dapm.providers.configs = saved_providers
+  dapm.continue = saved_continue
 end
 
 -- ── [36] env — §4.2 (r5) selection, candidates, var editing ─────

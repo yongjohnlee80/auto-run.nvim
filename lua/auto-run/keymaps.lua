@@ -208,7 +208,32 @@ function M.default_keymaps()
     end, "Debug: Clear Breakpoints")
 
     -- <leader>dc — continue/start (dap)  [provenance: kept]
-    bind("n", "<leader>dc", dap.continue, "Debug: Continue / Start")
+    -- With a live session this is a plain resume. With NO session nvim-dap
+    -- gathers configs from every registered provider and, finding none, says
+    -- "No configuration found for `<ft>`. You need to add configs to
+    -- `dap.configurations.<ft>`" (dap.lua:545-548). auto-run deliberately never
+    -- writes `dap.configurations` — it owns a `providers.configs` slot instead
+    -- — so that message sends the user to a surface auto-run does not own, with
+    -- no mention of the two gestures that actually work here. Worse for Rust,
+    -- whose configs are omitted from the synchronous provider until the binary
+    -- exists (ADR 0194 §2.3.4), so the empty case is the NORMAL first
+    -- experience. Pre-empt only the genuinely-empty case; otherwise defer to
+    -- nvim-dap untouched.
+    bind("n", "<leader>dc", function()
+      if dap.session() then return dap.continue() end
+      local bufnr = vim.api.nvim_get_current_buf()
+      -- Count exactly what nvim-dap would: every provider, called with bufnr.
+      local islist = vim.islist or vim.tbl_islist
+      local found = 0
+      for _, provider in pairs((dap.providers or {}).configs or {}) do
+        local okp, configs = pcall(provider, bufnr)
+        if okp and islist(configs) then found = found + #configs end
+      end
+      if found > 0 then return dap.continue() end
+      local ft = vim.bo[bufnr].filetype
+      require("auto-run.log").warn("keymaps", ("no debug configs for %s — scaffold one with <leader>rc, or debug the test under the cursor with <leader>dt")
+        :format(ft ~= "" and ft or "this buffer"))
+    end, "Debug: Continue / Start")
 
     -- <leader>dq / dR — terminate / restart  [provenance: kept]
     -- Terminate must also abort an in-flight debug PREPARATION (e.g. a Cargo
@@ -232,13 +257,29 @@ function M.default_keymaps()
   -- non-go positions, undiscovered buffers — takes the Phase 2
   -- config path (dap-go cursor selection).
   bind("n", "<leader>dt", function()
-    local node = discovery().nearest(0)
+    local node, nerr, why = discovery().nearest(0)
     -- Any discovered test position routes through debug_position, which
     -- dispatches by the adapter's debug capability (ADR 0194 §2.3.3) — no
-    -- keymap-level language branch. Undiscovered buffers fall back below.
+    -- keymap-level language branch.
     if node and node.type == "test" then
       local _, err = discovery().debug_position(node.id)
       if err then require("auto-run.log").error("keymaps", err) end
+      return
+    end
+    -- The config path below ends in `bridge().debug_test`, which is dap-go —
+    -- it debugs the GO test at the cursor. `nearest` documents exactly one
+    -- fallback trigger for it: `no_adapter` (ADR-0048 §10 / Phase 4 gate).
+    --
+    -- Falling back on ANY non-test outcome, as this did, meant that a Rust or
+    -- jest buffer whose cursor simply was not on a test got handed to the GO
+    -- debugger. That is the language leak Phase 1 set out to remove: no `==
+    -- "go"` branch survived in the dispatch, but this fallback reached the same
+    -- place by omission. The gate is capability-shaped, not name-shaped — an
+    -- adapter that CLAIMS the buffer is authoritative about it, so report its
+    -- reason instead of debugging something else.
+    if why ~= "no_adapter" then
+      require("auto-run.log").warn("keymaps",
+        nerr or "no test position at the cursor")
       return
     end
     exec().pick_config("test", function(name, reason)
