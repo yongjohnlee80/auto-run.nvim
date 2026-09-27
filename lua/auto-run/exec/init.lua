@@ -374,11 +374,22 @@ end
 
 ---@param state table
 local function write_state(state)
-  require("auto-run.store").write_state(state)
+  -- Pass the result through: store.write_state reports failure by RETURNING
+  -- (false, err), and a caller that announces a change must not announce one
+  -- that was never saved.
+  return require("auto-run.store").write_state(state)
+end
+
+---Tell the panes a pick changed — the topic adapters.config.pick uses, so a
+---view showing the shared pick re-renders when it is set or cleared.
+local function announce_pick(payload)
+  local ok, events = pcall(require, "auto-core.events")
+  if ok and events then pcall(events.publish, "run.config:changed", payload) end
 end
 
 ---Remember the last-picked config for a kind (persisted per repo in
----the shared tier's state.json). Best-effort + silent.
+---the shared tier's state.json). Best-effort. Announces
+---`run.config:changed {action="picked", kind, name}` when the pick changes.
 ---@param kind string?
 ---@param name string
 function M.remember_pick(kind, name)
@@ -388,7 +399,9 @@ function M.remember_pick(kind, name)
     state.picks = type(state.picks) == "table" and state.picks or {}
     if state.picks[kind] == name then return end
     state.picks[kind] = name
-    write_state(state)
+    if write_state(state) then
+      announce_pick({ action = "picked", kind = kind, name = name })
+    end
   end)
 end
 
@@ -409,17 +422,23 @@ function M.picks()
   return out
 end
 
----Clear the remembered pick for one kind (nil clears all).
+---Clear the remembered pick for one kind (nil clears all). Announces
+---`run.config:changed {action="pick_cleared", kind}` when a pick was there.
 ---@param kind string?
 function M.clear_pick(kind)
   pcall(function()
     local state = read_state()
+    local had = type(state.picks) == "table"
+      and (kind == nil and next(state.picks) ~= nil or kind ~= nil and state.picks[kind] ~= nil)
+    if not had then return end   -- nothing to clear: no write, no announcement
     if kind == nil then
       state.picks = nil
-    elseif type(state.picks) == "table" then
+    else
       state.picks[kind] = nil
     end
-    write_state(state)
+    if write_state(state) then
+      announce_pick({ action = "pick_cleared", kind = kind })
+    end
   end)
 end
 
