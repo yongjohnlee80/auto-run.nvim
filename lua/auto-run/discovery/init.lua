@@ -968,6 +968,9 @@ function M.debug_position(id)
   if adapter and type(adapter.prepare_debug) == "function" then
     -- Core-owned cancellation token (Lector P1-4): supersede/abort a prior
     -- pending build, and skip a late launch if this one was cancelled.
+    -- Where this debug STARTED: the callback may run after a worktree switch,
+    -- and must not record the new worktree as this debug's (Lector M6 P2).
+    local started_in = require("auto-run.last").anchor()
     local token = dap.new_launch_token()
     adapter.prepare_debug(node, token, function(launch, perr)
       if token.cancelled then return end
@@ -983,7 +986,7 @@ function M.debug_position(id)
       end
       -- Recorded when the launch reached nvim-dap, never at this function's
       -- synchronous return (the build can still fail or be cancelled).
-      require("auto-run.last").record("debug", { via = "position", id = id })
+      require("auto-run.last").record("debug", { via = "position", id = id, anchor = started_in })
     end)
     return true, nil
   end

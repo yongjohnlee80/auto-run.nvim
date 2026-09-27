@@ -28,7 +28,9 @@ local M = {}
 ---@field opts table?       options to pass again (callbacks stripped)
 ---@field path string?      test_config debug: the file dap-go resolved the test in
 ---@field lnum integer?     test_config debug: the cursor line it resolved from
----@field anchor string?    the store anchor's root when it launched (filled in by record)
+---@field anchor string?    the store anchor's root when the operation was STARTED.
+---                         An async caller passes it (captured before its
+---                         prepare); otherwise record() takes the current one.
 
 ---@type table<"run"|"debug", AutoRunLastDescriptor?>
 local _last = { run = nil, debug = nil }
@@ -39,6 +41,15 @@ local _last = { run = nil, debug = nil }
 local function current_anchor()
   local dirs = require("auto-run.store").resolve_run_dirs()
   return dirs.root or dirs.anchor
+end
+
+---The anchor to capture when an operation STARTS. An async debug records in
+---its prepare callback, possibly after the active worktree changed; it must
+---record where it started (Lector M6 P2), so it captures this first and
+---passes it as `desc.anchor`.
+---@return string
+function M.anchor()
+  return current_anchor()
 end
 
 ---Drop callbacks: they belong to the invocation that passed them.
@@ -59,7 +70,7 @@ end
 function M.record(mode, desc)
   local d = vim.deepcopy(desc)
   d.opts = replayable(desc.opts)
-  d.anchor = current_anchor()
+  d.anchor = desc.anchor or current_anchor()
   _last[mode] = d
 end
 

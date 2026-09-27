@@ -505,6 +505,9 @@ function M.debug_start(name, opts)
   local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
   if adapter and type(adapter.prepare_debug_config) == "function" then
     open_view()
+    -- Where this debug STARTED: the callback may run after a worktree switch,
+    -- and must not record the new worktree as this debug's (Lector M6 P2).
+    local started_in = require("auto-run.last").anchor()
     local token = M.new_launch_token()
     adapter.prepare_debug_config(eff, token, function(launch, perr)
       if token.cancelled then return end -- superseded / cancelled mid-build
@@ -519,8 +522,10 @@ function M.debug_start(name, opts)
         return
       end
       -- Recorded HERE, when the launch reached nvim-dap — not at this
-      -- function's synchronous return, which precedes the build.
-      require("auto-run.last").record("debug", { via = "config", name = name, opts = opts })
+      -- function's synchronous return, which precedes the build — under the
+      -- worktree it started in.
+      require("auto-run.last").record("debug",
+        { via = "config", name = name, opts = opts, anchor = started_in })
     end)
     return true, nil
   end
