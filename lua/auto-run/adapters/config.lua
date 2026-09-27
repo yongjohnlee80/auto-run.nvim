@@ -25,19 +25,13 @@
 
 local M = {}
 
----Name of the repo's `kind=test` config for `runtime`, or nil: the user's
----PICK when it names a matching config, otherwise the first match in
----`store.list()` order.
----
----Also returns WHY, so a pane can state it without re-deriving the rule — a
----second copy of this logic in a view is exactly what would let the header
----disagree with what runs (ADR 0199 §5.2):
----  `source` — `"picked"` | `"first"` | `"none"`
----  `ignored_pick` — the remembered pick when it did NOT apply to `runtime`
----  (another runtime's config, or a config that no longer exists), else nil.
----@param runtime string   the adapter's name ("go", "jest", …)
----@return string? name, "picked"|"first"|"none" source, string? ignored_pick
-function M.test_config_name(runtime)
+---Resolve the test config for `runtime` — the ONE implementation of the pick
+---rule. `skip_runtime_pick` answers "what would apply if this runtime's pick
+---were cleared", so a chooser can say so without a second copy of the rule.
+---@param runtime string
+---@param skip_runtime_pick boolean
+---@return string? name, "picked"|"shared"|"first"|"none" source, string? ignored_pick
+local function resolve(runtime, skip_runtime_pick)
   local ok, store = pcall(require, "auto-run.store")
   if not ok then return nil, "none", nil end
   local matches = {}
@@ -47,30 +41,53 @@ function M.test_config_name(runtime)
       matches[#matches + 1] = c.name
     end
   end
-  -- The user's PICK wins over list order, read through the store, which owns
-  -- state.json. Only a pick that still names a matching config counts — a pick
-  -- for another runtime, or one whose config is gone, falls back to the first
-  -- match rather than failing.
   -- Per-RUNTIME pick first (state.test_picks[runtime], written by M.pick), then
-  -- the legacy per-KIND pick (state.picks.test, written by exec.pick_config) so
+  -- the SHARED per-kind pick (state.picks.test, written by exec.pick_config) so
   -- nothing a user already picked is lost. One name per kind could not hold a
   -- Go choice and a Rust choice at once: picking one silently replaced the
   -- other while the header showed them as independent (ADR 0199 r2 §3.2).
-  local rt_pick, legacy
+  -- Only a pick that still names a matching config counts.
+  local rt_pick, shared
   pcall(function()
     local st = store.read_state()
     rt_pick = type(st.test_picks) == "table" and st.test_picks[runtime] or nil
-    legacy = type(st.picks) == "table" and st.picks.test or nil
+    shared = type(st.picks) == "table" and st.picks.test or nil
   end)
-  if type(rt_pick) ~= "string" then rt_pick = nil end
-  if type(legacy) ~= "string" then legacy = nil end
-  -- Checked one by one, NOT with ipairs({ rt_pick, legacy }): ipairs stops at
-  -- the first nil, so with no runtime pick it would never reach the legacy one.
+  if type(rt_pick) ~= "string" or skip_runtime_pick then rt_pick = nil end
+  if type(shared) ~= "string" then shared = nil end
+  -- Checked one by one, NOT with ipairs({ rt_pick, shared }): ipairs stops at
+  -- the first nil, so with no runtime pick it would never reach the shared one.
   if rt_pick and vim.tbl_contains(matches, rt_pick) then return rt_pick, "picked", nil end
-  if legacy and vim.tbl_contains(matches, legacy) then return legacy, "picked", nil end
-  local ignored = rt_pick or legacy
+  -- A runtime pick that did not apply is REPORTED even when the shared pick
+  -- then does — hiding it is the misrepresentation ADR 0199 §5.2 forbids.
+  local ignored = rt_pick
+  if shared and vim.tbl_contains(matches, shared) then return shared, "shared", ignored end
+  ignored = ignored or shared
   if #matches == 0 then return nil, "none", ignored end
   return matches[1], "first", ignored
+end
+
+---Name of the repo's `kind=test` config for `runtime`, or nil, and WHY — so a
+---pane states the resolver's own reason instead of re-deriving it (a second
+---copy of this rule in a view is what would let a header disagree with what
+---runs, ADR 0199 §5.2):
+---  `source` — `"picked"` (this runtime's pick) | `"shared"` (the per-kind pick
+---  every runtime falls back to) | `"first"` (no pick applied) | `"none"`
+---  `ignored_pick` — a remembered pick that did NOT apply to `runtime`
+---  (another runtime's config, or a config that no longer exists), else nil.
+---@param runtime string   the adapter's name ("go", "jest", …)
+---@return string? name, "picked"|"shared"|"first"|"none" source, string? ignored_pick
+function M.test_config_name(runtime)
+  return resolve(runtime, false)
+end
+
+---What `test_config_name(runtime)` would return if this runtime's pick were
+---cleared — the label a "clear" action must show, because clearing can reveal
+---the shared pick rather than the first match.
+---@param runtime string
+---@return string? name, "shared"|"first"|"none" source, string? ignored_pick
+function M.fallback_config_name(runtime)
+  return resolve(runtime, true)
 end
 
 ---Remember the test config for ONE runtime (nil clears it). Refuses a name
@@ -98,13 +115,17 @@ function M.pick(runtime, name)
       return nil, ("pick: '%s' is not a test config for %s"):format(tostring(name), runtime)
     end
   end
-  local okw, werr = pcall(function()
+  -- write_state reports failure by RETURNING (false, err), not by raising, so
+  -- a pcall around it alone would call a failed write a success — and then
+  -- announce a pick that was never saved. Check both, like import.set_selected.
+  local okp, okw, werr = pcall(function()
     local state = store.read_state()
     state.test_picks = type(state.test_picks) == "table" and state.test_picks or {}
     state.test_picks[runtime] = name
     if next(state.test_picks) == nil then state.test_picks = nil end
-    store.write_state(state)
+    return store.write_state(state)
   end)
+  if not okp then return nil, "pick: state.json write raised: " .. tostring(okw) end
   if not okw then return nil, "pick: state.json write failed: " .. tostring(werr) end
   local oke, events = pcall(require, "auto-core.events")
   if oke and events then

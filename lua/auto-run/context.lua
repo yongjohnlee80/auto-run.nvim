@@ -86,7 +86,7 @@ end
 ---The test config that WILL apply for `runtime`, and why — straight from the
 ---resolver the test run calls.
 ---@param runtime string
----@return { name: string?, source: "picked"|"first"|"none", ignored_pick: string? }
+---@return { name: string?, source: "picked"|"shared"|"first"|"none", ignored_pick: string? }
 function M.test_config(runtime)
   local name, source, ignored = require("auto-run.adapters.config").test_config_name(runtime)
   return { name = name, source = source, ignored_pick = ignored }
