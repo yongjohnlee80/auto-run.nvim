@@ -4147,6 +4147,12 @@ local section36c = function()
   ok("[36c] no selection, no config: nothing is injected",
     env.SEL_FROM_BASE == nil and env.SEL_FROM_ENVFILE == nil
       and argv:find("selbase", 1, true) == nil, vim.inspect({ env = env, argv = argv }))
+  -- The documented contract itself. Every current adapter behaves the same
+  -- given nil or an empty table, so without this cell the (nil, nil) guard
+  -- would be a claim nothing checks.
+  local applied, aerr = require("auto-run.adapters.config").test_config("go")
+  ok("[36c] test_config is (nil, nil) when nothing is configured or selected",
+    applied == nil and aerr == nil, vim.inspect({ applied = applied, err = aerr }))
 
   job.spawn = real_spawn
   import.set_selected(nil); envmod.set_selected(nil)
