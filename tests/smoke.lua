@@ -1262,7 +1262,8 @@ ok("run.remove gone → not_found",
 vim.cmd("runtime! plugin/auto-run.lua")
 local ucmds = vim.api.nvim_get_commands({})
 ok(":AutoRun user command registered", ucmds.AutoRun ~= nil)
-ok(":AutoRun validate runs clean", pcall(vim.cmd, "AutoRun validate"))
+ok(":AutoRun doctor runs clean (it carries the config validation that was :AutoRun validate)",
+  pcall(vim.cmd, "AutoRun doctor"))
 
 -- ═════════════════════════ Phase 2 ══════════════════════════════
 -- Cross-section carriers live on ONE table (sections below run in
@@ -1965,7 +1966,6 @@ end
 -- :AutoRun Phase 2 subcommands (plugin file already sourced in [9]).
 print("\n[17] :AutoRun — Phase 2 subcommands + doctor additions")
 do
-  ok(":AutoRun jobs runs clean", pcall(vim.cmd, "AutoRun jobs"))
   ok(":AutoRun doctor (with dap + breakpoint sections) runs clean",
     pcall(vim.cmd, "AutoRun doctor"))
   local okc = pcall(vim.cmd, "AutoRun stop not-a-job")
@@ -2980,20 +2980,14 @@ end
 print("\n[29] :AutoRun — tests/scan subcommands, doctor adapter rows")
 do
   worktree.set_active(jestfix)
-  local out = vim.api.nvim_exec2("AutoRun tests", { output = true }).output
-  ok(":AutoRun tests renders the position tree",
-    out:find("auto-run tests", 1, true) ~= nil
-      and out:find("math", 1, true) ~= nil
-      and out:find("adds", 1, true) ~= nil, out:sub(1, 200))
-  ok(":AutoRun tests shows result glyphs",
-    out:find("✗", 1, true) ~= nil and out:find("✓", 1, true) ~= nil)
-
+  -- `:AutoRun tests` and `:AutoRun scan` are gone (ADR 0199 §4.1): the tests
+  -- pane renders the tree and its `S` scans. The scan API they fronted stays.
   local scan_done
   local h_ev = core.events.subscribe("run.discovery:changed",
     function(p) scan_done = p end)
-  ok(":AutoRun scan runs clean", pcall(vim.cmd, "AutoRun scan"))
+  ok("discovery.scan runs clean", pcall(P3.discovery.scan, nil, function() end))
   wait_for(function() return scan_done end)
-  ok(":AutoRun scan completes and republishes discovery",
+  ok("discovery.scan completes and republishes discovery",
     scan_done ~= nil and scan_done.root == jestfix, vim.inspect(scan_done))
   core.events.unsubscribe(h_ev)
 
@@ -3321,8 +3315,8 @@ do
 
   -- Dropped gobugger bindings (dL/dE/dF) moved to the command surface
   -- per §10 — their replacements must respond.
-  local le_out = vim.api.nvim_exec2("AutoRun last-error", { output = true }).output
-  ok("dE replacement — :AutoRun last-error responds",
+  local le_out = vim.api.nvim_exec2("AutoRun doctor --last-error", { output = true }).output
+  ok("dE replacement — :AutoRun doctor --last-error responds",
     le_out:find("auto%-run") ~= nil, le_out)
   ok("dF replacement — doctor completion offers --fix",
     contains(vim.fn.getcompletion("AutoRun doctor ", "cmdline"), "--fix"))
@@ -4617,6 +4611,107 @@ local section36g = function()
   require("auto-run.store.paths").invalidate()
 end
 section36g()
+
+-- ── [36h] six commands, dispatching on kind (ADR 0199 §4.1) ──────────
+-- Fifteen subcommands shrink to six: run, debug, stop, env, doctor,
+-- import. `run` absorbs `test` and `debug` debugs a test config — both
+-- dispatch on the config's KIND. What the removed ones did lives in the panes
+-- (tests, jobs, list, show, scan), in doctor (validate, last-error) or in the
+-- Active-worktree selector (set-dir).
+print("\n[36h] :AutoRun — six commands, kind dispatch")
+local section36h = function()
+  local exec = require("auto-run.exec")
+  local darp = require("auto-run.dap")
+  local d = fx .. "/cmds"
+  ok("[36h] fixture repo", make_plain_repo(d))
+  local prev = worktree.get_active()
+  worktree.set_active(d)
+  require("auto-run.store.paths").invalidate()
+
+  local subs = vim.fn.getcompletion("AutoRun ", "cmdline")
+  table.sort(subs)
+  ok("[36h] :AutoRun offers exactly six subcommands",
+    vim.deep_equal(subs, { "debug", "doctor", "env", "import", "run", "stop" }), vim.inspect(subs))
+  for _, gone in ipairs({ "list", "show", "validate", "test", "jobs", "last-error", "tests", "scan", "set-dir" }) do
+    local out = vim.api.nvim_exec2("AutoRun " .. gone, { output = true }).output
+    ok(("[36h] :AutoRun %s is refused with the usage line"):format(gone),
+      out:find("usage: :AutoRun {", 1, true) ~= nil, out)
+  end
+
+  -- Kind dispatch, observed at the primitives each path must reach.
+  for _, c in ipairs({ { "cmd-test", "test" }, { "cmd-run", "run" }, { "cmd-debug", "debug" } }) do
+    store.add({ name = c[1], kind = c[2], runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  end
+  local calls = {}
+  local real = { tr = exec.test_run, st = exec.start, dt = darp.debug_test, ds = darp.debug_start }
+  exec.test_run = function(n) calls[#calls + 1] = "exec.test_run:" .. n; return { id = "x", strategy = "run" } end
+  exec.start = function(n) calls[#calls + 1] = "exec.start:" .. n; return { id = "x", strategy = "run" } end
+  darp.debug_test = function(n) calls[#calls + 1] = "dap.debug_test:" .. tostring(n); return true end
+  darp.debug_start = function(n) calls[#calls + 1] = "dap.debug_start:" .. n; return true end
+  local function via(cmd) calls = {}; pcall(vim.cmd, cmd); return calls[1] end
+  ok("[36h] run <test config> → exec.test_run", via("AutoRun run cmd-test") == "exec.test_run:cmd-test", vim.inspect(calls))
+  ok("[36h] run <run config> → exec.start", via("AutoRun run cmd-run") == "exec.start:cmd-run", vim.inspect(calls))
+  ok("[36h] debug <test config> → dap.debug_test", via("AutoRun debug cmd-test") == "dap.debug_test:cmd-test", vim.inspect(calls))
+  ok("[36h] debug <debug config> → dap.debug_start", via("AutoRun debug cmd-debug") == "dap.debug_start:cmd-debug", vim.inspect(calls))
+  exec.test_run, exec.start, darp.debug_test, darp.debug_start = real.tr, real.st, real.dt, real.ds
+
+  -- stop with no id: exec jobs only (a debug session has its own terminate).
+  local real_list, real_stop, real_select = exec.list, exec.stop, vim.ui.select
+  local stopped
+  exec.stop = function(id) stopped = id; return true end
+  exec.list = function() return { { id = "job-1", config = "a", pid = 1 } } end
+  stopped = nil; pcall(vim.cmd, "AutoRun stop")
+  ok("[36h] stop with no id and one running job stops it", stopped == "job-1", tostring(stopped))
+  exec.list = function() return { { id = "job-1", config = "a", pid = 1 }, { id = "job-2", config = "b", pid = 2 } } end
+  vim.ui.select = function(items, _, cb) cb(items[2], 2) end
+  stopped = nil; pcall(vim.cmd, "AutoRun stop")
+  ok("[36h] stop with no id and several running jobs asks which", stopped == "job-2", tostring(stopped))
+  exec.list = function() return {} end
+  local none = vim.api.nvim_exec2("AutoRun stop", { output = true }).output
+  ok("[36h] stop with nothing running says so", none:find("no running jobs", 1, true) ~= nil, none)
+  exec.list, exec.stop, vim.ui.select = real_list, real_stop, real_select
+
+  -- doctor absorbs validate and last-error.
+  local doc = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
+  ok("[36h] doctor carries the config validation", doc:find("config validation", 1, true) ~= nil, doc:sub(1, 300))
+  local real_ole, opened = darp.open_last_error, false
+  darp.open_last_error = function() opened = true; return true end
+  pcall(vim.cmd, "AutoRun doctor --last-error")
+  darp.open_last_error = real_ole
+  ok("[36h] doctor --last-error opens the captured DAP failure output", opened)
+
+  -- env profile replaces the old <leader>rp profile picker.
+  local real_snp, next_p = exec.set_next_profile, "unset"
+  exec.set_next_profile = function(n) next_p = n end
+  pcall(vim.cmd, "AutoRun env profile clear")
+  ok("[36h] env profile clear clears the next-run profile", next_p == nil, tostring(next_p))
+  exec.set_next_profile = real_snp
+  local ecomp = vim.fn.getcompletion("AutoRun env ", "cmdline")
+  ok("[36h] env completes select / clear / profile", vim.tbl_contains(ecomp, "profile"), vim.inspect(ecomp))
+
+  -- No message may send the user to a command that no longer exists.
+  local stale = {}
+  local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+  local files = vim.fn.globpath(root, "lua/**/*.lua", false, true)
+  vim.list_extend(files, vim.fn.globpath(root, "plugin/*.lua", false, true))
+  files[#files + 1] = root .. "/README.md"
+  for _, f in ipairs(files) do
+    for lnum, line in ipairs(vim.fn.readfile(f)) do
+      for _, gone in ipairs({ "list", "show", "validate", "test", "jobs", "last-error", "tests", "scan", "set-dir" }) do
+        if line:find(":AutoRun " .. gone:gsub("%-", "%%-") .. "%f[^%w%-]") then
+          stale[#stale + 1] = vim.fn.fnamemodify(f, ":~:.") .. ":" .. lnum
+        end
+      end
+    end
+  end
+  ok("[36h] no message, doc comment or README line names a removed :AutoRun subcommand",
+    #stale == 0, vim.inspect(stale))
+
+  for _, n in ipairs({ "cmd-test", "cmd-run", "cmd-debug" }) do pcall(store.remove, n, { tier = "tracked" }) end
+  worktree.set_active(prev)
+  require("auto-run.store.paths").invalidate()
+end
+section36h()
 
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
