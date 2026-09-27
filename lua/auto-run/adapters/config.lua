@@ -25,19 +25,36 @@
 
 local M = {}
 
----Name of the repo's picked `kind=test` config for `runtime`, or nil.
+---Name of the repo's `kind=test` config for `runtime`, or nil: the user's
+---PICK when it names a matching config, otherwise the first match in
+---`store.list()` order.
 ---@param runtime string   the adapter's name ("go", "jest", …)
 ---@return string? name
 function M.test_config_name(runtime)
   local ok, store = pcall(require, "auto-run.store")
   if not ok then return nil end
+  local matches = {}
   for _, c in ipairs(store.list()) do
     if not c.error and c.kind == "test"
         and (c.runtime == nil or c.runtime == runtime) then
-      return c.name
+      matches[#matches + 1] = c.name
     end
   end
-  return nil
+  if #matches == 0 then return nil end
+  -- The user's PICK wins over list order. The pick is the per-repo memory
+  -- exec.pick_config already honours (state.picks[kind] in the shared tier's
+  -- state.json); read through the store, which owns that file. Only a pick that
+  -- still names a matching config counts — a pick for another runtime, or one
+  -- whose config is gone, falls back to the first match rather than failing.
+  local picked
+  pcall(function()
+    local picks = store.read_state().picks
+    picked = type(picks) == "table" and picks.test or nil
+  end)
+  if type(picked) == "string" and vim.tbl_contains(matches, picked) then
+    return picked
+  end
+  return matches[1]
 end
 
 ---The picked `kind=test` config with the user's selections applied —
