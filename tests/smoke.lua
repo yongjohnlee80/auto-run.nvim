@@ -4362,6 +4362,76 @@ local section36e = function()
 end
 section36e()
 
+-- ── [36f] test picks are per RUNTIME (ADR 0199 r2 §3.2) ─────────────
+-- The pick memory held one name per KIND, so choosing a Rust test config
+-- silently replaced the Go one while the header showed them as independent —
+-- a hidden state change. Picks now persist per runtime (state.test_picks);
+-- the legacy per-kind pick stays as a fallback, so nothing already picked is
+-- lost.
+print("\n[36f] test picks are per runtime")
+local section36f = function()
+  local cfgm = require("auto-run.adapters.config")
+  local exec = require("auto-run.exec")
+  local d = fx .. "/picks-rt"
+  ok("[36f] fixture repo", make_plain_repo(d))
+  local prev_active = worktree.get_active()
+  worktree.set_active(d)
+  exec.clear_pick(nil); pcall(cfgm.pick, "go", nil); pcall(cfgm.pick, "rust", nil)
+  for _, c in ipairs({ { "go-unit", "go" }, { "go-int", "go" }, { "rs-unit", "rust" }, { "rs-int", "rust" } }) do
+    store.add({ name = c[1], kind = "test", runtime = c[2] }, { tier = "tracked" })
+  end
+  local function eff(rt) local n, src = cfgm.test_config_name(rt); return n, src end
+  local function first(rt)
+    for _, c in ipairs(store.list()) do
+      if c.kind == "test" and c.runtime == rt then return c.name end
+    end
+  end
+  local go_other = first("go") == "go-unit" and "go-int" or "go-unit"
+  local rs_other = first("rust") == "rs-unit" and "rs-int" or "rs-unit"
+
+  ok("[36f] the setter exists", type(cfgm.pick) == "function")
+  local changed
+  local h = core.events.subscribe("run.config:changed", function(p)
+    if p and p.action == "test_picked" then changed = p end
+  end)
+  local okp, perr = cfgm.pick("go", go_other)
+  ok("[36f] pick(go) succeeds", okp == true, tostring(perr))
+  ok("[36f] pick publishes run.config:changed {action=test_picked, runtime, name}",
+    changed and changed.runtime == "go" and changed.name == go_other, vim.inspect(changed))
+  core.events.unsubscribe(h)
+
+  cfgm.pick("rust", rs_other)
+  local gn, gs = eff("go"); local rn, rs = eff("rust")
+  ok("[36f] choosing for rust does NOT change go's pick",
+    gn == go_other and gs == "picked", ("go=%s (%s)"):format(tostring(gn), tostring(gs)))
+  ok("[36f] rust has its own pick", rn == rs_other and rs == "picked",
+    ("rust=%s (%s)"):format(tostring(rn), tostring(rs)))
+
+  local bad_ok, bad_err = cfgm.pick("go", rs_other)
+  ok("[36f] pick refuses a config that is not a test config for that runtime",
+    bad_ok == nil and type(bad_err) == "string", tostring(bad_err))
+  ok("[36f] …and the refused pick changed nothing", (eff("go")) == go_other)
+
+  -- Legacy per-kind pick: still honoured as a fallback, beaten by a runtime pick.
+  cfgm.pick("go", nil)
+  exec.remember_pick("test", go_other)
+  gn, gs = eff("go")
+  ok("[36f] the legacy per-kind pick still applies when no runtime pick exists",
+    gn == go_other and gs == "picked", ("go=%s (%s)"):format(tostring(gn), tostring(gs)))
+  cfgm.pick("go", first("go"))
+  ok("[36f] a runtime pick wins over the legacy pick", (eff("go")) == first("go"))
+
+  cfgm.pick("go", nil); exec.clear_pick(nil)
+  gn, gs = eff("go")
+  ok("[36f] clearing falls back to the first match", gn == first("go") and gs == "first",
+    ("go=%s (%s)"):format(tostring(gn), tostring(gs)))
+
+  cfgm.pick("rust", nil)
+  for _, n in ipairs({ "go-unit", "go-int", "rs-unit", "rs-int" }) do store.remove(n, { tier = "tracked" }) end
+  worktree.set_active(prev_active)
+end
+section36f()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
