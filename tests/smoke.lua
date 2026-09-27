@@ -5016,6 +5016,31 @@ local section36k = function()
   ok("[36k] a missing parent directory under the worktree is created", envm.create_file(nested) == true
     and vim.fn.filereadable(nested) == 1)
 
+  -- Lector r7: the bound is checked on REAL paths, and the create is exclusive.
+  local outside = fx .. "/mgmt-outside"
+  vim.fn.mkdir(outside, "p")
+  vim.uv.fs_symlink(outside, d .. "/.vscode")
+  local c4, e4 = envm.create_file(d .. "/.vscode/escape.env")
+  ok("[36k] a symlinked parent that leads outside the worktree is refused, and nothing is written there",
+    c4 == nil and e4 and e4.code == "outside_worktree" and vim.fn.filereadable(outside .. "/escape.env") == 0,
+    vim.inspect(e4))
+  local c5, e5 = envm.create_file(d .. "/deep/sub/x.env")
+  ok("[36k] a location env discovery does not scan is refused (the file would be invisible)",
+    c5 == nil and e5 and e5.code == "not_discoverable", vim.inspect(e5))
+  local c6, e6 = envm.create_file(d .. "/notes.txt")
+  ok("[36k] a name env discovery does not recognise is refused", c6 == nil and e6 and e6.code == "invalid_name",
+    vim.inspect(e6))
+  -- Exclusivity: fool the existence pre-check (a file appearing between check
+  -- and create); the create itself must still refuse rather than truncate.
+  write_file(d .. "/.env.race", "KEEP=1\n")
+  local real_stat = vim.uv.fs_stat
+  vim.uv.fs_stat = function(pth, ...) if pth == d .. "/.env.race" then return nil end return real_stat(pth, ...) end
+  local c7, e7 = envm.create_file(d .. "/.env.race")
+  vim.uv.fs_stat = real_stat
+  ok("[36k] the create is exclusive: a file that appears after the check is never truncated",
+    c7 == nil and e7 and e7.code == "already_exists" and vim.deep_equal(vim.fn.readfile(d .. "/.env.race"), { "KEEP=1" }),
+    vim.inspect(e7) .. vim.inspect(vim.fn.readfile(d .. "/.env.race")))
+
   -- remove_var
   write_file(nf, "# keep this comment\nA=1\nSECRET=hunter2\nB=2\n")
   evs = {}
