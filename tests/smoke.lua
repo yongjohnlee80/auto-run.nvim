@@ -4519,6 +4519,53 @@ local section36f = function()
 end
 section36f()
 
+-- ── [36g] one scaffold implementation (ADR 0199 §6.2) ───────────────
+-- Scaffolding lived inside the <leader>rc keymap callback, keyed on the
+-- CURRENT BUFFER's filetype. The panes' `a` runs with the panel as the
+-- current buffer, so it could not reuse it — a second copy would drift.
+-- adapters.scaffold(kind, name, runtime) is the one implementation.
+print("\n[36g] adapters.scaffold — one scaffold implementation")
+local section36g = function()
+  local reg = require("auto-run.adapters")
+  local d = fx .. "/scaffold-api"
+  ok("[36g] fixture repo", make_plain_repo(d))
+  local prev = worktree.get_active()
+  worktree.set_active(d)
+  require("auto-run.store.paths").invalidate()
+  ok("[36g] adapters.scaffold exists", type(reg.scaffold) == "function")
+  ok("[36g] adapters.scaffold_runtimes exists", type(reg.scaffold_runtimes) == "function")
+  if type(reg.scaffold) ~= "function" or type(reg.scaffold_runtimes) ~= "function" then
+    worktree.set_active(prev); return
+  end
+  local rts = reg.scaffold_runtimes()
+  ok("[36g] scaffold_runtimes lists the adapters that scaffold (go, rust), not jest",
+    vim.tbl_contains(rts, "go") and vim.tbl_contains(rts, "rust") and not vim.tbl_contains(rts, "jest"),
+    vim.inspect(rts))
+  local changed
+  local h = core.events.subscribe("run.config:changed", function(pl) changed = pl end)
+  local path, err = reg.scaffold("debug", "sc-go", "go")
+  core.events.unsubscribe(h)
+  local eff = path and store.get("sc-go")
+  ok("[36g] scaffold(debug, name, go) stores a go debug config and returns its file",
+    type(path) == "string" and vim.fn.filereadable(path) == 1 and eff and eff.kind == "debug"
+      and eff.runtime == "go", tostring(err) .. " " .. vim.inspect(eff))
+  ok("[36g] …and announces it (the panes re-render)", changed ~= nil, vim.inspect(changed))
+  local p2, e2 = reg.scaffold("run", "sc-plain", nil)
+  local eff2 = p2 and store.get("sc-plain")
+  ok("[36g] no runtime → the historical go-shaped default", eff2 and eff2.kind == "run"
+    and eff2.runtime == "go" and eff2.program == "${worktree}/cmd/sc-plain", tostring(e2) .. vim.inspect(eff2))
+  local p3, e3 = reg.scaffold("debug", "sc-go", "go")
+  ok("[36g] a duplicate name is refused, not overwritten", p3 == nil and type(e3) == "string", tostring(e3))
+  local p4, e4 = reg.scaffold("bogus", "sc-bad", "go")
+  ok("[36g] an unknown kind is refused", p4 == nil and type(e4) == "string", tostring(e4))
+  local p5, e5 = reg.scaffold("run", "", "go")
+  ok("[36g] an empty name is refused", p5 == nil and type(e5) == "string", tostring(e5))
+  for _, n in ipairs({ "sc-go", "sc-plain" }) do pcall(store.remove, n) end
+  worktree.set_active(prev)
+  require("auto-run.store.paths").invalidate()
+end
+section36g()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
@@ -5118,9 +5165,40 @@ do
       scaffold.cwd == rustws .. "/crateb", "cwd = " .. tostring(scaffold.cwd))
     rok("default_config scaffolds NO program (the cargo prebuild is the baseline)",
       scaffold.program == nil, "program = " .. tostring(scaffold.program))
+
+    -- Resolution follows the ACTIVE WORKTREE, not nvim's cwd (ADR 0199 §7.2).
+    -- The rust adapter fell back to vim.uv.cwd() when a config had no cwd and
+    -- (for scaffolding) no .rs buffer was current. The panes' `w` sets the
+    -- active worktree WITHOUT a cd, so the ordinary state is cwd=$WORKSPACE
+    -- with a Cargo project active — and that resolved "no Cargo metadata at
+    -- $WORKSPACE". A single-crate repo is the common shape. Own function
+    -- scope: the main chunk is at Lua's 200-local limit here.
+    ;(function()
+      local single = fx .. "/rs-single"
+      make_plain_repo(single)
+      write_file(single .. "/Cargo.toml", '[package]\nname = "single"\nversion = "0.1.0"\nedition = "2021"\n')
+      write_file(single .. "/src/main.rs", "fn main() {}\n")
+      local elsewhere = fx .. "/rs-elsewhere"; vim.fn.mkdir(elsewhere, "p")
+      local cwd0 = vim.fn.getcwd()
+      local prev = worktree.get_active()
+      worktree.set_active(single)
+      require("auto-run.store.paths").invalidate()
+      vim.cmd("cd " .. vim.fn.fnameescape(elsewhere))
+      vim.cmd("enew!")
+      local argv, aerr = R.build_run_argv({ name = "s", kind = "run", runtime = "rust" })
+      rok("a rust config with no cwd resolves Cargo from the ACTIVE worktree, not nvim's cwd",
+        argv ~= nil and table.concat(argv, " "):find("-p single", 1, true) ~= nil,
+        vim.inspect(argv) .. " err=" .. tostring(aerr))
+      local sc = R.default_config("run", "s")
+      rok("scaffolding with no .rs buffer resolves the crate from the ACTIVE worktree",
+        sc.cargo_package == "single" and sc.cwd == single, vim.inspect(sc))
+      vim.cmd("cd " .. vim.fn.fnameescape(cwd0))
+      worktree.set_active(prev)
+      require("auto-run.store.paths").invalidate()
+    end)()
   end
 
-  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 72 or 6
+  local RUST_MIN = (HAVE_CARGO and HAVE_RUST_TS) and 74 or 6
   ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
     rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
 end
