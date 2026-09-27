@@ -4536,6 +4536,20 @@ local section36f = function()
     store.write_state = real_ws
     core.events.unsubscribe(hf)
     ok("[36f] a remember_pick whose write fails announces nothing", #fired == 0, vim.inspect(fired))
+    -- clear_pick must REPORT its outcome: a caller that tells the user "cleared"
+    -- must not say so when the write failed and the pick is still there
+    -- (Lector M5b). Existing callers ignore the return, so this is additive.
+    exec.remember_pick("test", go_other)
+    store.write_state = function() return false, "injected: read-only" end
+    local cok, cerr = exec.clear_pick("test")
+    store.write_state = real_ws
+    ok("[36f] a clear_pick whose write fails returns (nil, err)",
+      cok == nil and type(cerr) == "string" and cerr:find("injected", 1, true) ~= nil,
+      ("ok=%s err=%s"):format(tostring(cok), tostring(cerr)))
+    ok("[36f] …and the pick is still there", (exec.picks() or {}).test == go_other, vim.inspect(exec.picks()))
+    local sok = exec.clear_pick("test")
+    ok("[36f] a successful clear_pick returns true", sok == true, tostring(sok))
+    ok("[36f] clearing nothing is not a failure either", exec.clear_pick("test") == true)
   end
 
   cfgm.pick("go", nil); exec.clear_pick(nil)
