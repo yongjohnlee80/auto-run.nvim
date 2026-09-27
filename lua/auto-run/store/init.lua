@@ -608,15 +608,58 @@ end
 ---clobber sibling keys already stored in that layer. `vim.NIL`
 ---values persist as JSON null tombstones; the layered merge rules
 ---apply at read time.
+---
+---`opts.kind = "profiles"` patches an env PROFILE instead (ADR 0199 §6.5):
+---the shared-local profile file when it exists, else a shared-local file is
+---created as an overlay on the tracked one — `get_profile` merges tracked
+---under shared, so the edit applies without rewriting a committed file.
 ---@param name string
 ---@param patch table
+---@param opts { kind: ("configs"|"profiles")? }?
 ---@return { name: string, layer: "shared"|"overrides", config: table }? result, string? err
-function M.update(name, patch)
+function M.update(name, patch, opts)
   if type(name) ~= "string" or name == "" then
     return nil, "update: name must be a non-empty string"
   end
   if type(patch) ~= "table" then
     return nil, "update: patch must be a table"
+  end
+  if opts and opts.kind == "profiles" then
+    local v = schema.validate_profile_fragment(patch)
+    if not v.ok then
+      return nil, "invalid profile patch: " .. table.concat(v.errors, "; ")
+    end
+    if patch.name ~= nil and patch.name ~= name then
+      return nil, "update: patch cannot rename a profile (remove + add instead)"
+    end
+    local existing = M.get_profile(name)
+    if not existing then return nil, "profile '" .. name .. "' not found" end
+    local dirs = paths.resolve_run_dirs()
+    local shared_path = record_path(dirs.shared, "profiles", name)
+    local data = {}
+    if fs_path.is_file(shared_path) then
+      local d, rerr = read_json(shared_path)
+      if rerr then return nil, rerr end
+      data = d or {}
+    else
+      scaffold_gitignore(dirs)
+    end
+    for k, val in pairs(patch) do
+      local rule = merge.FIELD_RULES[k]
+      if rule == "map" and type(val) == "table" and val ~= vim.NIL
+          and type(data[k]) == "table" and data[k] ~= vim.NIL then
+        for mk, mv in pairs(val) do data[k][mk] = mv end
+      else
+        data[k] = val
+      end
+    end
+    data.name = name
+    local okw, werr = write_json(shared_path, data)
+    if not okw then return nil, werr end
+    publish("run.config:changed", { name = name, action = "update", layer = "shared", kind = "profiles" })
+    local eff, gerr = M.get_profile(name)
+    if not eff then return nil, gerr end
+    return { name = name, layer = "shared", config = eff }, nil
   end
   local v = schema.validate_config_fragment(patch)
   if not v.ok then
@@ -681,18 +724,22 @@ end
 ---Remove a config file. `opts.tier` narrows the deletion; default
 ---removes the shared-local file when present, else the tracked file.
 ---The config's `overrides.json` entry is dropped once no file
----remains in either tier.
+---remains in either tier. `opts.kind = "profiles"` removes an env profile
+---the same way (ADR 0199 §6.5).
 ---@param name string
----@param opts { tier: ("tracked"|"shared")? }?
+---@param opts { tier: ("tracked"|"shared")?, kind: ("configs"|"profiles")? }?
 ---@return boolean ok, string? err
 function M.remove(name, opts)
   opts = opts or {}
   if type(name) ~= "string" or name == "" then
     return false, "remove: name must be a non-empty string"
   end
+  -- `opts.kind = "profiles"` removes an env PROFILE (ADR 0199 §6.5), the
+  -- shared-local layer first, then the tracked one — never a config.
+  local kind = opts.kind == "profiles" and "profiles" or "configs"
   local dirs = paths.resolve_run_dirs()
-  local shared_path = record_path(dirs.shared, "configs", name)
-  local tracked_path = dirs.tracked and record_path(dirs.tracked, "configs", name) or nil
+  local shared_path = record_path(dirs.shared, kind, name)
+  local tracked_path = dirs.tracked and record_path(dirs.tracked, kind, name) or nil
 
   local target, tier
   if opts.tier == "shared" then
@@ -705,7 +752,7 @@ function M.remove(name, opts)
     target, tier = tracked_path, "tracked"
   end
   if not target or not fs_path.is_file(target) then
-    return false, "config '" .. name .. "' not found"
+    return false, (kind == "profiles" and "profile '" or "config '") .. name .. "' not found"
       .. (opts.tier and (" in the " .. opts.tier .. " tier") or "")
   end
 
@@ -716,7 +763,7 @@ function M.remove(name, opts)
   -- (best-effort: a corrupt overrides file is left for validate()).
   local still_tracked = tracked_path and fs_path.is_file(tracked_path)
   local still_shared = fs_path.is_file(shared_path)
-  if not still_tracked and not still_shared then
+  if kind == "configs" and not still_tracked and not still_shared then
     local entries = read_overrides(dirs)
     if entries and entries[name] ~= nil then
       entries[name] = nil
@@ -724,8 +771,8 @@ function M.remove(name, opts)
     end
   end
 
-  publish("run.config:changed", { name = name, action = "remove", tier = tier })
-  log.debug("store", "removed configs/" .. name .. " (" .. tier .. ")")
+  publish("run.config:changed", { name = name, action = "remove", tier = tier, kind = kind })
+  log.debug("store", "removed " .. kind .. "/" .. name .. " (" .. tier .. ")")
   return true, nil
 end
 

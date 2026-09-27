@@ -646,6 +646,81 @@ end
 ---@type (fun(refs: AutoRunSecretRef[]): table<string, string>?, string?)|nil
 local _secret_resolver = nil
 
+---Remove `key`'s line from the env file at `path` — comments, blank lines and
+---every other entry are kept byte for byte. Announces
+---`run.env:changed {action="removed", path, key}` (the key only, never the
+---value). The panes' `D` on an env variable (ADR 0199 §6.5).
+---@param path string
+---@param key string
+---@return boolean? ok, table? err  structured {code=...}
+function M.remove_var(path, key)
+  if not M.valid_env_key(key) then
+    return nil, structured_err("invalid_key",
+      "remove_var: '" .. tostring(key)
+      .. "' is not a valid environment variable name"
+      .. " ([A-Za-z_][A-Za-z0-9_]*)", { key = tostring(key) })
+  end
+  if type(path) ~= "string" or path == "" then
+    return nil, structured_err("invalid_args", "remove_var: path must be a string")
+  end
+  path = fs_path.normalize(path)
+  local ok, err = rewrite_env_file(path, function(lines)
+    local idx
+    for i, line in ipairs(lines) do
+      local e = parse_entry_line(line)
+      if e and e.key == key then idx = i end
+    end
+    if not idx then
+      return nil, structured_err("not_found",
+        "remove_var: key '" .. key .. "' not found in " .. path, { key = key })
+    end
+    table.remove(lines, idx)
+    return true
+  end)
+  if not ok then return nil, err end
+  publish("run.env:changed", { action = "removed", path = path, key = key })
+  return true, nil
+end
+
+---Create an EMPTY env file at `path`, making a missing parent directory. The
+---path must lie under the store anchor's worktree root or its bare-repo
+---container — env files belong to the repository they configure — and an
+---existing file is refused, never truncated. Announces
+---`run.env:changed {action="created", path}`. The panes' `n` (ADR 0199 §6.5);
+---a name discovery recognises (`.env`, `.env.*`, `*.env` at the root,
+---`.config/` or `.vscode/`) is listed at once.
+---@param path string
+---@return boolean? ok, table? err  structured {code=...}
+function M.create_file(path)
+  if type(path) ~= "string" or path == "" then
+    return nil, structured_err("invalid_args", "create_file: path must be a string")
+  end
+  path = fs_path.normalize(vim.fn.expand(path))
+  local dirs = require("auto-run.store").resolve_run_dirs()
+  local root = dirs.root or dirs.anchor
+  local inside = (root and fs_path.is_under(path, root))
+    or (dirs.container and fs_path.is_under(path, dirs.container))
+  if not inside then
+    return nil, structured_err("outside_worktree",
+      "create_file: " .. path .. " is outside the worktree (" .. tostring(root) .. ")",
+      { path = path })
+  end
+  if vim.uv.fs_stat(path) then
+    return nil, structured_err("already_exists",
+      "create_file: " .. path .. " already exists", { path = path })
+  end
+  local parent = fs_path.parent(path)
+  if vim.fn.isdirectory(parent) == 0 and vim.fn.mkdir(parent, "p") == 0 then
+    return nil, structured_err("write_failed", "create_file: cannot create " .. parent)
+  end
+  local okw, werr = require("auto-core.fs.atomic").write(path, "")
+  if not okw then
+    return nil, structured_err("write_failed", "create_file: " .. tostring(werr))
+  end
+  publish("run.env:changed", { action = "created", path = path })
+  return true, nil
+end
+
 ---Register the secret-materialization hook (the gcp-env flow plugs
 ---in here in a later phase). `fn(refs) → values_by_key | nil, err`.
 ---Pass nil to clear.

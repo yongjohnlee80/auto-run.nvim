@@ -230,6 +230,14 @@ function M.validate_profile(t)
   return validate_against(t, PROFILE_FIELDS, { name = true }, "env profile")
 end
 
+---Validate a profile PATCH (store.update with kind=profiles): the profile
+---field catalog, nothing required.
+---@param t table
+---@return { ok: boolean, errors: string[] }
+function M.validate_profile_fragment(t)
+  return validate_against(t, PROFILE_FIELDS, {}, "profile fragment")
+end
+
 ---Is `name` usable as a config/profile name (and therefore filename)?
 ---@param name any
 ---@return boolean ok, string? err
