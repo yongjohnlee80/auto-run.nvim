@@ -500,8 +500,9 @@ end
 
 -- ── scaffold capability (ADR 0194 §2.3.4) ───────────────────────
 
----Scaffold defaults for a new Go config — the shape `<leader>rc` used to
----hardcode, now reached through the adapter so scaffolding is language-generic.
+---Scaffold defaults for a new Go config — the shape the old scaffold keymap
+---hardcoded, now reached through the adapter (adapters.scaffold) so
+---scaffolding is language-generic.
 ---@param kind "run"|"test"|"debug"
 ---@param name string?
 ---@return table

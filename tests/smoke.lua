@@ -1668,21 +1668,23 @@ do
   ok("lazy field resolves through merge+substitution on evaluation",
     echo_entry and echo_entry.program() == "sh")
 
-  -- default_keymaps: §10 table registered with desc strings.
+  -- default_keymaps: the ADR 0199 §4.2 table (amending ADR-0048 §10)
+  -- registered with desc strings. Global maps only — the go-only attach keys
+  -- are buffer-local and asserted in [36i].
   auto_run.default_keymaps()
   local descs = {}
   for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
     if m.desc then descs[m.desc] = true end
   end
   local expected_descs = {
-    "Run: Pick Config & Run", "Run: Run Last", "Run: Nearest Test",
-    "Run: Current Test File", "Run: Pick Env Profile for Next Run",
-    "Run: New Run Config (scaffold)",
+    "Run: Nearest Test", "Debug: Nearest Test",
+    "Run: Current Test File", "Debug: Choose a Test in This File",
+    "Run: Pick an Entry Point", "Debug: Pick an Entry Point",
+    "Run: Again (last run)", "Debug: Again (last debug)",
     "Debug: Toggle Breakpoint", "Debug: Conditional Breakpoint",
-    "Debug: Clear Breakpoints", "Debug: Continue / Start",
-    "Debug: Nearest Test", "Debug: Entry Point (pick)",
-    "Debug: Attach to Remote dlv Server", "Debug: Terminate",
-    "Debug: Restart", "Debug: Doctor",
+    "Debug: Clear Breakpoints", "Debug: Continue (resume only)",
+    "Debug: Step Into", "Debug: Step Over", "Debug: Step Out",
+    "Debug: Terminate", "Debug: Restart",
     "Run: Continue / Start (dap)", "Run: Step Over (dap)",
     "Run: Step Into (dap)", "Run: Step Out (dap)",
   }
@@ -1690,7 +1692,7 @@ do
   for _, d in ipairs(expected_descs) do
     if not descs[d] then missing[#missing + 1] = d end
   end
-  ok("§10 keymap table registered (desc on everything)",
+  ok("§4.2 keymap table registered (desc on everything)",
     #missing == 0, vim.inspect(missing))
 
   -- Breakpoint persistence in the linked-worktree fixture.
@@ -4712,6 +4714,22 @@ local section36i = function()
     if ours(vim.fn.maparg("<leader>" .. k, "n", false, true)) then lingering[#lingering + 1] = k end
   end
   ok("[36i] the replaced keys are gone (rr, rc, dt, dm, dD)", #lingering == 0, vim.inspect(lingering))
+  -- …and nothing still TELLS the user to press one.
+  local stale = {}
+  local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p:h:h")
+  local files = vim.fn.globpath(root, "lua/**/*.lua", false, true)
+  vim.list_extend(files, vim.fn.globpath(root, "plugin/*.lua", false, true))
+  files[#files + 1] = root .. "/README.md"
+  for _, f in ipairs(files) do
+    for lnum, line in ipairs(vim.fn.readfile(f)) do
+      for _, k in ipairs({ "rr", "rc", "dt", "dm", "dD" }) do
+        if line:find("<leader>" .. k .. "%f[^%w]") then
+          stale[#stale + 1] = vim.fn.fnamemodify(f, ":~:.") .. ":" .. lnum .. " " .. k
+        end
+      end
+    end
+  end
+  ok("[36i] no message, doc comment or README line names a removed key", #stale == 0, vim.inspect(stale))
   local leader = vim.g.mapleader or "\\"
   local under_R = {}
   for _, m in ipairs(vim.api.nvim_get_keymap("n")) do

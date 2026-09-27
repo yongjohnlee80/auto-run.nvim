@@ -164,7 +164,8 @@ generic and applies to any adapter. So one repo can serve both:
   "env_files": ["${worktree}/.env.test"] }
 ```
 
-Create them with `:AutoRun` scaffolding (`<leader>rc`), by hand under
+Create them with `a` in auto-finder's tests or debug pane (adapter-aware
+scaffolding through `adapters.scaffold`), by hand under
 `.auto-run/configs/`, or by importing a `launch.json` (`:AutoRun import` —
 its `env` and `envFile` land as `env` and `env_files`).
 
@@ -497,39 +498,46 @@ require("auto-run").setup({
 -- Session-boundary + VimLeavePre flushes stay active even when disabled.
 ```
 
-## Default keymaps (ADR §10)
+## Default keymaps (ADR 0199 §4.2)
 
-`require("auto-run").default_keymaps()` — `<leader>r` = run/test,
-`<leader>d` = debug/DAP only, F-keys unchanged. Bindings are
-pcall-gated on their dependency and all carry `desc` strings.
+`require("auto-run").default_keymaps()`. `<leader>r` **launches** — lowercase
+runs, the same letter UPPERCASE debugs; `<leader>d` **controls** what is
+running. `<leader>r` is auto-run's alone (remote-sync.nvim's keys live under
+`<leader>R`). Bindings are pcall-gated on their dependency and all carry
+`desc` strings; override any with `vim.keymap.set` after this call.
 
-| Key | Action | Provenance |
+| Target | Run | Debug |
 |---|---|---|
-| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out | kept |
-| `<leader>rr` | run: pick config & run | new |
-| `<leader>rl` | run last | gobugger `dr` |
-| `<leader>rt` | run nearest test | new |
-| `<leader>rf` | run current test file | new |
-| `<leader>rp` | pick env profile for next run | new |
-| `<leader>rc` | new run config (scaffold) | gobugger `dM`/`dN` merged |
-| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints | kept |
-| `<leader>dc` | continue/start (dap) | kept |
-| `<leader>dt` | debug nearest test | gobugger `dt` |
-| `<leader>dm` | debug entry point (pick) | gobugger `dm` |
-| `<leader>da` / `dA` | attach PID / attach remote | kept |
-| `<leader>dv` / `dw` / `de` | dap-view / watch / eval | kept |
-| `<leader>dq` / `dR` | terminate / restart | kept |
-| `<leader>dD` | doctor | gobugger `dD` |
+| Nearest test | `<leader>rt` | `<leader>rT` |
+| Current file | `<leader>rf` — run the file | `<leader>rF` — choose a test in it |
+| Pick an entry point | `<leader>rp` | `<leader>rP` |
+| Again (last) | `<leader>rl` | `<leader>rL` |
 
-`<leader>rt` / `<leader>rf` run the discovery position nearest the
-cursor / the current file's position through the Phase 3 position
-engine; `<leader>dt` routes the same nearest resolution through
-`debug_position` for go test positions. Buffers no adapter claims
-fall back to the Phase 2 kind=test config path with a logged hint.
+`rp` / `rP` dispatch on the picked config's kind, the same rule as
+`:AutoRun run` / `debug`: a `kind=test` config runs as a test / debugs the test
+at the cursor. `rl` / `rL` replay the last run / debug that **actually
+launched**, from any surface — a key, a command or a pane (`auto-run.last`). A
+target that no longer exists, or a changed active worktree, is refused with a
+message rather than silently substituted. `rL` with no auto-run debug yet falls
+back to nvim-dap's own `run_last`.
 
-Dropped from keymaps (moved to panel/commands): `dL` reload (store
-auto-reloads), `dE` last error (`:AutoRun doctor --last-error`), `dF`
-fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
+| Key | Action |
+|---|---|
+| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out |
+| `<leader>dc` | **resume only** — with no session it names the keys that start one |
+| `<leader>di` / `do` / `dO` | step into / over / out (no F-keys needed) |
+| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints |
+| `<leader>dq` / `dR` | terminate / restart |
+| `<leader>dv` / `dw` / `de` | dap-view / watch / evaluate |
+| `<leader>da` / `dA` | delve attach PID / remote — **go buffers only** |
+
+`<leader>rt` / `<leader>rf` run the discovery position nearest the cursor / the
+current file's position through the position engine; `<leader>rT` routes the
+same nearest resolution through `debug_position`. Buffers no adapter claims
+fall back to the kind=test config path with a logged hint.
+
+Not keys: new configs → `a` in the panes; the env profile → `:AutoRun env
+profile`; diagnostics → `:AutoRun doctor` (`--last-error`, `--fix`).
 
 ## Requirements
 

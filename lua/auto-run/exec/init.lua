@@ -38,11 +38,7 @@ M.generate_run_id = job.generate_run_id
 -- ── session launch memory (module-local, declared before any
 --    closure that captures it — [[auto-core-maintenance]] #8) ─────
 
----Last successful launch `{ name, opts }` (for run_last).
----@type { name: string, opts: table }|nil
-local _last_launch = nil
-
----One-shot profile override set by `<leader>rp` (consumed by the
+---One-shot profile override set by `:AutoRun env profile` (consumed by the
 ---next start() whose opts carry no explicit profile).
 ---@type string|nil
 local _next_profile = nil
@@ -204,7 +200,7 @@ end
 ---@return table? launched, string? err, table? detail
 function M.start(name, opts)
   opts = opts or {}
-  -- One-shot profile override (<leader>rp): consumed by the first
+  -- One-shot profile override (:AutoRun env profile): consumed by the first
   -- launch that doesn't pass its own profile.
   if opts.profile == nil and _next_profile ~= nil then
     opts = vim.tbl_extend("force", {}, opts, { profile = _next_profile })
@@ -221,8 +217,8 @@ function M.start(name, opts)
   local strategy, serr = strategies.resolve(eff0.kind, opts)
   if not strategy then return nil, serr end
 
-  -- Replay memory for run_last (callbacks stripped — they belong to
-  -- the original invocation only).
+  -- Replay descriptor for Again (auto-run.last; callbacks stripped — they
+  -- belong to the original invocation only).
   local replay_opts = {}
   for k, v in pairs(opts) do
     if k ~= "on_exit" then replay_opts[k] = v end
@@ -238,7 +234,7 @@ function M.start(name, opts)
       if not okd then return nil, derr, detail end
     end
     M.remember_pick(eff0.kind, name)
-    _last_launch = { name = name, opts = replay_opts }
+    require("auto-run.last").record("run", { via = "config", name = name, opts = replay_opts })
     return { strategy = "dap", config = name }, nil
   end
 
@@ -282,7 +278,7 @@ function M.start(name, opts)
       return nil, p_err or "terminal provider failed"
     end
     M.remember_pick(prep.eff.kind, name)
-    _last_launch = { name = name, opts = replay_opts }
+    require("auto-run.last").record("run", { via = "config", name = name, opts = replay_opts })
     log.debug("exec", ("term launch %s via %s provider"):format(run_id, source))
     return { id = run_id, strategy = "term", provider = source, config = name }, nil
   end
@@ -300,26 +296,30 @@ function M.start(name, opts)
   })
   if not launched then return nil, sp_err end
   M.remember_pick(prep.eff.kind, name)
-  _last_launch = { name = name, opts = replay_opts }
+  require("auto-run.last").record("run", { via = "config", name = name, opts = replay_opts })
   return launched, nil
 end
 
----Re-run the most recent auto-run launch (any strategy). When this
----session hasn't launched anything yet, falls back to nvim-dap's
----`run_last()` — the gobugger `<leader>dr` behavior the `<leader>rl`
----binding inherits.
----@return table? launched, string? err, table? detail
+---Run the last RUN again — a config or a test position, whichever launched
+---last, from any surface (auto-run.last). A debug is replayed separately
+---(`require("auto-run.last").replay("debug")`, `<leader>rL`).
+---@return any launched, string? err
 function M.run_last()
-  if _last_launch then
-    return M.start(_last_launch.name, _last_launch.opts)
+  return require("auto-run.last").replay("run")
+end
+
+---Run a config, dispatching on its KIND (ADR 0199 §4.1): a kind=test config
+---runs as a test (`test_run`), anything else launches (`start`). The one
+---implementation `:AutoRun run` and `<leader>rp` share.
+---@param name string
+---@param opts AutoRunStartOpts?
+---@return table? launched, string? err, table? detail
+function M.run_config(name, opts)
+  local ok, eff = pcall(require("auto-run.store").get, name)
+  if ok and type(eff) == "table" and eff.kind == "test" then
+    return M.test_run(name, opts)
   end
-  local okd, dap = pcall(require, "dap")
-  if okd and type(dap.run_last) == "function" then
-    local okr, rerr = pcall(dap.run_last)
-    if not okr then return nil, "dap.run_last: " .. tostring(rerr) end
-    return { strategy = "dap" }, nil
-  end
-  return nil, "nothing to re-run yet (no launch this session)"
+  return M.start(name, opts)
 end
 
 -- ── test_run (Phase 2 scope: kind=test configs only) ────────────

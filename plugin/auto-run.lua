@@ -277,29 +277,14 @@ end
 
 -- ── run / debug / stop ─────────────────────────────────────────
 
----The kind of a named config, or nil when it does not resolve (the launch
----path then reports the store's own error).
----@param name string
----@return string?
-local function kind_of(name)
-  local ok, eff = pcall(require("auto-run.store").get, name)
-  return ok and type(eff) == "table" and eff.kind or nil
-end
-
----Run a config, dispatching on its kind: a kind=test config runs as a test
----(exec.test_run), anything else launches (exec.start). `run` absorbed the
----old `test` subcommand, so both paths must be reachable from here.
+---Run a config, dispatching on its kind (exec.run_config — the one
+---implementation <leader>rp shares): a kind=test config runs as a test,
+---anything else launches. `run` absorbed the old `test` subcommand.
 function HANDLERS.run(args)
   local name = args[1]
   local exec = require("auto-run.exec")
   local function launch(config_name)
-    local is_test = kind_of(config_name) == "test"
-    local launched, err
-    if is_test then
-      launched, err = exec.test_run(config_name)
-    else
-      launched, err = exec.start(config_name)
-    end
+    local launched, err = exec.run_config(config_name)
     if not launched then
       echo_err(err)
       return
@@ -327,20 +312,14 @@ function HANDLERS.run(args)
   end)
 end
 
----Debug a config, dispatching on its kind: a kind=test config debugs the test
----at the cursor with the config's flags and env (dap.debug_test); anything
----else starts a session (dap.debug_start).
+---Debug a config, dispatching on its kind (dap.debug_config — the one
+---implementation <leader>rP shares): a kind=test config debugs the test at the
+---cursor with the config's flags and env; anything else starts a session.
 function HANDLERS.debug(args)
   local name = args[1]
   local exec = require("auto-run.exec")
   local function launch(config_name)
-    local dap_bridge = require("auto-run.dap")
-    local ok, err
-    if kind_of(config_name) == "test" then
-      ok, err = dap_bridge.debug_test(config_name)
-    else
-      ok, err = dap_bridge.debug_start(config_name)
-    end
+    local ok, err = require("auto-run.dap").debug_config(config_name)
     if not ok then echo_err(err) end
   end
   if name and name ~= "" then
@@ -425,7 +404,7 @@ function HANDLERS.env(args)
     return
   end
   if action == "profile" then
-    -- The env PROFILE for the next launch (what <leader>rp used to pick).
+    -- The env PROFILE for the next launch (the old profile-picker keymap's job).
     local exec = require("auto-run.exec")
     local pname = args[2]
     if pname == nil or pname == "" then

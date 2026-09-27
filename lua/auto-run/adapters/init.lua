@@ -76,7 +76,7 @@ local M = {}
 --- no language checks. `go` and `rust` implement them; `jest` implements none.
 ---@field default_config? fun(kind: "run"|"test"|"debug", name: string?): table
 ---           OPTIONAL, sync. Scaffold defaults for a new config of `kind`
----           (`<leader>rc`), so scaffolding is language-generic.
+---           (`adapters.scaffold`), so scaffolding is language-generic.
 ---@field build_run_argv? fun(eff: table, opts: table?): string[]|nil, string?
 ---           OPTIONAL, sync. argv for the RUN/TERM strategy only — never a DAP
 ---           launch (that is prepare_debug*). Returns the base command; the
@@ -218,9 +218,9 @@ function M.scaffold_runtimes()
 end
 
 ---Create and store a new config of `kind` named `name`, with the defaults of
----the `runtime` adapter. The ONE scaffold implementation: `<leader>rc` passes
----the current buffer's adapter, and a pane — whose current buffer is the
----panel — passes the runtime the user chose. A runtime with no
+---the `runtime` adapter. The ONE scaffold implementation: the panes' `a`
+---passes the runtime the user chose (their current buffer is the panel, so no
+---filetype can pick it), and any other caller names one. A runtime with no
 ---`default_config` (or none) gets the historical go-shaped default.
 ---Publishes `run.config:changed` through `store.add`.
 ---@param kind "run"|"test"|"debug"

@@ -792,7 +792,7 @@ local function config_identity(eff, op)
   }, nil
 end
 
----Scaffold defaults for a new Rust config (`<leader>rc`), carrying Cargo
+---Scaffold defaults for a new Rust config (`adapters.scaffold`), carrying Cargo
 ---identity so the generated config is unambiguous in a workspace.
 ---@param kind "run"|"test"|"debug"
 ---@param _name string?

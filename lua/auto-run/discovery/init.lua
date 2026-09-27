@@ -927,6 +927,11 @@ function M.run_position(id, opts)
     runs[#runs + 1] = { id = s.run_id, adapter = s.adapter.name,
       position = s.position.id }
   end
+  -- Every spec's job spawned: this is what Again replays (auto-run.last). A
+  -- descriptor, not the jobs — a replay re-resolves config and env.
+  if #runs > 0 then
+    require("auto-run.last").record("run", { via = "position", id = id, opts = opts })
+  end
   return { position = id, runs = runs }, nil
 end
 
@@ -971,8 +976,14 @@ function M.debug_position(id)
           .. tostring(perr.message or perr.code))
         return
       end
-      local _, lerr = dap.launch(launch)
-      if lerr then log.error("discovery", lerr) end
+      local okl, lerr = dap.launch(launch)
+      if not okl then
+        log.error("discovery", lerr)
+        return
+      end
+      -- Recorded when the launch reached nvim-dap, never at this function's
+      -- synchronous return (the build can still fail or be cancelled).
+      require("auto-run.last").record("debug", { via = "position", id = id })
     end)
     return true, nil
   end

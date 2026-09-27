@@ -1,7 +1,7 @@
 ---auto-run.doctor — git/worktree diagnostics + repair (ADR-0048 §13).
 ---
----This is the live diagnostic surface behind `:AutoRun doctor` and
----`<leader>dD`; several modules render into it (`store.status`,
+---This is the live diagnostic surface behind `:AutoRun doctor`; several
+---modules render into it (`store.status`,
 ---`breakpoints.stats`, `exec.pick_memory`, `dap`). It depends on git and
 ---nothing else.
 ---
