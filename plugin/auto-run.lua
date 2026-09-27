@@ -60,7 +60,7 @@ function HANDLERS.import(args)
   echo_lines(lines)
 end
 
----Config validation lines (what `:AutoRun validate` printed), for doctor.
+---Config validation lines for doctor (the report the removed validate subcommand printed).
 ---@return string[]
 local function validation_lines()
   local report = require("auto-run.store").validate()
