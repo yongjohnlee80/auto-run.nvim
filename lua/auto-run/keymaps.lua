@@ -3,7 +3,7 @@
 ---Namespace split: `<leader>r` = run/test (new), `<leader>d` =
 ---debug/DAP only (slimmed). F-keys unchanged. Dropped from keymaps
 ---per §10 (moved to panel/commands): `dL` reload (store
----auto-reloads), `dE` last error (`:AutoRun last-error`), `dF`
+---auto-reloads), `dE` last error (`:AutoRun doctor --last-error`), `dF`
 ---fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
 ---
 ---Call `default_keymaps()` after `setup()`. Every binding is

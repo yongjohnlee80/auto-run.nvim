@@ -822,7 +822,7 @@ function M.run_position(id, opts)
   local node = tree:get(id)
   if not node then
     return nil, "position '" .. id .. "' not found — "
-      .. "discovery covers open buffers by default (:AutoRun scan for the full worktree)"
+      .. "discovery covers open buffers by default (the tests pane's S scans the full worktree)"
   end
 
   local specs, berr = build_specs(tree, node)

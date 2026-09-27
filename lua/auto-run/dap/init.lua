@@ -136,7 +136,7 @@ local function flush_if_failed(reason_prefix)
   local trailer = ""
   if #full > 600 then
     preview = full:sub(1, 600)
-    trailer = "\n\n...(truncated; :AutoRun last-error for full output)"
+    trailer = "\n\n...(truncated; :AutoRun doctor --last-error for full output)"
   end
 
   vim.schedule(function()

@@ -748,8 +748,8 @@ end
 ---Schema-check every config + profile file in both tiers, inspect
 ---the shared tier's overrides.json (parse + per-entry fragment
 ---shape), then run extends resolution for every config name (cycles,
----dangling targets). Backs `:AutoRun validate` and the `run.validate`
----verb.
+---dangling targets). Backs `:AutoRun doctor`'s config validation and the
+---`run.validate` verb.
 ---@return { ok: boolean, checked: integer, issues: { file: string?, name: string, tier: string?, errors: string[] }[] }
 function M.validate()
   local dirs = paths.resolve_run_dirs()

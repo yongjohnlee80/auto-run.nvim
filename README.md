@@ -66,8 +66,7 @@ lua/auto-run/
 ├── keymaps.lua          -- default_keymaps() (§10 table)
 └── mailbox/commands.lua -- run.* verb SPECS + register_all()
 
-plugin/auto-run.lua      -- :AutoRun {list|show|validate|import|doctor|set-dir
-                         --          |run|debug|test|stop|jobs|last-error|tests|scan|env}
+plugin/auto-run.lua      -- :AutoRun {run|debug|stop|env|doctor|import}
 tests/smoke.lua          -- nvim -n -i NONE --headless -u tests/smoke.lua -c 'qa!'
 ```
 
@@ -81,16 +80,20 @@ require("auto-run").setup()
 require("auto-run").default_keymaps()   -- optional: the §10 layout below
 ```
 
-- `:AutoRun run [name]` / `:AutoRun test [name]` / `:AutoRun debug
-  [name]` — launch a config (picker with per-repo pick memory when
-  the name is omitted).
-- `:AutoRun jobs` / `:AutoRun stop <run-id>` — session job inventory
-  and control. Stop only ever signals jobs auto-run started, and it
+Six subcommands (ADR 0199 §4.1). Listings — configs, jobs, the discovered
+test tree — live in auto-finder's tests and debug panes, which render them
+live; a full discovery scan is the tests pane's `S`.
+
+- `:AutoRun run [name]` / `:AutoRun debug [name]` — run or debug a config,
+  **dispatching on its kind**: a `kind=test` config runs as a test
+  (`exec.test_run`) or debugs the test at the cursor with that config's flags
+  and env (`dap.debug_test`); `run`/`debug` configs launch (`exec.start` /
+  `dap.debug_start`). With no name, a picker with per-repo pick memory.
+- `:AutoRun stop [run-id]` — stop a running job; with no id, the only one, or
+  a choice among several. Covers exec jobs (a debug session ends with the
+  debugger's terminate). Stop only ever signals jobs auto-run started, and it
   signals the **process group**, not the handle (see below).
-- `:AutoRun tests` / `:AutoRun scan` — render the discovered position
-  tree (status glyphs from the last results) / run a bounded full
-  scan of the active worktree.
-- `:AutoRun doctor` — resolver output, git/worktree health (project
+- `:AutoRun doctor` — config validation, resolver output, git/worktree health (project
   root + marker, anchor `.git` kind incl. gitfile-target state,
   `git status`, common dir, go module root), configs per kind with
   the remembered session pick, test-adapter roots + discovery
@@ -99,12 +102,14 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   common dir (gobugger `fix_worktree` parity; survives a broken
   worktree gitfile via the container walk). Interactive-only —
   mutating, so never exposed as a mailbox verb.
-- `:AutoRun last-error` — replay the last failed-start dap capture in
-  a scratch buffer.
+- `:AutoRun doctor --last-error` — replay the last failed-start dap capture
+  in a scratch buffer.
 - `:AutoRun import` — one-shot launch.json migration into the
   tracked tier (`origin = "launch.json"` provenance).
 - `:AutoRun env [select <path>|clear]` — list/manage the per-repo
   selected env file (§4.2 below); `*` marks the selection.
+  `:AutoRun env profile [name|clear]` lists the store's env profiles or sets
+  the one applied to the next launch.
 - Mailbox verbs register automatically when the auto-core mailbox
   surface is present. `run.start` / `run.test_run` /
   `run.debug_start` are gated behind the `run.exec` trust capability
@@ -138,7 +143,7 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
 
 ### Configuring test runs (go and jest)
 
-Test discovery needs no configuration — `:AutoRun tests` finds positions as
+Test discovery needs no configuration — the tests pane finds positions as
 soon as an adapter recognises the project. A **`kind=test` config is only
 needed when a run needs something extra**: environment variables, an env
 file, or (go) build flags.
@@ -249,7 +254,7 @@ dir → file → namespace → test        ids: path  |  path::ns::name
 - **Lazy by default** (neotest pitfall #1): open test buffers are
   parsed on `BufReadPost` and re-parsed on `BufWritePost`
   (`discovery.open_buffers = false` disables). The full worktree
-  needs an explicit scan: `:AutoRun scan`, the tests panel's `S`, or
+  needs an explicit scan: the tests panel's `S`, or
   `discovery.scan(opts, cb)`.
 - **Bounded, cancelable scans**: hard caps
   (`discovery.max_files = 5000` candidate files,
@@ -523,7 +528,7 @@ engine; `<leader>dt` routes the same nearest resolution through
 fall back to the Phase 2 kind=test config path with a logged hint.
 
 Dropped from keymaps (moved to panel/commands): `dL` reload (store
-auto-reloads), `dE` last error (`:AutoRun last-error`), `dF`
+auto-reloads), `dE` last error (`:AutoRun doctor --last-error`), `dF`
 fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
 
 ## Requirements

@@ -1,11 +1,18 @@
 ---plugin/auto-run.lua — :AutoRun user command.
 ---
----Subcommands: list | show | validate | import | doctor [--fix] |
----set-dir (Phase 1) + run | debug | test | stop | jobs | last-error
----(Phase 2) + tests | scan (Phase 3 discovery) + env [select
----<path>|clear] (§4.2 r5 env-file selection). `doctor --fix` runs
----`git worktree repair` from the repo common dir (gobugger
----fix_worktree parity — interactive-only, never a mailbox verb).
+---Six subcommands (ADR 0199 §4.1):
+---  run [name]      run a config — a kind=test config runs as a test
+---  debug [name]    debug a config — a kind=test config debugs the test at
+---                  the cursor with that config's flags and env
+---  stop [id]       stop a running job (no id: the only one, or choose)
+---  env [select <path> | clear | profile [name|clear]]
+---  doctor [--fix | --last-error]   diagnostics, config validation,
+---                  worktree repair, the captured DAP failure output
+---  import [name]   one-way launch.json onboarding into the store
+---Listings the old subcommands printed (configs, jobs, the test tree) live
+---in the tests and debug panes; set-dir's role moved to the panes'
+---Active-worktree selector. `doctor --fix` runs `git worktree repair`
+---from the repo common dir (interactive-only, never a mailbox verb).
 ---Output goes through
 ---print()/nvim_echo (user-invoked, not a main path); errors are
 ---echoed, never vim.notify'd.
@@ -15,11 +22,7 @@ if vim.g.loaded_auto_run then
 end
 vim.g.loaded_auto_run = 1
 
-local SUBCOMMANDS = {
-  "list", "show", "validate", "import", "doctor", "set-dir",
-  "run", "debug", "test", "stop", "jobs", "last-error",
-  "tests", "scan", "env",
-}
+local SUBCOMMANDS = { "run", "debug", "stop", "env", "doctor", "import" }
 
 local function echo_lines(lines)
   print(table.concat(lines, "\n"))
@@ -30,60 +33,6 @@ local function echo_err(msg)
 end
 
 local HANDLERS = {}
-
-function HANDLERS.list()
-  local store = require("auto-run.store")
-  local configs = store.list()
-  if #configs == 0 then
-    echo_lines({ "auto-run: no configs (see :AutoRun doctor / :AutoRun import)" })
-    return
-  end
-  local lines = { "auto-run configs:" }
-  for _, c in ipairs(configs) do
-    if c.error then
-      lines[#lines + 1] = ("  %-24s ERROR: %s"):format(c.name, c.error)
-    else
-      lines[#lines + 1] = ("  %-24s %-6s %-8s [%s]"):format(
-        c.name, c.kind or "?", c.runtime or "-",
-        table.concat(c.layers, ","))
-    end
-  end
-  echo_lines(lines)
-end
-
-function HANDLERS.show(args)
-  local name = args[1]
-  if not name or name == "" then
-    echo_err("usage: :AutoRun show <name>")
-    return
-  end
-  local store = require("auto-run.store")
-  local eff, err, meta = store.get(name)
-  if not eff then
-    echo_err(err)
-    return
-  end
-  local lines = { "auto-run config '" .. name .. "'"
-    .. " (layers: " .. table.concat(meta.layers, " → ") .. ")" }
-  lines[#lines + 1] = vim.inspect(eff)
-  echo_lines(lines)
-end
-
-function HANDLERS.validate()
-  local store = require("auto-run.store")
-  local report = store.validate()
-  local lines = { ("auto-run validate: %d file(s) checked, %s"):format(
-    report.checked, report.ok and "all OK" or (#report.issues .. " issue(s)")) }
-  for _, issue in ipairs(report.issues) do
-    lines[#lines + 1] = "  " .. issue.name
-      .. (issue.tier and (" [" .. issue.tier .. "]") or "")
-      .. (issue.file and (" (" .. issue.file .. ")") or "")
-    for _, e in ipairs(issue.errors) do
-      lines[#lines + 1] = "    - " .. e
-    end
-  end
-  echo_lines(lines)
-end
 
 function HANDLERS.import(args)
   local import = require("auto-run.import")
@@ -111,7 +60,31 @@ function HANDLERS.import(args)
   echo_lines(lines)
 end
 
+---Config validation lines (what `:AutoRun validate` printed), for doctor.
+---@return string[]
+local function validation_lines()
+  local report = require("auto-run.store").validate()
+  local lines = { ("%d file(s) checked, %s"):format(
+    report.checked, report.ok and "all OK" or (#report.issues .. " issue(s)")) }
+  for _, issue in ipairs(report.issues) do
+    lines[#lines + 1] = "  " .. issue.name
+      .. (issue.tier and (" [" .. issue.tier .. "]") or "")
+      .. (issue.file and (" (" .. issue.file .. ")") or "")
+    for _, e in ipairs(issue.errors) do
+      lines[#lines + 1] = "    - " .. e
+    end
+  end
+  return lines
+end
+
 function HANDLERS.doctor(args)
+  -- `--last-error`: the captured output of the last failed DAP start.
+  if args and args[1] == "--last-error" then
+    if not require("auto-run.dap").open_last_error() then
+      echo_lines({ "auto-run: no captured dap failure output yet" })
+    end
+    return
+  end
   -- `--fix`: gobugger fix_worktree port — `git worktree repair` from
   -- the repo's common dir. Interactive-only (mutating): reachable
   -- here and nowhere on the mailbox surface.
@@ -184,6 +157,16 @@ function HANDLERS.doctor(args)
       or "<no go.mod found>")
   else
     lines[#lines + 1] = row("git info", "unavailable (" .. tostring(g) .. ")")
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "config validation"
+  lines[#lines + 1] = "─────────────────"
+  local okv, vlines = pcall(validation_lines)
+  if okv then
+    for _, l in ipairs(vlines) do lines[#lines + 1] = l end
+  else
+    lines[#lines + 1] = row("validation", "unavailable (" .. tostring(vlines) .. ")")
   end
 
   -- Per-kind config listing with the remembered pick markers
@@ -259,7 +242,7 @@ function HANDLERS.doctor(args)
       lines[#lines + 1] = row("adapters", table.concat(health.adapters, ", "))
     end
     lines[#lines + 1] = row("last error", health.last_error_captured
-      and "captured (:AutoRun last-error)" or "<none>")
+      and "captured (:AutoRun doctor --last-error)" or "<none>")
   else
     lines[#lines + 1] = row("dap bridge", "unavailable (" .. tostring(health) .. ")")
   end
@@ -292,13 +275,31 @@ function HANDLERS.doctor(args)
   echo_lines(lines)
 end
 
--- ── Phase 2 subcommands ─────────────────────────────────────────
+-- ── run / debug / stop ─────────────────────────────────────────
 
+---The kind of a named config, or nil when it does not resolve (the launch
+---path then reports the store's own error).
+---@param name string
+---@return string?
+local function kind_of(name)
+  local ok, eff = pcall(require("auto-run.store").get, name)
+  return ok and type(eff) == "table" and eff.kind or nil
+end
+
+---Run a config, dispatching on its kind: a kind=test config runs as a test
+---(exec.test_run), anything else launches (exec.start). `run` absorbed the
+---old `test` subcommand, so both paths must be reachable from here.
 function HANDLERS.run(args)
   local name = args[1]
   local exec = require("auto-run.exec")
   local function launch(config_name)
-    local launched, err = exec.start(config_name)
+    local is_test = kind_of(config_name) == "test"
+    local launched, err
+    if is_test then
+      launched, err = exec.test_run(config_name)
+    else
+      launched, err = exec.start(config_name)
+    end
     if not launched then
       echo_err(err)
       return
@@ -318,7 +319,7 @@ function HANDLERS.run(args)
   exec.pick_config({ "run", "test", "debug" }, function(picked, reason)
     if not picked then
       if reason == "no_matches" then
-        echo_err("no configs — :AutoRun import or create one under .auto-run/configs/")
+        echo_err("no configs — :AutoRun import, or `a` in the debug pane")
       end
       return
     end
@@ -326,21 +327,30 @@ function HANDLERS.run(args)
   end)
 end
 
+---Debug a config, dispatching on its kind: a kind=test config debugs the test
+---at the cursor with the config's flags and env (dap.debug_test); anything
+---else starts a session (dap.debug_start).
 function HANDLERS.debug(args)
   local name = args[1]
   local exec = require("auto-run.exec")
   local function launch(config_name)
-    local ok, err = require("auto-run.dap").debug_start(config_name)
+    local dap_bridge = require("auto-run.dap")
+    local ok, err
+    if kind_of(config_name) == "test" then
+      ok, err = dap_bridge.debug_test(config_name)
+    else
+      ok, err = dap_bridge.debug_start(config_name)
+    end
     if not ok then echo_err(err) end
   end
   if name and name ~= "" then
     launch(name)
     return
   end
-  exec.pick_config("debug", function(picked, reason)
+  exec.pick_config({ "debug", "run", "test" }, function(picked, reason)
     if not picked then
       if reason == "no_matches" then
-        echo_err("no kind=debug configs")
+        echo_err("no configs — :AutoRun import, or `a` in the debug pane")
       end
       return
     end
@@ -348,124 +358,33 @@ function HANDLERS.debug(args)
   end)
 end
 
-function HANDLERS.test(args)
-  local name = args[1]
+---Stop a running job. With no id: the only running job, or a choice among
+---several. Covers exec jobs (run / test / term strategies) — a debug
+---session is ended by its own terminate (nvim-dap), not from here.
+function HANDLERS.stop(args)
   local exec = require("auto-run.exec")
-  local function launch(config_name)
-    local launched, err = exec.test_run(config_name)
-    if not launched then
+  local function stop(id)
+    local ok, err = exec.stop(id)
+    if not ok then
       echo_err(err)
       return
     end
-    echo_lines({ ("auto-run: %s (%s strategy)"):format(
-      launched.id or config_name, launched.strategy) })
+    echo_lines({ "auto-run: stop signal sent to " .. id })
   end
-  if name and name ~= "" then
-    launch(name)
-    return
-  end
-  exec.pick_config("test", function(picked, reason)
-    if not picked then
-      if reason == "no_matches" then
-        echo_err("no kind=test configs")
-      end
-      return
-    end
-    launch(picked)
-  end)
-end
-
-function HANDLERS.stop(args)
   local id = args[1]
-  if not id or id == "" then
-    echo_err("usage: :AutoRun stop <run-id>  (see :AutoRun jobs)")
-    return
-  end
-  local ok, err = require("auto-run.exec").stop(id)
-  if not ok then
-    echo_err(err)
-    return
-  end
-  echo_lines({ "auto-run: stop signal sent to " .. id })
-end
-
-function HANDLERS.jobs()
-  local jobs = require("auto-run.exec").list()
+  if id and id ~= "" then return stop(id) end
+  local jobs = exec.list({ active_only = true })
   if #jobs == 0 then
-    echo_lines({ "auto-run: no jobs this session" })
+    echo_lines({ "auto-run: no running jobs (a debug session ends with the debugger's terminate)" })
     return
   end
-  local lines = { "auto-run jobs:" }
-  for _, j in ipairs(jobs) do
-    local state = j.exited
-      and ("exited code=" .. tostring(j.code)
-        .. (j.signal and j.signal ~= 0 and (" signal=" .. j.signal) or ""))
-      or ("running pid=" .. tostring(j.pid))
-    lines[#lines + 1] = ("  %-24s %-20s %-10s %s"):format(j.id, j.config, j.strategy, state)
-    lines[#lines + 1] = "      " .. j.dir
+  if #jobs == 1 then return stop(jobs[1].id) end
+  local labels = {}
+  for i, j in ipairs(jobs) do
+    labels[i] = ("%s  %s  pid=%s"):format(j.id, tostring(j.config), tostring(j.pid))
   end
-  echo_lines(lines)
-end
-
-HANDLERS["last-error"] = function()
-  if not require("auto-run.dap").open_last_error() then
-    echo_lines({ "auto-run: no captured dap failure output yet" })
-  end
-end
-
--- ── Phase 3 subcommands ─────────────────────────────────────────
-
-local STATUS_GLYPH = {
-  passed = "✓", failed = "✗", skipped = "○", running = "●",
-}
-
-function HANDLERS.tests()
-  local discovery = require("auto-run.discovery")
-  discovery.refresh_open_buffers()
-  local results = discovery.results()
-  local tree = discovery.tree()
-  local counts = tree:counts()
-  local lines = { ("auto-run tests — %s (%d file(s), %d position(s))")
-    :format(tree.root.path, counts.files, counts.positions) }
-  if counts.files == 0 then
-    lines[#lines + 1] =
-      "  (none discovered — open a test file or run :AutoRun scan)"
-  end
-  local function render(node, indent)
-    for _, child in ipairs(node.children or {}) do
-      local r = results[child.id]
-      local glyph = r and (STATUS_GLYPH[r.status] or "?") or " "
-      local where = (child.type == "test" or child.type == "namespace")
-        and (":" .. tostring(child.lnum)) or ""
-      lines[#lines + 1] = ("  %s%s %s%s"):format(indent, glyph, child.name, where)
-      render(child, indent .. "  ")
-    end
-  end
-  render(tree.root, "")
-  echo_lines(lines)
-end
-
-function HANDLERS.scan()
-  local discovery = require("auto-run.discovery")
-  echo_lines({ "auto-run: scanning " .. discovery.tree().root.path .. " …" })
-  discovery.scan(nil, function(report)
-    if report.status == "canceled" then
-      echo_lines({ "auto-run: scan canceled (" .. tostring(report.reason) .. ")" })
-      return
-    end
-    local lines = {}
-    if report.status == "capped" then
-      lines[#lines + 1] = ("auto-run: scan hit the %s cap (%d ≥ %d) — %s")
-        :format(report.cap, report.seen, report.limit, report.hint)
-    end
-    lines[#lines + 1] = ("auto-run scan: %d candidate file(s), %d parsed, "
-      .. "%d cached, %d removed, %d root(s), %d error(s)")
-      :format(report.files, report.parsed, report.cached, report.removed,
-        report.roots, #report.errors)
-    for _, e in ipairs(report.errors) do
-      lines[#lines + 1] = "  error: " .. e.path .. ": " .. e.error
-    end
-    echo_lines(lines)
+  vim.ui.select(labels, { prompt = "auto-run: stop which job?" }, function(_, idx)
+    if idx then stop(jobs[idx].id) end
   end)
 end
 
@@ -505,6 +424,31 @@ function HANDLERS.env(args)
     echo_lines({ "auto-run: selected env file " .. envmod.get_selected() })
     return
   end
+  if action == "profile" then
+    -- The env PROFILE for the next launch (what <leader>rp used to pick).
+    local exec = require("auto-run.exec")
+    local pname = args[2]
+    if pname == nil or pname == "" then
+      local names = {}
+      for _, pr in ipairs(require("auto-run.store").list_profiles()) do names[#names + 1] = pr.name end
+      echo_lines({ #names > 0 and ("auto-run env profiles: " .. table.concat(names, ", ")
+        .. "  (:AutoRun env profile <name> applies one to the next launch)")
+        or "auto-run: no env profiles in the store" })
+      return
+    end
+    if pname == "clear" then
+      exec.set_next_profile(nil)
+      echo_lines({ "auto-run: next-launch profile cleared" })
+      return
+    end
+    local oks, perr = pcall(exec.set_next_profile, pname)
+    if not oks then
+      echo_err(perr)
+      return
+    end
+    echo_lines({ "auto-run: profile '" .. pname .. "' applies to the next launch" })
+    return
+  end
   if action == "clear" then
     local oks, err = envmod.set_selected(nil)
     if not oks then
@@ -514,22 +458,7 @@ function HANDLERS.env(args)
     echo_lines({ "auto-run: env-file selection cleared" })
     return
   end
-  echo_err("usage: :AutoRun env [select <path>|clear]")
-end
-
-HANDLERS["set-dir"] = function(args)
-  local store = require("auto-run.store")
-  local path = args[1]
-  if path == "" then path = nil end
-  if path == "-" then path = nil end
-  local dirs, err = store.set_dir(path)
-  if not dirs then
-    echo_err(err)
-    return
-  end
-  echo_lines({
-    ("auto-run shared tier: %s (origin=%s)"):format(dirs.shared, dirs.origin),
-  })
+  echo_err("usage: :AutoRun env [select <path>|clear|profile [name|clear]]")
 end
 
 vim.api.nvim_create_user_command("AutoRun", function(cmd)
@@ -547,7 +476,7 @@ vim.api.nvim_create_user_command("AutoRun", function(cmd)
   end
 end, {
   nargs = "*",
-  desc = "auto-run: run configs, execution, dap sessions (ADR-0048)",
+  desc = "auto-run: run / debug / stop / env / doctor / import (ADR 0199 §4.1)",
   complete = function(arglead, cmdline, _)
     -- Complete the subcommand in position 1; config names for the
     -- config-taking subcommands; run ids for `stop`.
@@ -559,8 +488,7 @@ end, {
       end, SUBCOMMANDS)
     end
     local sub = words[2]
-    if sub == "show" or sub == "import" or sub == "run"
-        or sub == "debug" or sub == "test" then
+    if sub == "import" or sub == "run" or sub == "debug" then
       local ok, store = pcall(require, "auto-run.store")
       if not ok then return {} end
       local names = {}
@@ -574,9 +502,16 @@ end, {
     if sub == "doctor" then
       return vim.tbl_filter(function(s)
         return s:sub(1, #arglead) == arglead
-      end, { "--fix" })
+      end, { "--fix", "--last-error" })
     end
     if sub == "env" then
+      if words[3] == "profile" and (#words == 3 or #words == 4 and arglead ~= "") then
+        local ok, store = pcall(require, "auto-run.store")
+        if not ok then return {} end
+        local names = { "clear" }
+        for _, pr in ipairs(store.list_profiles()) do names[#names + 1] = pr.name end
+        return vim.tbl_filter(function(n) return n:sub(1, #arglead) == arglead end, names)
+      end
       if words[3] == "select" and (#words == 3 or #words >= 4) then
         local ok, envmod = pcall(require, "auto-run.env")
         if not ok then return {} end
@@ -590,7 +525,7 @@ end, {
       end
       return vim.tbl_filter(function(s)
         return s:sub(1, #arglead) == arglead
-      end, { "select", "clear" })
+      end, { "select", "clear", "profile" })
     end
     if sub == "stop" then
       local ok, exec = pcall(require, "auto-run.exec")
