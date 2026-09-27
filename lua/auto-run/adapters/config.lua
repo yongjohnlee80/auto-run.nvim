@@ -52,17 +52,66 @@ function M.test_config_name(runtime)
   -- state.json); read through the store, which owns that file. Only a pick that
   -- still names a matching config counts — a pick for another runtime, or one
   -- whose config is gone, falls back to the first match rather than failing.
-  local picked
+  -- Per-RUNTIME pick first (state.test_picks[runtime], written by M.pick), then
+  -- the legacy per-KIND pick (state.picks.test, written by exec.pick_config) so
+  -- nothing a user already picked is lost. One name per kind could not hold a
+  -- Go choice and a Rust choice at once: picking one silently replaced the
+  -- other while the header showed them as independent (ADR 0199 r2 §3.2).
+  local rt_pick, legacy
   pcall(function()
-    local picks = store.read_state().picks
-    picked = type(picks) == "table" and picks.test or nil
+    local st = store.read_state()
+    rt_pick = type(st.test_picks) == "table" and st.test_picks[runtime] or nil
+    legacy = type(st.picks) == "table" and st.picks.test or nil
   end)
-  if type(picked) ~= "string" then picked = nil end
-  if picked and vim.tbl_contains(matches, picked) then
-    return picked, "picked", nil
+  if type(rt_pick) ~= "string" then rt_pick = nil end
+  if type(legacy) ~= "string" then legacy = nil end
+  for _, p in ipairs({ rt_pick, legacy }) do
+    if p and vim.tbl_contains(matches, p) then return p, "picked", nil end
   end
-  if #matches == 0 then return nil, "none", picked end
-  return matches[1], "first", picked
+  local ignored = rt_pick or legacy
+  if #matches == 0 then return nil, "none", ignored end
+  return matches[1], "first", ignored
+end
+
+---Remember the test config for ONE runtime (nil clears it). Refuses a name
+---that is not a `kind=test` config for that runtime, and changes nothing when
+---it refuses. Publishes `run.config:changed {action="test_picked", runtime,
+---name}` so the panes re-render — the same topic `import.set_selected` uses.
+---@param runtime string
+---@param name string?
+---@return true? ok, string? err
+function M.pick(runtime, name)
+  if type(runtime) ~= "string" or runtime == "" then
+    return nil, "pick: runtime must be a non-empty string"
+  end
+  local store = require("auto-run.store")
+  if name ~= nil then
+    local valid = false
+    for _, c in ipairs(store.list()) do
+      if not c.error and c.kind == "test" and c.name == name
+          and (c.runtime == nil or c.runtime == runtime) then
+        valid = true
+        break
+      end
+    end
+    if not valid then
+      return nil, ("pick: '%s' is not a test config for %s"):format(tostring(name), runtime)
+    end
+  end
+  local okw, werr = pcall(function()
+    local state = store.read_state()
+    state.test_picks = type(state.test_picks) == "table" and state.test_picks or {}
+    state.test_picks[runtime] = name
+    if next(state.test_picks) == nil then state.test_picks = nil end
+    store.write_state(state)
+  end)
+  if not okw then return nil, "pick: state.json write failed: " .. tostring(werr) end
+  local oke, events = pcall(require, "auto-core.events")
+  if oke and events then
+    pcall(events.publish, "run.config:changed",
+      { action = "test_picked", runtime = runtime, name = name })
+  end
+  return true, nil
 end
 
 ---The picked `kind=test` config with the user's selections applied —

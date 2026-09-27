@@ -4376,7 +4376,8 @@ local section36f = function()
   ok("[36f] fixture repo", make_plain_repo(d))
   local prev_active = worktree.get_active()
   worktree.set_active(d)
-  exec.clear_pick(nil); pcall(cfgm.pick, "go", nil); pcall(cfgm.pick, "rust", nil)
+  exec.clear_pick(nil)
+  if type(cfgm.pick) == "function" then cfgm.pick("go", nil); cfgm.pick("rust", nil) end
   for _, c in ipairs({ { "go-unit", "go" }, { "go-int", "go" }, { "rs-unit", "rust" }, { "rs-int", "rust" } }) do
     store.add({ name = c[1], kind = "test", runtime = c[2] }, { tier = "tracked" })
   end
@@ -4390,6 +4391,9 @@ local section36f = function()
   local rs_other = first("rust") == "rs-unit" and "rs-int" or "rs-unit"
 
   ok("[36f] the setter exists", type(cfgm.pick) == "function")
+  -- Without the setter every later call would raise and ABORT the suite, hiding
+  -- every section after this one. A regression must read as red, not as silence.
+  if type(cfgm.pick) ~= "function" then worktree.set_active(prev_active); return end
   local changed
   local h = core.events.subscribe("run.config:changed", function(p)
     if p and p.action == "test_picked" then changed = p end
