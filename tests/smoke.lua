@@ -5072,6 +5072,21 @@ local section36k = function()
   local nf2, nferr = store.update("no-such-prof", { runtime_env = { A = "1" } }, { kind = "profiles" })
   ok("[36k] updating a profile that does not exist is refused", nf2 == nil and tostring(nferr):find("not found", 1, true) ~= nil,
     tostring(nferr))
+  -- Where a record lives, per tier — what a pane's delete confirm must name
+  -- (it never rebuilds the store's layout itself).
+  local okf = type(store.files) == "function"
+  ok("[36k] store.files exists", okf)
+  if okf then
+    local tiers = store.files("mgmt-prof", { kind = "profiles" })
+    ok("[36k] store.files names both tiers of a profile with a local overlay",
+      tiers and tiers.tracked == tracked_path and type(tiers.shared) == "string" and vim.fn.filereadable(tiers.shared) == 1,
+      vim.inspect(tiers))
+    ok("[36k] config_file(name, {kind=profiles}) finds the profile's file",
+      store.config_file("mgmt-prof", { kind = "profiles" }) == tracked_path,
+      tostring(store.config_file("mgmt-prof", { kind = "profiles" })))
+    ok("[36k] store.files is empty for a name that is not there",
+      vim.deep_equal(store.files("no-such", { kind = "profiles" }), {}), vim.inspect(store.files("no-such", { kind = "profiles" })))
+  end
   local rm1 = store.remove("mgmt-prof", { kind = "profiles" })
   local after1 = store.get_profile("mgmt-prof")
   ok("[36k] store.remove (kind=profiles) removes the local layer first", rm1 == true and after1
