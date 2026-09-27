@@ -51,7 +51,7 @@ local function repo_identity(root)
 end
 
 ---Where auto-run is looking, and why.
----@return { anchor: string, source: "active"|"buffer"|"cwd", root: string?, is_repo: boolean, label: string, branch: string? }
+---@return { anchor: string, source: "active"|"cwd", root: string?, is_repo: boolean, label: string, branch: string? }
 function M.worktree()
   local anchor, source = require("auto-run.store.paths").anchor_with_source()
   local dirs = require("auto-run.store").resolve_run_dirs()

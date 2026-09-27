@@ -9,8 +9,9 @@
 ---Resolution contract (§2.1):
 ---
 ---  1. **Anchor** — `auto-core.git.worktree.get_active()`; only when
----     nil, the current buffer's directory, then `vim.fn.getcwd()`.
----     Never `get_workspace_root()` (conflates sibling repos).
+---     nil, `vim.fn.getcwd()`. Never the current buffer's directory
+---     (ADR 0199 §7.2 — it made resolution depend on window focus), and
+---     never `get_workspace_root()` (conflates sibling repos).
 ---  2. **Override** — a `run.set_dir` override for the anchor's repo
 ---     (keyed by the repo's common_dir) replaces the shared-local
 ---     tier; `origin = "override"`.
@@ -43,10 +44,16 @@ end
 
 -- ── anchor resolution ───────────────────────────────────────────
 
----The anchor AND how it was chosen: `"active"` (auto-core's active worktree),
----`"buffer"` (the current buffer's directory) or `"cwd"`. The source is what a
----pane header needs to say *why* it is looking where it is looking.
----@return string path, "active"|"buffer"|"cwd" source
+---The anchor AND how it was chosen: `"active"` (auto-core's active worktree)
+---or `"cwd"`. The source is what a pane header needs to say *why* it is
+---looking where it is looking.
+---
+---There is deliberately no current-buffer step (ADR 0199 §7.2). It used to
+---sit between the two, so the same pane resolved a different repository
+---depending on which window was current, and the discovery tree was rebuilt
+---whenever focus crossed a repo. The active worktree is auto-core's; with
+---none, the cwd is stable for the session and the header says so.
+---@return string path, "active"|"cwd" source
 function M.anchor_with_source()
   local ok, worktree = pcall(require, "auto-core.git.worktree")
   if ok and worktree then
@@ -55,19 +62,12 @@ function M.anchor_with_source()
       return fs_path.normalize(active), "active"
     end
   end
-  local bufname = vim.api.nvim_buf_get_name(0)
-  if bufname ~= "" and not bufname:match("^%w+://") then
-    local dir = fs_path.parent(fs_path.normalize(bufname))
-    if dir ~= "" and fs_path.is_dir(dir) then
-      return dir, "buffer"
-    end
-  end
   return fs_path.normalize(vim.fn.getcwd()), "cwd"
 end
 
 ---Resolve the anchor path for store resolution. Active worktree
----first; when unset, the current buffer's directory; last resort
----the cwd. Never the workspace root.
+---first; when unset, the cwd. Never the current buffer's directory,
+---never the workspace root.
 ---@return string absolute path
 function M.anchor()
   -- Parenthesised: exactly one value, so callers that pass anchor() as a
