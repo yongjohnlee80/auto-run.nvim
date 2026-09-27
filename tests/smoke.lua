@@ -4672,8 +4672,15 @@ local section36h = function()
   exec.list, exec.stop, vim.ui.select = real_list, real_stop, real_select
 
   -- doctor absorbs validate and last-error.
+  -- A broken config file must SHOW in doctor, by name: a header alone would
+  -- pass with the validation report emptied (measured — mutant K4 survived).
+  local tracked = store.resolve_run_dirs().tracked
+  write_file(tracked .. "/configs/cmd-broken.json", vim.json.encode({ name = "cmd-broken", kind = "nope" }) .. "\n")
   local doc = vim.api.nvim_exec2("AutoRun doctor", { output = true }).output
-  ok("[36h] doctor carries the config validation", doc:find("config validation", 1, true) ~= nil, doc:sub(1, 300))
+  ok("[36h] doctor carries the config validation, naming a broken config",
+    doc:find("config validation", 1, true) ~= nil and doc:find("file(s) checked", 1, true) ~= nil
+      and doc:find("cmd-broken", 1, true) ~= nil, doc:sub(1, 600))
+  os.remove(tracked .. "/configs/cmd-broken.json")
   local real_ole, opened = darp.open_last_error, false
   darp.open_last_error = function() opened = true; return true end
   pcall(vim.cmd, "AutoRun doctor --last-error")
