@@ -4161,6 +4161,78 @@ local section36c = function()
 end
 section36c()
 
+-- ── [36d] the SELECTED test config is the one that applies ──────────
+-- `test_config_name` returned the FIRST kind=test config in store.list()
+-- order and never read the per-repo pick memory (`state.picks[kind]`, written
+-- by exec.remember_pick and already honoured by exec.pick_config) — though its
+-- docstring called the result "the repo's picked config". With two test
+-- configs, list order silently decided which env and build flags a test got.
+-- Asserts the noun: what job.spawn receives.
+print("\n[36d] the selected test config is the one that applies")
+local section36d = function()
+  local d = fx .. "/pick-go"
+  ok("[36d] fixture repo", make_plain_repo(d))
+  write_file(d .. "/go.mod", "module pickgo\n\ngo 1.22\n")
+  write_file(d .. "/calc.go", "package pickgo\n\nfunc Add(a, b int) int { return a + b }\n")
+  write_file(d .. "/calc_test.go",
+    "package pickgo\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal() } }\n")
+  git(d, "add", "."); git(d, "commit", "-q", "-m", "fixture")
+
+  local prev_active = worktree.get_active()
+  worktree.set_active(d)
+  import.set_selected(nil); envmod.set_selected(nil)
+  local exec = require("auto-run.exec")
+  exec.clear_pick(nil)
+
+  for _, n in ipairs({ "pick-alpha", "pick-beta" }) do
+    store.add({ name = n, kind = "test", runtime = "go", env = { PICK_WHICH = n } }, { tier = "tracked" })
+  end
+  -- A test config for ANOTHER runtime: picking it must not hijack a go run.
+  store.add({ name = "pick-jest", kind = "test", runtime = "jest", env = { PICK_WHICH = "pick-jest" } },
+    { tier = "tracked" })
+
+  local disc = P3.discovery
+  local job = require("auto-run.exec.job")
+  local real_spawn, captured = job.spawn, nil
+  job.spawn = function(spec) captured = spec; return { id = spec.id }, nil end
+  local function which()
+    captured = nil
+    disc._reset_for_tests()
+    disc.parse_file(d .. "/calc_test.go", require("auto-run.adapters").get("go"))
+    disc.run_position(d .. "/calc_test.go::TestAdd")
+    return captured and captured.env and captured.env.PICK_WHICH or nil
+  end
+
+  -- The fallback, stated rather than assumed: with no pick, the first go test
+  -- config in store.list() order.
+  local first
+  for _, c in ipairs(store.list()) do
+    if c.kind == "test" and (c.runtime == nil or c.runtime == "go") then first = c.name break end
+  end
+  local other = (first == "pick-alpha") and "pick-beta" or "pick-alpha"
+  ok("[36d] control: with no pick, the first go test config applies",
+    first ~= nil and which() == first, ("first=%s got=%s"):format(tostring(first), tostring(which())))
+
+  exec.remember_pick("test", other)
+  ok("[36d] the PICKED test config applies, not the first in list order",
+    which() == other, ("picked=%s got=%s"):format(other, tostring(which())))
+
+  exec.remember_pick("test", "pick-jest")
+  ok("[36d] a pick for another runtime does not hijack a go run",
+    which() == first, ("got=%s"):format(tostring(which())))
+
+  exec.remember_pick("test", "pick-vanished")
+  ok("[36d] a stale pick (config gone) falls back to the first, with no error",
+    which() == first, ("got=%s"):format(tostring(which())))
+
+  job.spawn = real_spawn
+  exec.clear_pick(nil)
+  for _, n in ipairs({ "pick-alpha", "pick-beta", "pick-jest" }) do store.remove(n, { tier = "tracked" }) end
+  disc._reset_for_tests()
+  if prev_active then worktree.set_active(prev_active) end
+end
+section36d()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
