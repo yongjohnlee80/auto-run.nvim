@@ -40,36 +40,63 @@ function M.test_config_name(runtime)
   return nil
 end
 
----The picked `kind=test` config, substituted and env-composed.
+---The picked `kind=test` config with the user's selections applied —
+---the selected launch config merged under it as the active base, the
+---selected env file composed in — substituted and env-composed.
 ---
----`(nil, nil)` when the repo has no such config — a normal state, the adapter
----just runs without one. `(nil, err)` when the config EXISTS but composition
----fails: a missing `envFile` or an unresolvable secret must fail the run
----loudly, never silently drop the env the user configured.
+---`(nil, nil)` only when the repo has no such config AND nothing is selected —
+---a normal state, the adapter just runs without one. With no config but a
+---selection, the result carries the selection (`name` is nil). `(nil, err)`
+---when composition fails: a missing `envFile` or an unresolvable secret must
+---fail the run loudly, never silently drop the env the user configured.
 ---@param runtime string
 ---@return { name: string, eff: table, env: table<string,string>? }? applied, string? err
 function M.test_config(runtime)
   local picked = M.test_config_name(runtime)
-  if not picked then return nil, nil end
 
-  local store = require("auto-run.store")
-  local eff, gerr = store.get(picked)
-  if not eff then return nil, tostring(gerr) end
+  local eff
+  if picked then
+    local gerr
+    eff, gerr = require("auto-run.store").get(picked)
+    if not eff then return nil, tostring(gerr) end
+  else
+    -- No kind=test config is a NORMAL state, but it must not be a SILENT one.
+    -- The tests pane lets the user select a launch config and an env file, and
+    -- both have to reach the run whether or not the repo has a config. Compose
+    -- an empty test eff so they do; without this the selected env file was
+    -- dropped outright, because env.compose (which applies it) never ran.
+    eff = { kind = "test", runtime = runtime }
+  end
+
+  -- The selected launch config is the active BASE, merged UNDER `eff` with
+  -- `eff` winning — the same call exec/init.lua, dap.translate and
+  -- dap.debug_test already make. This was the one production path without it,
+  -- and it is the path the tests pane's own run action takes, so the Config
+  -- selected in that pane never reached a position run: neither its env nor
+  -- its build flags. apply_selected_base only fills program/args when `eff`
+  -- has none, and no adapter reads those from here — a position run targets
+  -- the POSITION.
+  eff = require("auto-run.import").apply_selected_base(eff)
 
   local env_mod = require("auto-run.env")
   local ctx = env_mod.context()
   eff = env_mod.substitute_deep(eff, ctx)
   local comp, cerr = env_mod.compose(eff, { ctx = ctx })
   if not comp then
-    return nil, "config '" .. picked .. "': "
-      .. (cerr and cerr.message or "env composition failed")
+    -- Loud, as before: a missing envFile or an unresolvable secret fails the
+    -- run rather than silently dropping env the user asked for.
+    return nil, (picked and ("config '" .. picked .. "'") or "test run selections")
+      .. ": " .. (cerr and cerr.message or "env composition failed")
   end
 
-  return {
-    name = picked,
-    eff  = eff,
-    env  = next(comp.env) ~= nil and comp.env or nil,
-  }, nil
+  local env = next(comp.env) ~= nil and comp.env or nil
+  -- Nothing configured AND nothing selected: keep the historical (nil, nil), so
+  -- an adapter's no-config path is unchanged rather than handed an empty table.
+  if not picked and env == nil and eff.build_flags == nil then
+    return nil, nil
+  end
+
+  return { name = picked, eff = eff, env = env }, nil
 end
 
 return M
