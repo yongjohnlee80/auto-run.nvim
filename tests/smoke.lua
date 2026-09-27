@@ -4977,6 +4977,90 @@ local section36j = function()
 end
 section36j()
 
+-- ── [36k] the store and env APIs the panes' management needs (ADR 0199 §6.5)
+-- After v0.1.15 a user still had to open files to delete an env variable,
+-- create an env file, or edit / delete an env profile. The panes can only
+-- offer those if the owner has them.
+print("\n[36k] env.create_file / remove_var, store profile update / remove")
+local section36k = function()
+  local envm = require("auto-run.env")
+  local d = fx .. "/mgmt"
+  ok("[36k] fixture repo", make_plain_repo(d))
+  local prev = worktree.get_active()
+  worktree.set_active(d)
+  require("auto-run.store.paths").invalidate()
+  ok("[36k] the APIs exist", type(envm.create_file) == "function" and type(envm.remove_var) == "function")
+  if type(envm.create_file) ~= "function" or type(envm.remove_var) ~= "function" then
+    worktree.set_active(prev); return
+  end
+  local evs = {}
+  local h = core.events.subscribe("run.env:changed", function(pl) evs[#evs + 1] = pl end)
+
+  -- create_file
+  local nf = d .. "/.env.local"
+  local cok, cerr = envm.create_file(nf)
+  ok("[36k] create_file makes an empty env file", cok == true and vim.fn.filereadable(nf) == 1
+    and #vim.fn.readfile(nf) == 0, tostring(cerr and cerr.message or cerr))
+  local listed = false
+  for _, c in ipairs(envm.files_list()) do if c.path == nf then listed = true end end
+  ok("[36k] …which env discovery lists at once", listed)
+  ok("[36k] …and it is announced", evs[#evs] and evs[#evs].action == "created" and evs[#evs].path == nf,
+    vim.inspect(evs[#evs]))
+  local c2, e2 = envm.create_file(nf)
+  ok("[36k] an existing file is refused, never truncated", c2 == nil and e2 and e2.code == "already_exists",
+    vim.inspect(e2))
+  local c3, e3 = envm.create_file(fx .. "/outside-the-worktree.env")
+  ok("[36k] a path outside the worktree is refused", c3 == nil and e3 and e3.code == "outside_worktree",
+    vim.inspect(e3))
+  local nested = d .. "/.config/dev.env"
+  ok("[36k] a missing parent directory under the worktree is created", envm.create_file(nested) == true
+    and vim.fn.filereadable(nested) == 1)
+
+  -- remove_var
+  write_file(nf, "# keep this comment\nA=1\nSECRET=hunter2\nB=2\n")
+  evs = {}
+  local rok, rerr = envm.remove_var(nf, "SECRET")
+  ok("[36k] remove_var drops exactly that line", rok == true
+    and vim.deep_equal(vim.fn.readfile(nf), { "# keep this comment", "A=1", "B=2" }),
+    tostring(rerr and rerr.message) .. vim.inspect(vim.fn.readfile(nf)))
+  ok("[36k] …and announces it without the value", evs[1] and evs[1].action == "removed" and evs[1].key == "SECRET"
+    and not vim.inspect(evs):find("hunter2", 1, true), vim.inspect(evs))
+  local r2, re2 = envm.remove_var(nf, "SECRET")
+  ok("[36k] removing a key that is not there is not_found", r2 == nil and re2 and re2.code == "not_found", vim.inspect(re2))
+  local r3, re3 = envm.remove_var(nf, "not a key")
+  ok("[36k] an invalid key is refused", r3 == nil and re3 and re3.code == "invalid_key", vim.inspect(re3))
+  core.events.unsubscribe(h)
+
+  -- profiles: update / remove, never rewriting a committed (tracked) file
+  local tracked_path = store.add({ name = "mgmt-prof", base_env_files = { "${worktree}/.env" } }, { kind = "profiles", tier = "tracked" })
+  ok("[36k] fixture: a tracked profile", type(tracked_path) == "string", tostring(tracked_path))
+  local before = table.concat(vim.fn.readfile(tracked_path), "\n")
+  local up, uerr = store.update("mgmt-prof", { runtime_env = { MODE = "dev" } }, { kind = "profiles" })
+  local prof = store.get_profile("mgmt-prof")
+  ok("[36k] store.update patches a profile (kind=profiles)", up ~= nil and prof and prof.runtime_env
+    and prof.runtime_env.MODE == "dev" and vim.deep_equal(prof.base_env_files, { "${worktree}/.env" }),
+    tostring(uerr) .. vim.inspect(prof))
+  ok("[36k] …in the local tier: the committed file is untouched",
+    table.concat(vim.fn.readfile(tracked_path), "\n") == before)
+  local bad, berr = store.update("mgmt-prof", { program = "x" }, { kind = "profiles" })
+  ok("[36k] a field profiles do not have is refused", bad == nil and type(berr) == "string", tostring(berr))
+  local nf2, nferr = store.update("no-such-prof", { runtime_env = { A = "1" } }, { kind = "profiles" })
+  ok("[36k] updating a profile that does not exist is refused", nf2 == nil and tostring(nferr):find("not found", 1, true) ~= nil,
+    tostring(nferr))
+  local rm1 = store.remove("mgmt-prof", { kind = "profiles" })
+  local after1 = store.get_profile("mgmt-prof")
+  ok("[36k] store.remove (kind=profiles) removes the local layer first", rm1 == true and after1
+    and after1.runtime_env == nil, vim.inspect(after1))
+  local rm2 = store.remove("mgmt-prof", { kind = "profiles" })
+  ok("[36k] …then the committed one; the profile is gone", rm2 == true and store.get_profile("mgmt-prof") == nil)
+  local cfg_left = store.get("mgmt-prof")
+  ok("[36k] removing a profile never touches a config of the same name", cfg_left == nil)
+
+  worktree.set_active(prev)
+  require("auto-run.store.paths").invalidate()
+end
+section36k()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
