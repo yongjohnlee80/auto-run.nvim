@@ -284,6 +284,30 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.16] — 2026-09-27 — the APIs for managing env files and profiles from the panes (ADR 0199 §6.5)
+
+Patch, additive. Pairs with auto-finder v0.5.3 (delete, test-config editing, env
+files and profiles in the panes). Reviewed by Lector (design + two rounds).
+
+- `env.create_file(path)` — an empty env file, created **exclusively**
+  (`O_EXCL`: an existing file is never truncated), only where env discovery
+  looks (root / `.config/` / `.vscode/` of the worktree or bare container) and
+  under a name it recognises, with containment checked on **real** paths (a
+  symlinked parent cannot escape). Discovery and `create_file` share one rule.
+- `env.remove_var(path, key)` — removes **every** line setting the key (parsing
+  is last-wins; removing one would resurface an older value) and announces the
+  key only.
+- Profiles: `store.update` / `store.remove` take `opts.kind = "profiles"`; an
+  update lands in the local tier (a tracked profile gets an overlay — a
+  committed file is never rewritten). `store.files(name, opts)` and
+  `config_file(name, { kind = "profiles" })` say where a record lives.
+- **List edits can replace.** A layer may carry `replace = { "<field>", … }`:
+  for append-rule fields (`env_files`, `base_env_files`, `secret_manifests`) its
+  value replaces what lower layers accumulated. `store.update(…, { replace })`
+  records it per call. Without it the layering rule is unchanged. (Before, an
+  edit of the effective list appended to itself — `[A]` edited to `[A,B]`
+  became `[A,A,B]`.)
+
 ## [v0.1.15] — 2026-09-27 — one run/debug model: stable environments, visible state, six commands (ADR 0199)
 
 Patch. Pairs with auto-finder v0.5.1 (the pane header and entry-point

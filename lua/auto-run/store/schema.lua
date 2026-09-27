@@ -41,6 +41,10 @@ local CONFIG_FIELDS = {
   profile          = "string",
   depends          = "string_list",
   tags             = "string_list",
+  -- Layer-level marker (ADR 0199 §6.5): append-rule fields whose value in
+  -- THIS layer replaces what lower layers accumulated. Never in an
+  -- effective record.
+  replace          = "string_list",
   params           = "params_map",
   origin           = "string",
   -- Profile-pipeline fields may also appear directly on a config
@@ -66,6 +70,10 @@ local PROFILE_FIELDS = {
   command_env      = "command_env_list",
   runtime_env      = "string_map",
   tags             = "string_list",
+  -- Layer-level marker (ADR 0199 §6.5): append-rule fields whose value in
+  -- THIS layer replaces what lower layers accumulated. Never in an
+  -- effective record.
+  replace          = "string_list",
   origin           = "string",
 }
 
@@ -228,6 +236,14 @@ end
 ---@return { ok: boolean, errors: string[] }
 function M.validate_profile(t)
   return validate_against(t, PROFILE_FIELDS, { name = true }, "env profile")
+end
+
+---Validate a profile PATCH (store.update with kind=profiles): the profile
+---field catalog, nothing required.
+---@param t table
+---@return { ok: boolean, errors: string[] }
+function M.validate_profile_fragment(t)
+  return validate_against(t, PROFILE_FIELDS, {}, "profile fragment")
 end
 
 ---Is `name` usable as a config/profile name (and therefore filename)?
