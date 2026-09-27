@@ -4334,12 +4334,25 @@ local section36e = function()
   local other = (first == "ctx-alpha") and "ctx-beta" or "ctx-alpha"
   local cases = {
     { label = "no pick",            pick = nil,           source = "first",  ignored = nil },
-    { label = "pick applies",       pick = other,         source = "picked", ignored = nil },
+    { label = "shared pick applies", pick = other,        source = "shared", ignored = nil },
     { label = "pick is jest's",     pick = "ctx-jest",    source = "first",  ignored = "ctx-jest" },
     { label = "pick has vanished",  pick = "ctx-gone",    source = "first",  ignored = "ctx-gone" },
+    -- A runtime pick that no longer applies must stay VISIBLE even when the
+    -- shared pick then does: the header would otherwise show the shared pick
+    -- as if it were this runtime's choice (Lector, M3a review).
+    { label = "stale runtime pick, shared applies", pick = other, rt_pick = "ctx-gone",
+      source = "shared", ignored = "ctx-gone" },
   }
+  local function set_rt_pick(name)
+    -- Written straight to state.json: pick() refuses a name that is not a
+    -- config, and a pick going STALE later is exactly the case under test.
+    local st = store.read_state()
+    st.test_picks = name and { go = name } or nil
+    store.write_state(st)
+  end
   for _, c in ipairs(cases) do
     exec.clear_pick(nil)
+    set_rt_pick(c.rt_pick)
     if c.pick then exec.remember_pick("test", c.pick) end
     local t = ctxm.test_config("go")
     local executed = ran()
@@ -4348,6 +4361,7 @@ local section36e = function()
     ok(("[36e] %s: source=%s, ignored_pick=%s"):format(c.label, c.source, tostring(c.ignored)),
       t.source == c.source and t.ignored_pick == c.ignored, vim.inspect(t))
   end
+  set_rt_pick(nil)
 
   -- One call for the whole header. After ran() the go test file is in the
   -- discovery tree, so resolve()'s DEFAULT runtimes must find go by itself.
@@ -4427,10 +4441,43 @@ local section36f = function()
   cfgm.pick("go", nil)
   exec.remember_pick("test", go_other)
   gn, gs = eff("go")
-  ok("[36f] the legacy per-kind pick still applies when no runtime pick exists",
-    gn == go_other and gs == "picked", ("go=%s (%s)"):format(tostring(gn), tostring(gs)))
+  ok("[36f] the shared per-kind pick still applies when no runtime pick exists, and says so",
+    gn == go_other and gs == "shared", ("go=%s (%s)"):format(tostring(gn), tostring(gs)))
   cfgm.pick("go", first("go"))
-  ok("[36f] a runtime pick wins over the legacy pick", (eff("go")) == first("go"))
+  ok("[36f] a runtime pick wins over the shared pick", (eff("go")) == first("go"))
+
+  -- "Clear" does not mean "use the first" while a shared pick exists — it
+  -- reveals the shared pick. The chooser must be able to SAY that, from the
+  -- same resolver, before the user picks it.
+  local has_fb = type(cfgm.fallback_config_name) == "function"
+  ok("[36f] fallback_config_name exists", has_fb)
+  if has_fb then
+    local fn, fsrc = cfgm.fallback_config_name("go")
+    ok("[36f] with a runtime pick set, the fallback names the shared pick",
+      fn == go_other and fsrc == "shared", ("fallback=%s (%s)"):format(tostring(fn), tostring(fsrc)))
+    ok("[36f] …and asking for the fallback changed nothing", (eff("go")) == first("go"))
+    cfgm.pick("go", nil)
+    ok("[36f] clearing the runtime pick lands exactly on the announced fallback",
+      (eff("go")) == fn, ("now=%s announced=%s"):format(tostring((eff("go"))), tostring(fn)))
+    cfgm.pick("go", first("go"))
+  end
+
+  -- A FAILED write must not read as success. store.write_state reports failure
+  -- by returning (false, err) — it does not raise — so a bare pcall around it
+  -- reported success and announced a pick that was never saved.
+  local real_write = store.write_state
+  local fired
+  local hw = core.events.subscribe("run.config:changed", function(p)
+    if p and p.action == "test_picked" then fired = p end
+  end)
+  store.write_state = function() return false, "injected: disk full" end
+  local wok, werr = cfgm.pick("go", go_other)
+  store.write_state = real_write
+  core.events.unsubscribe(hw)
+  ok("[36f] a failed state write fails the pick", wok == nil and type(werr) == "string"
+    and werr:find("injected", 1, true) ~= nil, ("ok=%s err=%s"):format(tostring(wok), tostring(werr)))
+  ok("[36f] …publishes nothing", fired == nil, vim.inspect(fired))
+  ok("[36f] …and the previous pick still applies", (eff("go")) == first("go"))
 
   cfgm.pick("go", nil); exec.clear_pick(nil)
   gn, gs = eff("go")
