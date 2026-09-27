@@ -166,22 +166,10 @@ function M.default_keymaps()
         vim.ui.input({ prompt = "config name: " }, function(name)
           if not name or name == "" then return end
           -- Scaffold defaults come from the buffer's adapter (ADR 0194 §2.3.4),
-          -- so a Rust buffer scaffolds a rust config and a Go buffer a go one.
-          -- Fall back to the go-shaped default for a buffer no adapter claims.
-          local adapter = require("auto-run.adapters").get(vim.bo.filetype)
-          local cfg
-          if adapter and type(adapter.default_config) == "function" then
-            cfg = adapter.default_config(kind, name)
-          else
-            cfg = {
-              runtime = "go",
-              program = kind == "test" and "${worktree}" or "${worktree}/cmd/" .. name,
-            }
-          end
-          cfg.name = name
-          cfg.kind = kind
-          local store = require("auto-run.store")
-          local path, err = store.add(cfg)
+          -- so a Rust buffer scaffolds a rust config and a Go buffer a go one;
+          -- adapters.scaffold falls back to the go-shaped default for a buffer
+          -- no adapter claims. One implementation, shared with the panes' `a`.
+          local path, err = require("auto-run.adapters").scaffold(kind, name, vim.bo.filetype)
           if not path then
             require("auto-run.log").error("keymaps", err)
             return
