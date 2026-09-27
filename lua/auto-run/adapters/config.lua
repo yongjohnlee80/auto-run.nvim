@@ -28,11 +28,18 @@ local M = {}
 ---Name of the repo's `kind=test` config for `runtime`, or nil: the user's
 ---PICK when it names a matching config, otherwise the first match in
 ---`store.list()` order.
+---
+---Also returns WHY, so a pane can state it without re-deriving the rule — a
+---second copy of this logic in a view is exactly what would let the header
+---disagree with what runs (ADR 0199 §5.2):
+---  `source` — `"picked"` | `"first"` | `"none"`
+---  `ignored_pick` — the remembered pick when it did NOT apply to `runtime`
+---  (another runtime's config, or a config that no longer exists), else nil.
 ---@param runtime string   the adapter's name ("go", "jest", …)
----@return string? name
+---@return string? name, "picked"|"first"|"none" source, string? ignored_pick
 function M.test_config_name(runtime)
   local ok, store = pcall(require, "auto-run.store")
-  if not ok then return nil end
+  if not ok then return nil, "none", nil end
   local matches = {}
   for _, c in ipairs(store.list()) do
     if not c.error and c.kind == "test"
@@ -40,7 +47,6 @@ function M.test_config_name(runtime)
       matches[#matches + 1] = c.name
     end
   end
-  if #matches == 0 then return nil end
   -- The user's PICK wins over list order. The pick is the per-repo memory
   -- exec.pick_config already honours (state.picks[kind] in the shared tier's
   -- state.json); read through the store, which owns that file. Only a pick that
@@ -51,10 +57,12 @@ function M.test_config_name(runtime)
     local picks = store.read_state().picks
     picked = type(picks) == "table" and picks.test or nil
   end)
-  if type(picked) == "string" and vim.tbl_contains(matches, picked) then
-    return picked
+  if type(picked) ~= "string" then picked = nil end
+  if picked and vim.tbl_contains(matches, picked) then
+    return picked, "picked", nil
   end
-  return matches[1]
+  if #matches == 0 then return nil, "none", picked end
+  return matches[1], "first", picked
 end
 
 ---The picked `kind=test` config with the user's selections applied —

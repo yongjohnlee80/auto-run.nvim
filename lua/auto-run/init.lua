@@ -101,6 +101,8 @@ local function resubscribe(events)
   }) do
     _subs[#_subs + 1] = events.subscribe(topic, function()
       paths.invalidate()
+      -- The header's cached branch/label belongs to the OLD root.
+      require("auto-run.context").invalidate()
     end)
   end
 end

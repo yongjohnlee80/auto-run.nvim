@@ -4233,6 +4233,135 @@ local section36d = function()
 end
 section36d()
 
+-- ── [36e] context — the one answer the pane headers read ─────────────
+-- ADR 0199 §5.2: the header states the active worktree, env file, shared base
+-- and per-runtime test config. The contract that matters is AGREEMENT: what the
+-- header reports must be what executes. So the test-config cells compare the
+-- context's answer with the env that actually reaches job.spawn, rather than
+-- asserting the context against a copy of the rule.
+print("\n[36e] context — the header's answer agrees with what runs")
+local section36e = function()
+  local ctxm = require("auto-run.context")
+  local d = fx .. "/ctx-go"
+  ok("[36e] fixture repo", make_plain_repo(d))
+  write_file(d .. "/go.mod", "module ctxgo\n\ngo 1.22\n")
+  write_file(d .. "/calc.go", "package ctxgo\n\nfunc Add(a, b int) int { return a + b }\n")
+  write_file(d .. "/calc_test.go",
+    "package ctxgo\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal() } }\n")
+  write_file(d .. "/.vscode/launch.json", vim.json.encode({ version = "0.2.0", configurations = {
+    { name = "CtxBase", type = "go", request = "launch", mode = "debug", program = "${workspaceFolder}" } } }))
+  write_file(d .. "/ctx.env", "CTX_ENV=1\n")
+  git(d, "add", "."); git(d, "commit", "-q", "-m", "fixture")
+
+  local prev_active = worktree.get_active()
+  local exec = require("auto-run.exec")
+  import.set_selected(nil); envmod.set_selected(nil); exec.clear_pick(nil)
+  ctxm._reset_for_tests()
+
+  -- Active worktree: where auto-run looks, and why.
+  worktree.set_active(d)
+  local w = ctxm.worktree()
+  ok("[36e] an active worktree is reported with source=active",
+    w.source == "active" and w.root == d and w.is_repo == true, vim.inspect(w))
+
+  local plain = fx .. "/ctx-not-a-repo"; vim.fn.mkdir(plain, "p")
+  worktree.set_active(plain)
+  w = ctxm.worktree()
+  ok("[36e] a directory that is not a repository says so (is_repo=false, no root)",
+    w.is_repo == false and w.root == nil and w.anchor == plain, vim.inspect(w))
+
+  worktree.set_active(nil)
+  vim.cmd("enew!")   -- an unnamed buffer: nothing to anchor on but the cwd
+  w = ctxm.worktree()
+  ok("[36e] with no active worktree and no file buffer the source is cwd",
+    w.source == "cwd", vim.inspect(w))
+  worktree.set_active(d)
+
+  -- Branch: from auto-core's repo_at when this auto-core has it.
+  local has_repo_at = type(require("auto-core.git.graph").repo_at) == "function"
+  ctxm.invalidate()
+  w = ctxm.worktree()
+  if has_repo_at then
+    ok("[36e] the branch is reported (auto-core repo_at present)", w.branch == "main", vim.inspect(w))
+    git(d, "checkout", "-q", "-b", "ctx-other")
+    ok("[36e] the branch is cached per root until invalidated",
+      ctxm.worktree().branch == "main")
+    ctxm.invalidate()
+    ok("[36e] invalidate re-reads the branch after a checkout",
+      ctxm.worktree().branch == "ctx-other", vim.inspect(ctxm.worktree()))
+    git(d, "checkout", "-q", "main")
+  else
+    ok("[36e] no repo_at in this auto-core: no branch, and no error", w.branch == nil, vim.inspect(w))
+  end
+
+  -- Env file: selected, missing, none.
+  ok("[36e] no env selected -> path nil", ctxm.env().path == nil)
+  envmod.set_selected(d .. "/ctx.env")
+  local e = ctxm.env()
+  ok("[36e] the selected env file is reported and exists", e.path == d .. "/ctx.env" and e.exists, vim.inspect(e))
+  os.remove(d .. "/ctx.env")
+  ok("[36e] a selected env file that vanished is reported as MISSING, not hidden",
+    ctxm.env().path == d .. "/ctx.env" and ctxm.env().exists == false, vim.inspect(ctxm.env()))
+  envmod.set_selected(nil)
+
+  -- Shared base.
+  ok("[36e] no base selected -> nil", ctxm.base().name == nil)
+  import.set_selected("CtxBase")
+  ok("[36e] the selected base is reported", ctxm.base().name == "CtxBase", vim.inspect(ctxm.base()))
+  import.set_selected(nil)
+
+  -- Test config — AGREEMENT with what reaches the spawn.
+  for _, n in ipairs({ "ctx-alpha", "ctx-beta" }) do
+    store.add({ name = n, kind = "test", runtime = "go", env = { CTX_WHICH = n } }, { tier = "tracked" })
+  end
+  store.add({ name = "ctx-jest", kind = "test", runtime = "jest", env = { CTX_WHICH = "ctx-jest" } },
+    { tier = "tracked" })
+  local disc = P3.discovery
+  local job = require("auto-run.exec.job")
+  local real_spawn, captured = job.spawn, nil
+  job.spawn = function(spec) captured = spec; return { id = spec.id }, nil end
+  local function ran()
+    captured = nil
+    disc._reset_for_tests()
+    disc.parse_file(d .. "/calc_test.go", require("auto-run.adapters").get("go"))
+    disc.run_position(d .. "/calc_test.go::TestAdd")
+    return captured and captured.env and captured.env.CTX_WHICH or nil
+  end
+  local first
+  for _, c in ipairs(store.list()) do
+    if c.kind == "test" and (c.runtime == nil or c.runtime == "go") then first = c.name break end
+  end
+  local other = (first == "ctx-alpha") and "ctx-beta" or "ctx-alpha"
+  local cases = {
+    { label = "no pick",            pick = nil,           source = "first",  ignored = nil },
+    { label = "pick applies",       pick = other,         source = "picked", ignored = nil },
+    { label = "pick is jest's",     pick = "ctx-jest",    source = "first",  ignored = "ctx-jest" },
+    { label = "pick has vanished",  pick = "ctx-gone",    source = "first",  ignored = "ctx-gone" },
+  }
+  for _, c in ipairs(cases) do
+    exec.clear_pick(nil)
+    if c.pick then exec.remember_pick("test", c.pick) end
+    local t = ctxm.test_config("go")
+    local executed = ran()
+    ok(("[36e] %s: the header's test config IS the one that runs"):format(c.label),
+      t.name ~= nil and t.name == executed, ("header=%s ran=%s"):format(tostring(t.name), tostring(executed)))
+    ok(("[36e] %s: source=%s, ignored_pick=%s"):format(c.label, c.source, tostring(c.ignored)),
+      t.source == c.source and t.ignored_pick == c.ignored, vim.inspect(t))
+  end
+
+  -- One call for the whole header.
+  local all = ctxm.resolve({ runtimes = { "go" } })
+  ok("[36e] resolve() carries every header field",
+    all.worktree and all.env and all.base and all.tests and all.tests.go ~= nil, vim.inspect(all))
+
+  job.spawn = real_spawn
+  exec.clear_pick(nil)
+  for _, n in ipairs({ "ctx-alpha", "ctx-beta", "ctx-jest" }) do store.remove(n, { tier = "tracked" }) end
+  disc._reset_for_tests(); ctxm._reset_for_tests()
+  worktree.set_active(prev_active)
+end
+section36e()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`

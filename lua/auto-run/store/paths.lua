@@ -43,26 +43,36 @@ end
 
 -- ── anchor resolution ───────────────────────────────────────────
 
----Resolve the anchor path for store resolution. Active worktree
----first; when unset, the current buffer's directory; last resort
----the cwd. Never the workspace root.
----@return string absolute path
-function M.anchor()
+---The anchor AND how it was chosen: `"active"` (auto-core's active worktree),
+---`"buffer"` (the current buffer's directory) or `"cwd"`. The source is what a
+---pane header needs to say *why* it is looking where it is looking.
+---@return string path, "active"|"buffer"|"cwd" source
+function M.anchor_with_source()
   local ok, worktree = pcall(require, "auto-core.git.worktree")
   if ok and worktree then
     local active = worktree.get_active()
     if active and active ~= "" then
-      return fs_path.normalize(active)
+      return fs_path.normalize(active), "active"
     end
   end
   local bufname = vim.api.nvim_buf_get_name(0)
   if bufname ~= "" and not bufname:match("^%w+://") then
     local dir = fs_path.parent(fs_path.normalize(bufname))
     if dir ~= "" and fs_path.is_dir(dir) then
-      return dir
+      return dir, "buffer"
     end
   end
-  return fs_path.normalize(vim.fn.getcwd())
+  return fs_path.normalize(vim.fn.getcwd()), "cwd"
+end
+
+---Resolve the anchor path for store resolution. Active worktree
+---first; when unset, the current buffer's directory; last resort
+---the cwd. Never the workspace root.
+---@return string absolute path
+function M.anchor()
+  -- Parenthesised: exactly one value, so callers that pass anchor() as a
+  -- trailing argument never pick up the source by accident.
+  return (M.anchor_with_source())
 end
 
 -- ── override registry (run.set_dir, ADR-0031 §3.3 pattern) ─────

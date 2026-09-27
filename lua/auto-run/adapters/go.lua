@@ -306,10 +306,11 @@ end
 
 -- ── effective kind=test config (gobugger run_test parity) ───────
 
----Name of the repo's first non-error kind=test config with a go (or
----unset) runtime — the config whose `build_flags`/env apply to every
----adapter-driven test run (and to `debug_position`'s debug_test).
----@return string?
+---The go test config — the user's pick when it names a go (or unset-runtime)
+---config, else the first match — whose `build_flags`/env apply to every
+---adapter-driven test run (and to `debug_position`'s debug_test). Passes
+---through the shared resolver's `(name, source, ignored_pick)`.
+---@return string? name, string source, string? ignored_pick
 function M.test_config_name()
   return require("auto-run.adapters.config").test_config_name(M.name)
 end
