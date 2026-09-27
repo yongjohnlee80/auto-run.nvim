@@ -4049,6 +4049,112 @@ local section36 = function()
 end
 section36()
 
+-- ── [36c] selections reach a POSITION run — the tests pane's own run ──
+-- The tests pane lets the user pick a launch config (`import.set_selected`,
+-- auto-finder _config_section.lua) and an env file (`env.set_selected`), and its
+-- `r` runs a position (`discovery.run_position`). Before this section existed,
+-- the suite proved the selected base reaches `dap.translate` ([30]) and never
+-- that it reaches a POSITION run — and it did not:
+--   • the selected launch config never reached a position run, env or build
+--     flags, because `adapters/config.lua:test_config` never called
+--     `import.apply_selected_base` (its three siblings do);
+--   • the selected env file reached one only when a kind=test config existed,
+--     because `test_config` returned before `env.compose` otherwise.
+-- ASSERT THE NOUN: what `job.spawn` receives is what the test process gets.
+-- Runs inside a FUNCTION — the main chunk is near Lua's 200-local cap.
+print("\n[36c] selections reach a position run (tests pane r)")
+local section36c = function()
+  local sel = fx .. "/sel-go"
+  ok("[36c] fixture repo", make_plain_repo(sel))
+  write_file(sel .. "/go.mod", "module selgo\n\ngo 1.22\n")
+  write_file(sel .. "/calc.go", "package selgo\n\nfunc Add(a, b int) int { return a + b }\n")
+  write_file(sel .. "/calc_test.go",
+    "package selgo\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal() } }\n")
+  write_file(sel .. "/.vscode/launch.json", vim.json.encode({ version = "0.2.0", configurations = {
+    { name = "SelBase", type = "go", request = "launch", mode = "debug",
+      program = "${workspaceFolder}/cmd/SELBASE_PROGRAM_MARKER",
+      args = { "--selbase-arg-marker" },
+      buildFlags = "-tags=selbase",
+      env = { SEL_FROM_BASE = "1", SEL_SHARED = "from-base" } } } }))
+  write_file(sel .. "/probe.env", "SEL_FROM_ENVFILE=1\n")
+  git(sel, "add", "."); git(sel, "commit", "-q", "-m", "fixture")
+
+  local prev_active = worktree.get_active()
+  worktree.set_active(sel)
+  import.set_selected(nil); envmod.set_selected(nil)
+
+  local disc = P3.discovery
+  local job = require("auto-run.exec.job")
+  local real_spawn, captured = job.spawn, nil
+  job.spawn = function(spec) captured = spec; return { id = spec.id }, nil end
+  local id = sel .. "/calc_test.go::TestAdd"
+  local function run_add()
+    captured = nil
+    disc._reset_for_tests()
+    disc.parse_file(sel .. "/calc_test.go", require("auto-run.adapters").get("go"))
+    local _, err = disc.run_position(id)
+    local argv = captured and table.concat(captured.cmd or {}, " ") or ""
+    return (captured and captured.env) or {}, argv, err, captured ~= nil
+  end
+
+  -- CONTROL — the instrument observes: a kind=test config's OWN env reaches
+  -- the spawn. If this is false every "absent" below means nothing.
+  store.add({ name = "sel-tests", kind = "test", runtime = "go",
+    env = { SEL_FROM_CONFIG = "1", SEL_SHARED = "from-config" } }, { tier = "tracked" })
+  local env, argv, err, spawned = run_add()
+  ok("[36c] control: a position run spawns", spawned, tostring(err))
+  ok("[36c] control: the kind=test config's own env reaches the spawn",
+    env.SEL_FROM_CONFIG == "1", vim.inspect(env))
+
+  -- A — the selected launch config reaches a position run.
+  ok("[36c] set_selected('SelBase')", import.set_selected("SelBase") == true)
+  env, argv = run_add()
+  ok("[36c] the selected base's env reaches a position run",
+    env.SEL_FROM_BASE == "1", vim.inspect(env))
+  ok("[36c] the selected base's build flags reach the position argv",
+    argv:find("-tags=selbase", 1, true) ~= nil, argv)
+  -- Precedence is apply_selected_base's, not a new rule: the config wins.
+  ok("[36c] the kind=test config's own key still wins over the base",
+    env.SEL_SHARED == "from-config", tostring(env.SEL_SHARED))
+
+  -- B — the selected env file, with a config present.
+  ok("[36c] env.set_selected(probe.env)", envmod.set_selected(sel .. "/probe.env") == true)
+  env = run_add()
+  ok("[36c] the selected env file reaches a position run (config present)",
+    env.SEL_FROM_ENVFILE == "1", vim.inspect(env))
+
+  -- C — NO kind=test config: both selections must still apply.
+  store.remove("sel-tests", { tier = "tracked" })
+  env, argv = run_add()
+  ok("[36c] with NO kind=test config the selected env file still applies",
+    env.SEL_FROM_ENVFILE == "1", vim.inspect(env))
+  ok("[36c] with NO kind=test config the selected base's env still applies",
+    env.SEL_FROM_BASE == "1", vim.inspect(env))
+  ok("[36c] with NO kind=test config the selected base's build flags still apply",
+    argv:find("-tags=selbase", 1, true) ~= nil, argv)
+  -- The base's program/args fill a config that has none — a position run must
+  -- never pick them up (the adapter targets the POSITION, not a program).
+  ok("[36c] the base's program never reaches a position argv",
+    argv:find("SELBASE_PROGRAM_MARKER", 1, true) == nil, argv)
+  ok("[36c] the base's args never reach a position argv",
+    argv:find("selbase-arg-marker", 1, true) == nil, argv)
+
+  -- D — nothing selected, nothing configured: the run is unchanged and
+  -- nothing is injected (the "no config is a normal state" contract).
+  import.set_selected(nil); envmod.set_selected(nil)
+  env, argv, err, spawned = run_add()
+  ok("[36c] no selection, no config: the run still spawns", spawned, tostring(err))
+  ok("[36c] no selection, no config: nothing is injected",
+    env.SEL_FROM_BASE == nil and env.SEL_FROM_ENVFILE == nil
+      and argv:find("selbase", 1, true) == nil, vim.inspect({ env = env, argv = argv }))
+
+  job.spawn = real_spawn
+  import.set_selected(nil); envmod.set_selected(nil)
+  disc._reset_for_tests()
+  if prev_active then worktree.set_active(prev_active) end
+end
+section36c()
+
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
 -- dap module, so keeping it here avoids polluting the `:AutoRun last-error`
