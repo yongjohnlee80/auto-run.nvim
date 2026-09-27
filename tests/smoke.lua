@@ -4856,6 +4856,24 @@ local section36j = function()
   okr, rerr = last.replay("run")
   ok("[36j] after a worktree change, Again refuses and names where the last run was",
     okr == nil and tostring(rerr):find(gofix, 1, true) ~= nil and #spawned == 0, tostring(rerr))
+  -- The anchor check on its own: a config NAME present in both worktrees would
+  -- otherwise re-run silently in the other repo (the position case above is
+  -- also refused by the discovery tree, so it cannot isolate this).
+  worktree.set_active(gofix); require("auto-run.store.paths").invalidate()
+  store.add({ name = "both-trees", kind = "run", runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  worktree.set_active(jestfix); require("auto-run.store.paths").invalidate()
+  store.add({ name = "both-trees", kind = "run", runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  worktree.set_active(gofix); require("auto-run.store.paths").invalidate()
+  P2.exec.start("both-trees")
+  worktree.set_active(jestfix); require("auto-run.store.paths").invalidate()
+  spawned = {}
+  okr, rerr = last.replay("run")
+  ok("[36j] a config name that exists in BOTH worktrees is not re-run in the other one",
+    okr == nil and tostring(rerr):find(gofix, 1, true) ~= nil and #spawned == 0,
+    tostring(rerr) .. " spawned=" .. #spawned)
+  store.remove("both-trees", { tier = "tracked" })
+  worktree.set_active(gofix); require("auto-run.store.paths").invalidate()
+  store.remove("both-trees", { tier = "tracked" })
   worktree.set_active(gofix)
   require("auto-run.store.paths").invalidate()
   disc._reset_for_tests()
@@ -4892,6 +4910,25 @@ local section36j = function()
   disc.debug_position = real_dp
   ok("[36j] Again (debug) debugs the same position", okr and replayed_id == fail_id, tostring(rerr))
   go.prepare_debug, darp.launch = real_pd, real_launch
+
+  -- A test-config debug replays from its file; a vanished config must be
+  -- refused BEFORE that jump moves the user.
+  local saved_dg = package.loaded["dap-go"]
+  package.loaded["dap-go"] = { debug_test = function() end, setup = function() end }
+  store.add({ name = "last-dbg", kind = "test", runtime = "go", program = "./calc" }, { tier = "tracked" })
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  darp.debug_test("last-dbg")
+  d = last.peek("debug")
+  ok("[36j] a test-config debug is recorded with where it resolved the test",
+    d and d.via == "test_config" and d.name == "last-dbg" and d.path == calc_test, vim.inspect(d))
+  store.remove("last-dbg", { tier = "tracked" })
+  vim.cmd("enew!")
+  local here_buf = vim.api.nvim_get_current_buf()
+  okr, rerr = last.replay("debug")
+  ok("[36j] a vanished test config is refused before the jump (the buffer stays put)",
+    okr == nil and tostring(rerr):find("last-dbg", 1, true) ~= nil and vim.api.nvim_get_current_buf() == here_buf,
+    tostring(rerr) .. " buf=" .. vim.api.nvim_buf_get_name(0))
+  package.loaded["dap-go"] = saved_dg
 
   -- rL with nothing recorded falls back to nvim-dap's own run_last.
   last._reset_for_tests()

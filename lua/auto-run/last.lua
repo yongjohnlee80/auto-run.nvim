@@ -85,14 +85,15 @@ function M.replay(mode)
   end
 
   if d.via == "position" then
+    -- A position that is gone is refused by the primitive itself, with the
+    -- actionable message (how to widen discovery).
     local disc = require("auto-run.discovery")
-    if not disc.tree():get(d.id) then
-      return nil, ("the last %s target '%s' is no longer discovered"):format(verb, d.id)
-    end
     if mode == "run" then return disc.run_position(d.id, d.opts) end
     return disc.debug_position(d.id)
   end
 
+  -- Checked BEFORE anything else happens: a test-config debug jumps to the
+  -- file first, so a vanished config must be refused before it moves you.
   if d.name ~= nil then
     local ok, eff = pcall(require("auto-run.store").get, d.name)
     if not (ok and eff) then
