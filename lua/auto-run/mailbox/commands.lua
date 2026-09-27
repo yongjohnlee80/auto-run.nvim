@@ -542,7 +542,7 @@ local SPECS = {
 
   ["run.tests_list"] = {
     owner       = OWNER,
-    description = "Discovered test-position tree for the current worktree (ADR-0048 §7): {root, files, positions, tree}. Nodes are {id, type=dir|file|namespace|test, name, path, lnum, adapter, children}; ids are `path` / `path::ns::name`. Covers open buffers by default — a prior full scan (:AutoRun scan / the tests panel) widens it. Read-only; never launches anything.",
+    description = "Discovered test-position tree for the current worktree (ADR-0048 §7): {root, files, positions, tree}. Nodes are {id, type=dir|file|namespace|test, name, path, lnum, adapter, children}; ids are `path` / `path::ns::name`. Covers open buffers by default — a prior full scan (the tests pane's S, or discovery.scan) widens it. Read-only; never launches anything.",
     schema      = {},
     handler     = h_tests_list,
   },

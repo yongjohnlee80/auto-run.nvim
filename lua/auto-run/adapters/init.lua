@@ -76,7 +76,7 @@ local M = {}
 --- no language checks. `go` and `rust` implement them; `jest` implements none.
 ---@field default_config? fun(kind: "run"|"test"|"debug", name: string?): table
 ---           OPTIONAL, sync. Scaffold defaults for a new config of `kind`
----           (`<leader>rc`), so scaffolding is language-generic.
+---           (`adapters.scaffold`), so scaffolding is language-generic.
 ---@field build_run_argv? fun(eff: table, opts: table?): string[]|nil, string?
 ---           OPTIONAL, sync. argv for the RUN/TERM strategy only — never a DAP
 ---           launch (that is prepare_debug*). Returns the base command; the
@@ -199,6 +199,56 @@ function M.adapter_for(path)
     if ok and is == true then return adapter end
   end
   return nil
+end
+
+-- ── scaffolding (ADR 0199 §6.2) ─────────────────────────────────
+
+local SCAFFOLD_KINDS = { run = true, test = true, debug = true }
+
+---Adapter names that can scaffold a config (they implement
+---`default_config`), in registration order — what a "new config" chooser
+---offers.
+---@return string[]
+function M.scaffold_runtimes()
+  local out = {}
+  for _, a in ipairs(M.list()) do
+    if type(a.default_config) == "function" then out[#out + 1] = a.name end
+  end
+  return out
+end
+
+---Create and store a new config of `kind` named `name`, with the defaults of
+---the `runtime` adapter. The ONE scaffold implementation: the panes' `a`
+---passes the runtime the user chose (their current buffer is the panel, so no
+---filetype can pick it), and any other caller names one. A runtime with no
+---`default_config` (or none) gets the historical go-shaped default.
+---Publishes `run.config:changed` through `store.add`.
+---@param kind "run"|"test"|"debug"
+---@param name string
+---@param runtime string?  adapter name
+---@return string? path, string? err
+function M.scaffold(kind, name, runtime)
+  if not SCAFFOLD_KINDS[kind] then
+    return nil, "scaffold: kind must be run, test or debug (got " .. tostring(kind) .. ")"
+  end
+  if type(name) ~= "string" or name == "" then
+    return nil, "scaffold: name must be a non-empty string"
+  end
+  local adapter = runtime and M.get(runtime) or nil
+  local cfg
+  if adapter and type(adapter.default_config) == "function" then
+    local ok, res = pcall(adapter.default_config, kind, name)
+    if not ok then return nil, "scaffold: " .. tostring(res) end
+    cfg = res
+  else
+    cfg = {
+      runtime = "go",
+      program = kind == "test" and "${worktree}" or "${worktree}/cmd/" .. name,
+    }
+  end
+  cfg.name = name
+  cfg.kind = kind
+  return require("auto-run.store").add(cfg)
 end
 
 ---Test-only: wipe the registry (builtins reload on next access). Not

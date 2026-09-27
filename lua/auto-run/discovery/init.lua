@@ -822,7 +822,7 @@ function M.run_position(id, opts)
   local node = tree:get(id)
   if not node then
     return nil, "position '" .. id .. "' not found — "
-      .. "discovery covers open buffers by default (:AutoRun scan for the full worktree)"
+      .. "discovery covers open buffers by default (the tests pane's S scans the full worktree)"
   end
 
   local specs, berr = build_specs(tree, node)
@@ -927,6 +927,11 @@ function M.run_position(id, opts)
     runs[#runs + 1] = { id = s.run_id, adapter = s.adapter.name,
       position = s.position.id }
   end
+  -- Every spec's job spawned: this is what Again replays (auto-run.last). A
+  -- descriptor, not the jobs — a replay re-resolves config and env.
+  if #runs > 0 then
+    require("auto-run.last").record("run", { via = "position", id = id, opts = opts })
+  end
   return { position = id, runs = runs }, nil
 end
 
@@ -963,6 +968,9 @@ function M.debug_position(id)
   if adapter and type(adapter.prepare_debug) == "function" then
     -- Core-owned cancellation token (Lector P1-4): supersede/abort a prior
     -- pending build, and skip a late launch if this one was cancelled.
+    -- Where this debug STARTED: the callback may run after a worktree switch,
+    -- and must not record the new worktree as this debug's (Lector M6 P2).
+    local started_in = require("auto-run.last").anchor()
     local token = dap.new_launch_token()
     adapter.prepare_debug(node, token, function(launch, perr)
       if token.cancelled then return end
@@ -971,8 +979,14 @@ function M.debug_position(id)
           .. tostring(perr.message or perr.code))
         return
       end
-      local _, lerr = dap.launch(launch)
-      if lerr then log.error("discovery", lerr) end
+      local okl, lerr = dap.launch(launch)
+      if not okl then
+        log.error("discovery", lerr)
+        return
+      end
+      -- Recorded when the launch reached nvim-dap, never at this function's
+      -- synchronous return (the build can still fail or be cancelled).
+      require("auto-run.last").record("debug", { via = "position", id = id, anchor = started_in })
     end)
     return true, nil
   end

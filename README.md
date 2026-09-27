@@ -66,8 +66,7 @@ lua/auto-run/
 ├── keymaps.lua          -- default_keymaps() (§10 table)
 └── mailbox/commands.lua -- run.* verb SPECS + register_all()
 
-plugin/auto-run.lua      -- :AutoRun {list|show|validate|import|doctor|set-dir
-                         --          |run|debug|test|stop|jobs|last-error|tests|scan|env}
+plugin/auto-run.lua      -- :AutoRun {run|debug|stop|env|doctor|import}
 tests/smoke.lua          -- nvim -n -i NONE --headless -u tests/smoke.lua -c 'qa!'
 ```
 
@@ -81,16 +80,20 @@ require("auto-run").setup()
 require("auto-run").default_keymaps()   -- optional: the §10 layout below
 ```
 
-- `:AutoRun run [name]` / `:AutoRun test [name]` / `:AutoRun debug
-  [name]` — launch a config (picker with per-repo pick memory when
-  the name is omitted).
-- `:AutoRun jobs` / `:AutoRun stop <run-id>` — session job inventory
-  and control. Stop only ever signals jobs auto-run started, and it
+Six subcommands (ADR 0199 §4.1). Listings — configs, jobs, the discovered
+test tree — live in auto-finder's tests and debug panes, which render them
+live; a full discovery scan is the tests pane's `S`.
+
+- `:AutoRun run [name]` / `:AutoRun debug [name]` — run or debug a config,
+  **dispatching on its kind**: a `kind=test` config runs as a test
+  (`exec.test_run`) or debugs the test at the cursor with that config's flags
+  and env (`dap.debug_test`); `run`/`debug` configs launch (`exec.start` /
+  `dap.debug_start`). With no name, a picker with per-repo pick memory.
+- `:AutoRun stop [run-id]` — stop a running job; with no id, the only one, or
+  a choice among several. Covers exec jobs (a debug session ends with the
+  debugger's terminate). Stop only ever signals jobs auto-run started, and it
   signals the **process group**, not the handle (see below).
-- `:AutoRun tests` / `:AutoRun scan` — render the discovered position
-  tree (status glyphs from the last results) / run a bounded full
-  scan of the active worktree.
-- `:AutoRun doctor` — resolver output, git/worktree health (project
+- `:AutoRun doctor` — config validation, resolver output, git/worktree health (project
   root + marker, anchor `.git` kind incl. gitfile-target state,
   `git status`, common dir, go module root), configs per kind with
   the remembered session pick, test-adapter roots + discovery
@@ -99,12 +102,14 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
   common dir (gobugger `fix_worktree` parity; survives a broken
   worktree gitfile via the container walk). Interactive-only —
   mutating, so never exposed as a mailbox verb.
-- `:AutoRun last-error` — replay the last failed-start dap capture in
-  a scratch buffer.
+- `:AutoRun doctor --last-error` — replay the last failed-start dap capture
+  in a scratch buffer.
 - `:AutoRun import` — one-shot launch.json migration into the
   tracked tier (`origin = "launch.json"` provenance).
 - `:AutoRun env [select <path>|clear]` — list/manage the per-repo
   selected env file (§4.2 below); `*` marks the selection.
+  `:AutoRun env profile [name|clear]` lists the store's env profiles or sets
+  the one applied to the next launch.
 - Mailbox verbs register automatically when the auto-core mailbox
   surface is present. `run.start` / `run.test_run` /
   `run.debug_start` are gated behind the `run.exec` trust capability
@@ -138,7 +143,7 @@ require("auto-run").default_keymaps()   -- optional: the §10 layout below
 
 ### Configuring test runs (go and jest)
 
-Test discovery needs no configuration — `:AutoRun tests` finds positions as
+Test discovery needs no configuration — the tests pane finds positions as
 soon as an adapter recognises the project. A **`kind=test` config is only
 needed when a run needs something extra**: environment variables, an env
 file, or (go) build flags.
@@ -159,7 +164,8 @@ generic and applies to any adapter. So one repo can serve both:
   "env_files": ["${worktree}/.env.test"] }
 ```
 
-Create them with `:AutoRun` scaffolding (`<leader>rc`), by hand under
+Create them with `a` in auto-finder's tests or debug pane (adapter-aware
+scaffolding through `adapters.scaffold`), by hand under
 `.auto-run/configs/`, or by importing a `launch.json` (`:AutoRun import` —
 its `env` and `envFile` land as `env` and `env_files`).
 
@@ -249,7 +255,7 @@ dir → file → namespace → test        ids: path  |  path::ns::name
 - **Lazy by default** (neotest pitfall #1): open test buffers are
   parsed on `BufReadPost` and re-parsed on `BufWritePost`
   (`discovery.open_buffers = false` disables). The full worktree
-  needs an explicit scan: `:AutoRun scan`, the tests panel's `S`, or
+  needs an explicit scan: the tests panel's `S`, or
   `discovery.scan(opts, cb)`.
 - **Bounded, cancelable scans**: hard caps
   (`discovery.max_files = 5000` candidate files,
@@ -492,39 +498,46 @@ require("auto-run").setup({
 -- Session-boundary + VimLeavePre flushes stay active even when disabled.
 ```
 
-## Default keymaps (ADR §10)
+## Default keymaps (ADR 0199 §4.2)
 
-`require("auto-run").default_keymaps()` — `<leader>r` = run/test,
-`<leader>d` = debug/DAP only, F-keys unchanged. Bindings are
-pcall-gated on their dependency and all carry `desc` strings.
+`require("auto-run").default_keymaps()`. `<leader>r` **launches** — lowercase
+runs, the same letter UPPERCASE debugs; `<leader>d` **controls** what is
+running. `<leader>r` is auto-run's alone (remote-sync.nvim's keys live under
+`<leader>R`). Bindings are pcall-gated on their dependency and all carry
+`desc` strings; override any with `vim.keymap.set` after this call.
 
-| Key | Action | Provenance |
+| Target | Run | Debug |
 |---|---|---|
-| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out | kept |
-| `<leader>rr` | run: pick config & run | new |
-| `<leader>rl` | run last | gobugger `dr` |
-| `<leader>rt` | run nearest test | new |
-| `<leader>rf` | run current test file | new |
-| `<leader>rp` | pick env profile for next run | new |
-| `<leader>rc` | new run config (scaffold) | gobugger `dM`/`dN` merged |
-| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints | kept |
-| `<leader>dc` | continue/start (dap) | kept |
-| `<leader>dt` | debug nearest test | gobugger `dt` |
-| `<leader>dm` | debug entry point (pick) | gobugger `dm` |
-| `<leader>da` / `dA` | attach PID / attach remote | kept |
-| `<leader>dv` / `dw` / `de` | dap-view / watch / eval | kept |
-| `<leader>dq` / `dR` | terminate / restart | kept |
-| `<leader>dD` | doctor | gobugger `dD` |
+| Nearest test | `<leader>rt` | `<leader>rT` |
+| Current file | `<leader>rf` — run the file | `<leader>rF` — choose a test in it |
+| Pick an entry point | `<leader>rp` | `<leader>rP` |
+| Again (last) | `<leader>rl` | `<leader>rL` |
 
-`<leader>rt` / `<leader>rf` run the discovery position nearest the
-cursor / the current file's position through the Phase 3 position
-engine; `<leader>dt` routes the same nearest resolution through
-`debug_position` for go test positions. Buffers no adapter claims
-fall back to the Phase 2 kind=test config path with a logged hint.
+`rp` / `rP` dispatch on the picked config's kind, the same rule as
+`:AutoRun run` / `debug`: a `kind=test` config runs as a test / debugs the test
+at the cursor. `rl` / `rL` replay the last run / debug that **actually
+launched**, from any surface — a key, a command or a pane (`auto-run.last`). A
+target that no longer exists, or a changed active worktree, is refused with a
+message rather than silently substituted. `rL` with no auto-run debug yet falls
+back to nvim-dap's own `run_last`.
 
-Dropped from keymaps (moved to panel/commands): `dL` reload (store
-auto-reloads), `dE` last error (`:AutoRun last-error`), `dF`
-fix-worktree (`:AutoRun doctor --fix`), scaffold keys.
+| Key | Action |
+|---|---|
+| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out |
+| `<leader>dc` | **resume only** — with no session it names the keys that start one |
+| `<leader>di` / `do` / `dO` | step into / over / out (no F-keys needed) |
+| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints |
+| `<leader>dq` / `dR` | terminate / restart |
+| `<leader>dv` / `dw` / `de` | dap-view / watch / evaluate |
+| `<leader>da` / `dA` | delve attach PID / remote — **go buffers only** |
+
+`<leader>rt` / `<leader>rf` run the discovery position nearest the cursor / the
+current file's position through the position engine; `<leader>rT` routes the
+same nearest resolution through `debug_position`. Buffers no adapter claims
+fall back to the kind=test config path with a logged hint.
+
+Not keys: new configs → `a` in the panes; the env profile → `:AutoRun env
+profile`; diagnostics → `:AutoRun doctor` (`--last-error`, `--fix`).
 
 ## Requirements
 

@@ -284,6 +284,53 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.15] — 2026-09-27 — one run/debug model: stable environments, visible state, six commands (ADR 0199)
+
+Patch. Pairs with auto-finder v0.5.1 (the pane header and entry-point
+management read the new APIs), auto-core v0.2.31 (bare-repo enumeration for the
+Active-worktree selector) and remote-sync.nvim v0.1.3 / AutoVim v0.4.23
+(remote-sync's keys move to `<leader>R`, leaving `<leader>r` to this plugin).
+Reviewed by Lector, milestone by milestone (M1–M6). *(v0.1.12–v0.1.14 are
+recorded in their tag messages only.)*
+
+**Stable environments**
+- A test run from the tests pane now applies the selected base and env file
+  (`adapters.config.test_config` was the one path that applied neither).
+- The test config that applies is the one you pick, **per runtime**
+  (`state.test_picks[runtime]`), not the first in list order; the old per-kind
+  pick stays as a `shared` fallback. `fallback_config_name` says where clearing
+  lands. A failed state write fails the pick.
+- The store anchor is auto-core's active worktree, else the cwd — never the
+  current buffer's directory, which made resolution follow window focus.
+- Rust resolves Cargo from the active worktree when a config has no `cwd`.
+
+**Visible state**
+- `auto-run.context` is the one answer to "what will run, and from where" that
+  the panes' header reads (worktree, env file, base, test config per runtime).
+
+**Config management**
+- `adapters.scaffold(kind, name, runtime)` + `scaffold_runtimes()` — the one
+  scaffold implementation (the panes' `a`).
+- The shared pick announces its changes; `exec.clear_pick` reports its outcome.
+
+**Commands** — six: `run`, `debug` (both dispatch on the config's kind — a
+`kind=test` config runs / debugs as a test), `stop` (no id: the only job, or a
+choice), `env` (`select` / `clear` / `profile`), `doctor` (`--fix`,
+`--last-error`; now includes config validation), `import`. Removed: `list`,
+`show`, `validate`, `test`, `jobs`, `last-error`, `tests`, `scan`, `set-dir` —
+the panes show them live, and the APIs behind them are unchanged.
+
+**Keymaps** — `<leader>r` launches, lowercase runs / UPPERCASE debugs: `rt`/`rT`
+nearest test, `rf`/`rF` file (rF: choose a test in it), `rp`/`rP` pick an entry
+point, `rl`/`rL` again. `<leader>dc` resumes only; `di`/`do`/`dO` step;
+`da`/`dA` in go buffers only. **Removed:** `rr`, `rc`, `rp` (env profile), `dt`,
+`dm`, `dD` — see the README's table for where each went.
+
+**Again** (`auto-run.last`) — replays the last run / debug that actually
+launched, from any surface; recorded at the true launch boundary (never an
+async prepare that failed or was cancelled), under the worktree it started in.
+A replay refuses a vanished config or a changed active worktree.
+
 ## [v0.1.11] — 2026-09-05 — CI on every PR, and three defects it found on the run path
 
 Patch. No public Lua surface changed; every item is a fix or the gate

@@ -112,7 +112,7 @@ jobs:
       # language the code can dispatch to is one CI has to be able to parse.
       - name: install tree-sitter parsers
         env:
-          LANGS: "go javascript typescript tsx"
+          LANGS: "go javascript typescript tsx rust"
         run: ./.github/install-parsers.sh
 
       # Named "assert", not "verify", because it CAN fail: it compares the
@@ -128,6 +128,15 @@ jobs:
           test "$got" = "$NVIM_VERSION"
           test -d "$HOME/.local/share/nvim/lazy/plenary.nvim"
           test -d "$HOME/.local/share/nvim/lazy/nvim-dap"
+          # The rust sections are gated on cargo AND a rust parser, and fall back
+          # to a floor of 6 assertions when either is missing -- a green run that
+          # skipped the cells which caught v0.1.13's dead debug launch. So both are
+          # REQUIRED here rather than inherited from whatever the runner image
+          # happens to ship.
+          cargo --version
+          # cquit, not assert: a failing `-c 'lua assert(...)'` still exits 0 in
+          # headless nvim (measured), which would make this line unable to fail.
+          nvim --headless -u NONE -c 'lua if not pcall(vim.treesitter.get_string_parser, "fn f(){}", "rust") then vim.cmd("cquit 1") end' -c q
 
       # The pin's age as ROUTINE INFORMATION, not something discovered while
       # debugging. This job's pin comment read `# main @ v0.2.15` while sitting
@@ -248,7 +257,7 @@ jobs:
       # language the code can dispatch to is one CI has to be able to parse.
       - name: install tree-sitter parsers
         env:
-          LANGS: "go javascript typescript tsx"
+          LANGS: "go javascript typescript tsx rust"
         run: ./.github/install-parsers.sh
 
       - name: report which auto-core is under test

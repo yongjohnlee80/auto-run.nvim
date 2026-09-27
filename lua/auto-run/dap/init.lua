@@ -136,7 +136,7 @@ local function flush_if_failed(reason_prefix)
   local trailer = ""
   if #full > 600 then
     preview = full:sub(1, 600)
-    trailer = "\n\n...(truncated; :AutoRun last-error for full output)"
+    trailer = "\n\n...(truncated; :AutoRun doctor --last-error for full output)"
   end
 
   vim.schedule(function()
@@ -343,7 +343,7 @@ function M.provider(bufnr)
     -- A rust config that still needs a Cargo build cannot be prepared inside
     -- nvim-dap's SYNCHRONOUS provider callback (ADR 0194 §2.3.4) — only an
     -- explicit, already-built `program` is representable here; build-requiring
-    -- rust configs are reached via <leader>dm / debug_start. The include check
+    -- rust configs are reached via <leader>rP / debug_start. The include check
     -- inspects the EFFECTIVE (merged) config so an inherited program counts
     -- (Lector r4 caution #1).
     local include = not c.error and (c.kind == "debug" or c.kind == "run")
@@ -505,6 +505,9 @@ function M.debug_start(name, opts)
   local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
   if adapter and type(adapter.prepare_debug_config) == "function" then
     open_view()
+    -- Where this debug STARTED: the callback may run after a worktree switch,
+    -- and must not record the new worktree as this debug's (Lector M6 P2).
+    local started_in = require("auto-run.last").anchor()
     local token = M.new_launch_token()
     adapter.prepare_debug_config(eff, token, function(launch, perr)
       if token.cancelled then return end -- superseded / cancelled mid-build
@@ -513,8 +516,16 @@ function M.debug_start(name, opts)
           .. tostring(perr.message or perr.code))
         return
       end
-      local _, lerr = M.launch(launch)
-      if lerr then log.error("dap", lerr) end
+      local okl, lerr = M.launch(launch)
+      if not okl then
+        log.error("dap", lerr)
+        return
+      end
+      -- Recorded HERE, when the launch reached nvim-dap — not at this
+      -- function's synchronous return, which precedes the build — under the
+      -- worktree it started in.
+      require("auto-run.last").record("debug",
+        { via = "config", name = name, opts = opts, anchor = started_in })
     end)
     return true, nil
   end
@@ -522,6 +533,7 @@ function M.debug_start(name, opts)
   open_view()
   local okr, rerr = pcall(dap.run, eff_to_dap(eff, comp))
   if not okr then return nil, "dap.run: " .. tostring(rerr) end
+  require("auto-run.last").record("debug", { via = "config", name = name, opts = opts })
   return true, nil
 end
 
@@ -572,10 +584,33 @@ function M.debug_test(name, opts)
     if next(custom) == nil then custom = nil end
   end
 
+  -- dap-go resolves the test from the cursor, so the replay descriptor keeps
+  -- where it was (auto-run.last jumps back before debugging again).
+  local path = vim.api.nvim_buf_get_name(0)
+  local lnum = vim.api.nvim_win_get_cursor(0)[1]
   open_view()
   local okr, rerr = pcall(dap_go.debug_test, custom)
   if not okr then return nil, "dap_go.debug_test: " .. tostring(rerr) end
+  require("auto-run.last").record("debug", {
+    via = "test_config", name = name, opts = opts,
+    path = path ~= "" and path or nil, lnum = lnum,
+  })
   return true, nil
+end
+
+---Debug a config, dispatching on its KIND (ADR 0199 §4.1): a kind=test config
+---debugs the test at the cursor with that config's flags and env
+---(`debug_test`); anything else starts a session (`debug_start`). The one
+---implementation `:AutoRun debug` and `<leader>rP` share.
+---@param name string
+---@param opts { profile: string?, args: table? }?
+---@return boolean? ok, string? err, table? detail
+function M.debug_config(name, opts)
+  local ok, eff = pcall(require("auto-run.store").get, name)
+  if ok and type(eff) == "table" and eff.kind == "test" then
+    return M.debug_test(name, opts)
+  end
+  return M.debug_start(name, opts)
 end
 
 ---Attach to a local process via delve: runs dap-go's registered

@@ -650,6 +650,18 @@ local function normalized_kind(t)
   return nil
 end
 
+---Where to resolve Cargo from when nothing more specific is known: the store
+---anchor's worktree root — auto-core's active worktree, else the cwd — the
+---same root every other execution path uses. NOT vim.uv.cwd() directly: the
+---panes' `w` sets the active worktree without a cd, so cwd=$WORKSPACE with a
+---Cargo project active is the ordinary state, and resolving from the cwd
+---failed with "no Cargo metadata at $WORKSPACE" (ADR 0199 §7.2).
+---@return string
+local function anchor_dir()
+  local dirs = require("auto-run.store").resolve_run_dirs()
+  return dirs.root or dirs.anchor
+end
+
 ---The ONE authoritative Cargo identity for a GENERIC (non-position) config,
 ---shared by `build_run_argv` and `prepare_debug_config` so run and debug can
 ---never resolve different workspace members (ADR 0194 §2.3.4).
@@ -668,7 +680,7 @@ end
 ---@param op "run"|"test"|"build"   the command the selectors will carry
 ---@return { package: string, package_id: string, crate_dir: string, kind: string?, target: string?, selectors: string[] }? id, string? err
 local function config_identity(eff, op)
-  local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or vim.uv.cwd()
+  local from = (type(eff.cwd) == "string" and eff.cwd ~= "") and eff.cwd or anchor_dir()
   local root = M.root(from) or M.crate_dir(from) or from
   local meta = cargo_metadata(root)
   if not meta then
@@ -780,7 +792,7 @@ local function config_identity(eff, op)
   }, nil
 end
 
----Scaffold defaults for a new Rust config (`<leader>rc`), carrying Cargo
+---Scaffold defaults for a new Rust config (`adapters.scaffold`), carrying Cargo
 ---identity so the generated config is unambiguous in a workspace.
 ---@param kind "run"|"test"|"debug"
 ---@param _name string?
@@ -797,13 +809,13 @@ function M.default_config(kind, _name)
   -- multi-package / multi-bin workspace (ADR 0194 §2.3.4).
   local buf = vim.api.nvim_buf_get_name(0)
   local from = (type(buf) == "string" and buf:match("%.rs$")) and fs_path.parent(buf)
-    or vim.uv.cwd()
+    or anchor_dir()
   local crate = from and M.crate_dir(from) or nil
   local pkg = crate and package_at(crate) or nil
   if pkg then
     cfg.cargo_package = pkg.name
     -- Pin `cwd` to the crate. `config_identity` resolves the Cargo workspace
-    -- from `eff.cwd` (falling back to nvim's cwd), so a crate that does not sit
+    -- from `eff.cwd` (falling back to the active worktree), so a crate that does not sit
     -- AT the project root — the ordinary case for a monorepo, an examples/
     -- folder, or any `.auto-run/` above the manifest — otherwise resolves to a
     -- directory with no Cargo.toml and fails with "no Cargo metadata at …".
