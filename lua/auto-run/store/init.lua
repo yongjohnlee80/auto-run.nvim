@@ -653,18 +653,23 @@ function M.update(name, patch, opts)
   end
   -- `opts.replace` names append-rule fields in `patch` whose value must
   -- REPLACE what lower layers contribute (an edit of the effective list —
-  -- ADR 0199 §6.5); recorded as the written layer's `replace` marker.
+  -- ADR 0199 §6.5); recorded as the written layer's `replace` marker. The
+  -- marker follows EACH call: a field patched without `replace` gets the
+  -- append rule again, so a later programmatic update is never silently
+  -- turned into a replacement by an earlier pane edit.
   local function mark_replace(data)
-    if opts and type(opts.replace) == "table" then
-      local set, list = {}, {}
-      for _, f in ipairs(type(data.replace) == "table" and data.replace or {}) do
-        if not set[f] then set[f] = true; list[#list + 1] = f end
-      end
-      for _, f in ipairs(opts.replace) do
-        if patch[f] ~= nil and not set[f] then set[f] = true; list[#list + 1] = f end
-      end
-      data.replace = #list > 0 and list or nil
+    local want = {}
+    for _, f in ipairs(opts and type(opts.replace) == "table" and opts.replace or {}) do want[f] = true end
+    local set, list = {}, {}
+    for _, f in ipairs(type(data.replace) == "table" and data.replace or {}) do
+      local keep = patch[f] == nil or want[f]
+      if keep and not set[f] then set[f] = true; list[#list + 1] = f end
     end
+    for f in pairs(want) do
+      if patch[f] ~= nil and not set[f] then set[f] = true; list[#list + 1] = f end
+    end
+    table.sort(list)
+    data.replace = #list > 0 and list or nil
     return data
   end
   if opts and opts.kind == "profiles" then
