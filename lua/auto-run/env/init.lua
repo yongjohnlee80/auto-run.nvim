@@ -344,6 +344,14 @@ end
 ---     `<worktree>/{.env,.env.*,*.env}` (dirs skipped; node_modules
 ---     never entered — the glob does not recurse).
 ---
+-- What env-file DISCOVERY scans, shared with `create_file` so a file it creates
+-- is always one discovery lists: these names, in these subdirectories of the
+-- worktree root and of the bare-repo container (non-recursive).
+local ENV_SUBDIRS = { "", ".config", ".vscode" }
+local function is_env_name(f)
+  return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
+end
+
 ---Deterministic order: referenced first (store listing order), then
 ---discovered alphabetically; deduped by normalized path (first
 ---source wins). The `selected` flag marks the per-repo pick.
@@ -402,9 +410,7 @@ function M.files_list()
   -- shared `.config/` / `.vscode/`), each scanned at its root plus its
   -- `.config/` and `.vscode/` subdirs. Per-file dedup (`seen`) makes a
   -- repeated dir (e.g. container == root in a plain clone) harmless.
-  local function is_env(f)
-    return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
-  end
+  local is_env = is_env_name
   for _, base in ipairs({ dirs.root or dirs.anchor, dirs.container }) do
     if base then
       scan_dir(base, is_env)
@@ -682,13 +688,15 @@ function M.remove_var(path, key)
   return true, nil
 end
 
----Create an EMPTY env file at `path`, making a missing parent directory. The
----path must lie under the store anchor's worktree root or its bare-repo
----container — env files belong to the repository they configure — and an
----existing file is refused, never truncated. Announces
----`run.env:changed {action="created", path}`. The panes' `n` (ADR 0199 §6.5);
----a name discovery recognises (`.env`, `.env.*`, `*.env` at the root,
----`.config/` or `.vscode/`) is listed at once.
+---Create an EMPTY env file at `path`. Only where env discovery looks — the
+---worktree root or the bare-repo container, directly or in its `.config/` /
+---`.vscode/` (created if missing) — and only under a name discovery
+---recognises (`.env`, `.env.*`, `*.env`), so the new file is listed at once.
+---The bound is checked on RESOLVED real paths, so a symlinked parent cannot
+---lead outside the repository, and the create is EXCLUSIVE (`O_EXCL`): an
+---existing file — including one that appears after any check — is refused,
+---never truncated (Lector, ADR 0199 r7). Announces
+---`run.env:changed {action="created", path}`. The panes' `n`.
 ---@param path string
 ---@return boolean? ok, table? err  structured {code=...}
 function M.create_file(path)
@@ -696,27 +704,61 @@ function M.create_file(path)
     return nil, structured_err("invalid_args", "create_file: path must be a string")
   end
   path = fs_path.normalize(vim.fn.expand(path))
+  local name = vim.fn.fnamemodify(path, ":t")
+  local parent = fs_path.parent(path)
   local dirs = require("auto-run.store").resolve_run_dirs()
-  local root = dirs.root or dirs.anchor
-  local inside = (root and fs_path.is_under(path, root))
-    or (dirs.container and fs_path.is_under(path, dirs.container))
-  if not inside then
+  local bases = {}
+  for _, b in ipairs({ dirs.root or dirs.anchor, dirs.container }) do
+    if type(b) == "string" and b ~= "" then bases[#bases + 1] = fs_path.normalize(b) end
+  end
+
+  local base, sub
+  for _, b in ipairs(bases) do
+    for _, d in ipairs(ENV_SUBDIRS) do
+      if parent == (d == "" and b or fs_path.join(b, d)) then base, sub = b, d end
+    end
+  end
+  if not base then
+    local inside = false
+    for _, b in ipairs(bases) do if fs_path.is_under(path, b) then inside = true end end
+    if not inside then
+      return nil, structured_err("outside_worktree",
+        "create_file: " .. path .. " is outside the worktree (" .. tostring(bases[1]) .. ")", { path = path })
+    end
+    return nil, structured_err("not_discoverable",
+      "create_file: env files live in the worktree root or its .config/ or .vscode/"
+      .. " (where env discovery looks); " .. parent .. " is not one of them", { path = path })
+  end
+  if not is_env_name(name) then
+    return nil, structured_err("invalid_name",
+      "create_file: '" .. name .. "' is not an env-file name (.env, .env.<name>, <name>.env)", { path = path })
+  end
+
+  if sub ~= "" and vim.fn.isdirectory(parent) == 0 and vim.fn.mkdir(parent) == 0 then
+    return nil, structured_err("write_failed", "create_file: cannot create " .. parent)
+  end
+  -- Real-path containment: a `.config` / `.vscode` that is a symlink must not
+  -- carry the new file outside the repository.
+  local real_parent = vim.uv.fs_realpath(parent)
+  local real_base = vim.uv.fs_realpath(base)
+  if not (real_parent and real_base)
+      or not (real_parent == real_base or fs_path.is_under(real_parent, real_base)) then
     return nil, structured_err("outside_worktree",
-      "create_file: " .. path .. " is outside the worktree (" .. tostring(root) .. ")",
+      "create_file: " .. parent .. " resolves outside the worktree (" .. tostring(real_parent) .. ")",
       { path = path })
   end
   if vim.uv.fs_stat(path) then
-    return nil, structured_err("already_exists",
-      "create_file: " .. path .. " already exists", { path = path })
+    return nil, structured_err("already_exists", "create_file: " .. path .. " already exists", { path = path })
   end
-  local parent = fs_path.parent(path)
-  if vim.fn.isdirectory(parent) == 0 and vim.fn.mkdir(parent, "p") == 0 then
-    return nil, structured_err("write_failed", "create_file: cannot create " .. parent)
+  -- Exclusive create: the check above is advisory; this is the guarantee.
+  local fd, oerr = vim.uv.fs_open(path, "wx", 420)
+  if not fd then
+    if tostring(oerr):find("EEXIST", 1, true) then
+      return nil, structured_err("already_exists", "create_file: " .. path .. " already exists", { path = path })
+    end
+    return nil, structured_err("write_failed", "create_file: " .. tostring(oerr))
   end
-  local okw, werr = require("auto-core.fs.atomic").write(path, "")
-  if not okw then
-    return nil, structured_err("write_failed", "create_file: " .. tostring(werr))
-  end
+  vim.uv.fs_close(fd)
   publish("run.env:changed", { action = "created", path = path })
   return true, nil
 end
