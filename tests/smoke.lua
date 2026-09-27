@@ -4508,6 +4508,27 @@ local section36f = function()
   ok("[36f] …publishes nothing", fired == nil, vim.inspect(fired))
   ok("[36f] …and the previous pick still applies", (eff("go")) == first("go"))
 
+  -- The shared pick must ANNOUNCE its changes, as pick() does: a pane showing
+  -- it (the tests pane's Test configs section) otherwise never re-renders
+  -- after the shared pick is cleared or set elsewhere.
+  do
+    exec.clear_pick(nil)
+    local evs = {}
+    local hp = core.events.subscribe("run.config:changed", function(pl)
+      if pl and (pl.action == "picked" or pl.action == "pick_cleared") then evs[#evs + 1] = pl end
+    end)
+    exec.remember_pick("test", go_other)
+    exec.remember_pick("test", go_other)
+    exec.clear_pick("test")
+    exec.clear_pick("test")
+    core.events.unsubscribe(hp)
+    ok("[36f] remember_pick announces a CHANGED shared pick, once",
+      #evs >= 1 and evs[1].action == "picked" and evs[1].kind == "test" and evs[1].name == go_other,
+      vim.inspect(evs))
+    ok("[36f] clear_pick announces a cleared pick, once; repeats announce nothing",
+      #evs == 2 and evs[2].action == "pick_cleared" and evs[2].kind == "test", vim.inspect(evs))
+  end
+
   cfgm.pick("go", nil); exec.clear_pick(nil)
   gn, gs = eff("go")
   ok("[36f] clearing falls back to the first match", gn == first("go") and gs == "first",
