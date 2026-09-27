@@ -47,11 +47,10 @@ function M.test_config_name(runtime)
       matches[#matches + 1] = c.name
     end
   end
-  -- The user's PICK wins over list order. The pick is the per-repo memory
-  -- exec.pick_config already honours (state.picks[kind] in the shared tier's
-  -- state.json); read through the store, which owns that file. Only a pick that
-  -- still names a matching config counts — a pick for another runtime, or one
-  -- whose config is gone, falls back to the first match rather than failing.
+  -- The user's PICK wins over list order, read through the store, which owns
+  -- state.json. Only a pick that still names a matching config counts — a pick
+  -- for another runtime, or one whose config is gone, falls back to the first
+  -- match rather than failing.
   -- Per-RUNTIME pick first (state.test_picks[runtime], written by M.pick), then
   -- the legacy per-KIND pick (state.picks.test, written by exec.pick_config) so
   -- nothing a user already picked is lost. One name per kind could not hold a
@@ -65,9 +64,10 @@ function M.test_config_name(runtime)
   end)
   if type(rt_pick) ~= "string" then rt_pick = nil end
   if type(legacy) ~= "string" then legacy = nil end
-  for _, p in ipairs({ rt_pick, legacy }) do
-    if p and vim.tbl_contains(matches, p) then return p, "picked", nil end
-  end
+  -- Checked one by one, NOT with ipairs({ rt_pick, legacy }): ipairs stops at
+  -- the first nil, so with no runtime pick it would never reach the legacy one.
+  if rt_pick and vim.tbl_contains(matches, rt_pick) then return rt_pick, "picked", nil end
+  if legacy and vim.tbl_contains(matches, legacy) then return legacy, "picked", nil end
   local ignored = rt_pick or legacy
   if #matches == 0 then return nil, "none", ignored end
   return matches[1], "first", ignored
