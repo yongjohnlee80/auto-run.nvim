@@ -40,6 +40,9 @@ grammar_repo() {
     javascript) echo "tree-sitter/tree-sitter-javascript|58404d8cf191d69f2674a8fd507bd5776f46cb11|." ;;
     typescript) echo "tree-sitter/tree-sitter-typescript|75b3874edb2dc714fb1fd77a32013d0f8699989f|typescript" ;;
     tsx)        echo "tree-sitter/tree-sitter-typescript|75b3874edb2dc714fb1fd77a32013d0f8699989f|tsx" ;;
+    # rust: the rust adapter (v0.1.12+) dispatches here. Pinned to the revision
+    # nvim-treesitter's parsers.lua uses, so CI parses what developers parse.
+    rust)       echo "tree-sitter/tree-sitter-rust|77a3747266f4d621d0757825e6b11edcbf991ca5|." ;;
     *) echo "unknown grammar: $1" >&2; exit 1 ;;
   esac
 }
