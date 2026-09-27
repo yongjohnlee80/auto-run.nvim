@@ -264,18 +264,42 @@ end
 ---which duplicates the store's layout in a caller and silently rots if the
 ---record naming ever changes (ADR-0048 Phase 3 follow-up;
 ---[[auto-family-state-ownership]] — the owner of a location publishes it).
+---`opts.kind = "profiles"` answers for an env profile (ADR 0199 §6.5).
 ---@param name string
+---@param opts { kind: ("configs"|"profiles")? }?
 ---@return string? path
-function M.config_file(name)
+function M.config_file(name, opts)
   if type(name) ~= "string" or name == "" then return nil end
+  local kind = opts and opts.kind == "profiles" and "profiles" or "configs"
   local dirs = paths.resolve_run_dirs()
   for _, tier in ipairs({ dirs.tracked, dirs.shared }) do
     if type(tier) == "string" then
-      local candidate = record_path(tier, "configs", name)
+      local candidate = record_path(tier, kind, name)
       if fs_path.is_file(candidate) then return candidate end
     end
   end
   return nil
+end
+
+---The files that hold `name`, per tier: `{ tracked = path?, shared = path? }`
+---(empty when neither exists). What a delete confirm names — the exact file
+---and tier, and whether removing the local layer reveals a tracked one —
+---without a caller rebuilding the store's layout (ADR 0199 §6.5).
+---@param name string
+---@param opts { kind: ("configs"|"profiles")? }?
+---@return { tracked: string?, shared: string? }
+function M.files(name, opts)
+  local out = {}
+  if type(name) ~= "string" or name == "" then return out end
+  local kind = opts and opts.kind == "profiles" and "profiles" or "configs"
+  local dirs = paths.resolve_run_dirs()
+  if dirs.tracked then
+    local t = record_path(dirs.tracked, kind, name)
+    if fs_path.is_file(t) then out.tracked = t end
+  end
+  local sh = record_path(dirs.shared, kind, name)
+  if fs_path.is_file(sh) then out.shared = sh end
+  return out
 end
 
 ---Read-through shims from `auto-run.import` (lazy require — the
