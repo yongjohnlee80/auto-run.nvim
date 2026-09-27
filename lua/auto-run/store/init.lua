@@ -639,7 +639,10 @@ end
 ---under shared, so the edit applies without rewriting a committed file.
 ---@param name string
 ---@param patch table
----@param opts { kind: ("configs"|"profiles")? }?
+---`opts.replace` lists append-rule fields (`env_files`, `base_env_files`,
+---`secret_manifests`, …) whose patched value REPLACES what lower layers
+---contribute, so the effective list is exactly the value written.
+---@param opts { kind: ("configs"|"profiles")?, replace: string[]? }?
 ---@return { name: string, layer: "shared"|"overrides", config: table }? result, string? err
 function M.update(name, patch, opts)
   if type(name) ~= "string" or name == "" then
@@ -647,6 +650,22 @@ function M.update(name, patch, opts)
   end
   if type(patch) ~= "table" then
     return nil, "update: patch must be a table"
+  end
+  -- `opts.replace` names append-rule fields in `patch` whose value must
+  -- REPLACE what lower layers contribute (an edit of the effective list —
+  -- ADR 0199 §6.5); recorded as the written layer's `replace` marker.
+  local function mark_replace(data)
+    if opts and type(opts.replace) == "table" then
+      local set, list = {}, {}
+      for _, f in ipairs(type(data.replace) == "table" and data.replace or {}) do
+        if not set[f] then set[f] = true; list[#list + 1] = f end
+      end
+      for _, f in ipairs(opts.replace) do
+        if patch[f] ~= nil and not set[f] then set[f] = true; list[#list + 1] = f end
+      end
+      data.replace = #list > 0 and list or nil
+    end
+    return data
   end
   if opts and opts.kind == "profiles" then
     local v = schema.validate_profile_fragment(patch)
@@ -678,6 +697,7 @@ function M.update(name, patch, opts)
       end
     end
     data.name = name
+    mark_replace(data)
     local okw, werr = write_json(shared_path, data)
     if not okw then return nil, werr end
     publish("run.config:changed", { name = name, action = "update", layer = "shared", kind = "profiles" })
@@ -710,7 +730,7 @@ function M.update(name, patch, opts)
         data[k] = val
       end
     end
-    return data
+    return mark_replace(data)
   end
 
   local layer

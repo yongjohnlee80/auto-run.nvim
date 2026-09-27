@@ -652,8 +652,8 @@ end
 ---@type (fun(refs: AutoRunSecretRef[]): table<string, string>?, string?)|nil
 local _secret_resolver = nil
 
----Remove `key`'s line from the env file at `path` — comments, blank lines and
----every other entry are kept byte for byte. Announces
+---Remove every line that sets `key` in the env file at `path` — comments,
+---blank lines and every other entry are kept byte for byte. Announces
 ---`run.env:changed {action="removed", path, key}` (the key only, never the
 ---value). The panes' `D` on an env variable (ADR 0199 §6.5).
 ---@param path string
@@ -671,16 +671,21 @@ function M.remove_var(path, key)
   end
   path = fs_path.normalize(path)
   local ok, err = rewrite_env_file(path, function(lines)
-    local idx
-    for i, line in ipairs(lines) do
-      local e = parse_entry_line(line)
-      if e and e.key == key then idx = i end
+    -- EVERY occurrence: parsing is last-wins, so removing only one line of a
+    -- duplicated key would let an older value — possibly a secret the user
+    -- believes deleted — become live again (Lector #13 P1).
+    local removed = 0
+    for i = #lines, 1, -1 do
+      local e = parse_entry_line(lines[i])
+      if e and e.key == key then
+        table.remove(lines, i)
+        removed = removed + 1
+      end
     end
-    if not idx then
+    if removed == 0 then
       return nil, structured_err("not_found",
         "remove_var: key '" .. key .. "' not found in " .. path, { key = key })
     end
-    table.remove(lines, idx)
     return true
   end)
   if not ok then return nil, err end

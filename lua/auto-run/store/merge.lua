@@ -139,9 +139,23 @@ function M.apply(layers)
   local out, provenance = {}, {}
   for _, layer in ipairs(layers) do
     if type(layer.data) == "table" then
+      -- A layer's `replace` list names append-rule fields whose value in THIS
+      -- layer replaces the accumulation rather than extending it — how an edit
+      -- of the EFFECTIVE list lands exactly as entered (ADR 0199 §6.5). The
+      -- marker itself is layer metadata, never an effective field.
+      local replaces = {}
+      if type(layer.data.replace) == "table" then
+        for _, f in ipairs(layer.data.replace) do replaces[f] = true end
+      end
       for k, v in pairs(layer.data) do
-        merge_field(out, k, v)
-        provenance[k] = layer.source
+        if k ~= "replace" then
+          if replaces[k] and v ~= vim.NIL and type(v) == "table" then
+            out[k] = vim.deepcopy(v)
+          else
+            merge_field(out, k, v)
+          end
+          provenance[k] = layer.source
+        end
       end
     end
   end
