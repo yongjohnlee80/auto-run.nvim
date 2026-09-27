@@ -4275,6 +4275,35 @@ local section36e = function()
   w = ctxm.worktree()
   ok("[36e] with no active worktree and no file buffer the source is cwd",
     w.source == "cwd", vim.inspect(w))
+
+  -- The anchor must NOT follow the current buffer (ADR 0199 §7.2). It used
+  -- to fall back to the buffer's directory, so the same pane resolved a
+  -- different repository depending on which window was current, and the
+  -- discovery tree was dropped and rebuilt whenever focus crossed a repo.
+  do
+    local paths_mod = require("auto-run.store.paths")
+    local cwd0 = vim.fn.getcwd()
+    vim.cmd("cd " .. vim.fn.fnameescape(plain))
+    vim.cmd("edit " .. vim.fn.fnameescape(d .. "/calc_test.go"))
+    paths_mod.invalidate()
+    local a1, s1 = paths_mod.anchor_with_source()
+    ok("[36e] no active worktree: a file buffer in another repo does NOT move the anchor",
+      a1 == plain and s1 == "cwd", ("anchor=%s source=%s"):format(tostring(a1), tostring(s1)))
+    vim.cmd("enew!")
+    paths_mod.invalidate()
+    local a2 = paths_mod.anchor_with_source()
+    ok("[36e] …and switching buffers leaves it where it was", a2 == a1,
+      ("before=%s after=%s"):format(tostring(a1), tostring(a2)))
+    worktree.set_active(d)
+    vim.cmd("edit " .. vim.fn.fnameescape(plain .. "/elsewhere.txt"))
+    paths_mod.invalidate()
+    local a3, s3 = paths_mod.anchor_with_source()
+    ok("[36e] an active worktree wins over the current buffer",
+      a3 == d and s3 == "active", ("anchor=%s source=%s"):format(tostring(a3), tostring(s3)))
+    vim.cmd("enew!")
+    vim.cmd("cd " .. vim.fn.fnameescape(cwd0))
+    paths_mod.invalidate()
+  end
   worktree.set_active(d)
 
   -- Branch: from auto-core's repo_at when this auto-core has it.
