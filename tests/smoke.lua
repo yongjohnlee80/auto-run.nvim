@@ -4527,6 +4527,15 @@ local section36f = function()
       vim.inspect(evs))
     ok("[36f] clear_pick announces a cleared pick, once; repeats announce nothing",
       #evs == 2 and evs[2].action == "pick_cleared" and evs[2].kind == "test", vim.inspect(evs))
+    -- A failed write is not a change: nothing may be announced.
+    local real_ws = store.write_state
+    store.write_state = function() return false, "injected: disk full" end
+    local fired = {}
+    local hf = core.events.subscribe("run.config:changed", function(pl) fired[#fired + 1] = pl end)
+    exec.remember_pick("test", go_other)
+    store.write_state = real_ws
+    core.events.unsubscribe(hf)
+    ok("[36f] a remember_pick whose write fails announces nothing", #fired == 0, vim.inspect(fired))
   end
 
   cfgm.pick("go", nil); exec.clear_pick(nil)
