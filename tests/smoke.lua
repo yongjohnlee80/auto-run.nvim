@@ -4909,6 +4909,41 @@ local section36j = function()
   okr, rerr = last.replay("debug")
   disc.debug_position = real_dp
   ok("[36j] Again (debug) debugs the same position", okr and replayed_id == fail_id, tostring(rerr))
+  -- Lector M6 P2: an async debug started in worktree A and completed after a
+  -- switch to B must be recorded as A's — never B's, which would let Again in
+  -- B replay A's debug against B's configs.
+  do
+    local paths_mod = require("auto-run.store.paths")
+    local pending
+    go.prepare_debug = function(_, _, cb) pending = cb end
+    last._reset_for_tests()
+    worktree.set_active(gofix); paths_mod.invalidate()
+    disc.debug_position(fail_id)
+    worktree.set_active(jestfix); paths_mod.invalidate()
+    pending({ dap_type = "go", program = "x" })
+    local dd = last.peek("debug")
+    ok("[36j] an async position debug is recorded under the worktree it STARTED in",
+      dd and dd.anchor == gofix, vim.inspect(dd))
+    local okx, errx = last.replay("debug")
+    ok("[36j] …so Again in the other worktree refuses it, naming where it ran",
+      okx == nil and tostring(errx):find(gofix, 1, true) ~= nil, tostring(errx))
+
+    worktree.set_active(gofix); paths_mod.invalidate()
+    store.add({ name = "dbg-a", kind = "debug", runtime = "go", program = "${worktree}/calc" }, { tier = "tracked" })
+    local real_pdc = go.prepare_debug_config
+    go.prepare_debug_config = function(_, _, cb) pending = cb end
+    last._reset_for_tests()
+    pending = nil
+    darp.debug_start("dbg-a")
+    worktree.set_active(jestfix); paths_mod.invalidate()
+    if pending then pending({ dap_type = "go", program = "x" }) end
+    dd = last.peek("debug")
+    ok("[36j] an async config debug is recorded under the worktree it STARTED in",
+      dd and dd.anchor == gofix and dd.name == "dbg-a", vim.inspect(dd))
+    go.prepare_debug_config = real_pdc
+    worktree.set_active(gofix); paths_mod.invalidate()
+    store.remove("dbg-a", { tier = "tracked" })
+  end
   go.prepare_debug, darp.launch = real_pd, real_launch
 
   -- A test-config debug replays from its file; a vanished config must be
