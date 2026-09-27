@@ -5050,6 +5050,15 @@ local section36k = function()
     tostring(rerr and rerr.message) .. vim.inspect(vim.fn.readfile(nf)))
   ok("[36k] …and announces it without the value", evs[1] and evs[1].action == "removed" and evs[1].key == "SECRET"
     and not vim.inspect(evs):find("hunter2", 1, true), vim.inspect(evs))
+  -- Lector #13 P1: a duplicated key. parse_env_file is last-wins, so removing
+  -- only the last line would resurrect the older value — for a secret, a
+  -- credential the user believes deleted.
+  write_file(nf, "SECRET=old-credential\nA=1\nSECRET=new-credential\n")
+  envm.remove_var(nf, "SECRET")
+  local parsed = envm.parse_env_file(nf)
+  ok("[36k] remove_var removes EVERY occurrence of a duplicated key (none resurfaces)",
+    type(parsed) == "table" and parsed.SECRET == nil and vim.deep_equal(vim.fn.readfile(nf), { "A=1" }),
+    vim.inspect(parsed) .. vim.inspect(vim.fn.readfile(nf)))
   local r2, re2 = envm.remove_var(nf, "SECRET")
   ok("[36k] removing a key that is not there is not_found", r2 == nil and re2 and re2.code == "not_found", vim.inspect(re2))
   local r3, re3 = envm.remove_var(nf, "not a key")
@@ -5087,6 +5096,34 @@ local section36k = function()
     ok("[36k] store.files is empty for a name that is not there",
       vim.deep_equal(store.files("no-such", { kind = "profiles" }), {}), vim.inspect(store.files("no-such", { kind = "profiles" })))
   end
+  -- Lector #13 P1/P2: an APPEND-rule list (env_files, base_env_files,
+  -- secret_manifests) edited as a whole. The pane shows the EFFECTIVE list, so
+  -- what the user enters must become the effective list: without a replace
+  -- marker the overlay APPENDS to the tracked layer — [A] edited to [A,B]
+  -- became [A,A,B], and edited to [B] left A active.
+  store.update("mgmt-prof", { base_env_files = { "${worktree}/.env", "${worktree}/.env.b" } },
+    { kind = "profiles", replace = { "base_env_files" } })
+  ok("[36k] a replace edit makes a profile's list exactly what was entered",
+    vim.deep_equal(store.get_profile("mgmt-prof").base_env_files, { "${worktree}/.env", "${worktree}/.env.b" }),
+    vim.inspect(store.get_profile("mgmt-prof").base_env_files))
+  store.update("mgmt-prof", { base_env_files = { "${worktree}/.env.b" } }, { kind = "profiles", replace = { "base_env_files" } })
+  ok("[36k] …including dropping an inherited (tracked) entry",
+    vim.deep_equal(store.get_profile("mgmt-prof").base_env_files, { "${worktree}/.env.b" }),
+    vim.inspect(store.get_profile("mgmt-prof").base_env_files))
+  ok("[36k] …and the marker never reaches the effective record", store.get_profile("mgmt-prof").replace == nil)
+  -- The same for a CONFIG (the debug pane's env_files row, shipped in v0.1.15
+  -- / auto-finder v0.5.1): a tracked config's edit routes to overrides.json.
+  store.add({ name = "mgmt-cfg", kind = "run", runtime = "go", program = "sh", env_files = { "${worktree}/.env" } },
+    { tier = "tracked" })
+  store.update("mgmt-cfg", { env_files = { "${worktree}/.env.b" } }, { replace = { "env_files" } })
+  local ce = store.get("mgmt-cfg")
+  ok("[36k] a config's env_files edit (overrides layer) replaces the inherited list exactly",
+    ce and vim.deep_equal(ce.env_files, { "${worktree}/.env.b" }) and ce.replace == nil, vim.inspect(ce and ce.env_files))
+  store.update("mgmt-cfg", { env_files = { "${worktree}/.env.c" } })
+  ok("[36k] CONTROL — without replace, a list edit still appends (the layering rule is unchanged)",
+    vim.deep_equal(store.get("mgmt-cfg").env_files, { "${worktree}/.env", "${worktree}/.env.c" }),
+    vim.inspect(store.get("mgmt-cfg").env_files))
+  store.remove("mgmt-cfg", { tier = "tracked" })
   local rm1 = store.remove("mgmt-prof", { kind = "profiles" })
   local after1 = store.get_profile("mgmt-prof")
   ok("[36k] store.remove (kind=profiles) removes the local layer first", rm1 == true and after1
