@@ -424,22 +424,29 @@ end
 
 ---Clear the remembered pick for one kind (nil clears all). Announces
 ---`run.config:changed {action="pick_cleared", kind}` when a pick was there.
+---Returns the persisted outcome, so a caller that tells the user "cleared"
+---can check it: `true` when the pick is gone (or was never there), `(nil,
+---err)` when the write failed and the pick remains.
 ---@param kind string?
+---@return true? ok, string? err
 function M.clear_pick(kind)
-  pcall(function()
+  local okp, res, err = pcall(function()
     local state = read_state()
     local had = type(state.picks) == "table"
       and (kind == nil and next(state.picks) ~= nil or kind ~= nil and state.picks[kind] ~= nil)
-    if not had then return end   -- nothing to clear: no write, no announcement
+    if not had then return true end   -- nothing to clear: no write, no announcement
     if kind == nil then
       state.picks = nil
     else
       state.picks[kind] = nil
     end
-    if write_state(state) then
-      announce_pick({ action = "pick_cleared", kind = kind })
-    end
+    local okw, werr = write_state(state)
+    if not okw then return nil, "clear_pick: state.json write failed: " .. tostring(werr) end
+    announce_pick({ action = "pick_cleared", kind = kind })
+    return true
   end)
+  if not okp then return nil, "clear_pick: " .. tostring(res) end
+  return res, err
 end
 
 ---Mode-filtered config pick with per-repo memory. Resolution order:
