@@ -3321,14 +3321,11 @@ do
   ok("dF replacement — doctor completion offers --fix",
     contains(vim.fn.getcompletion("AutoRun doctor ", "cmdline"), "--fix"))
 
-  -- Remapped run-namespace targets carry auto-run's own descs (not a
-  -- stale binding that happened to share the lhs).
+  -- The run-namespace targets carry auto-run's own descs (not a stale
+  -- binding that happened to share the lhs). The full table is [36i].
   local rl = vim.fn.maparg("<leader>rl", "n", false, true)
-  local rc = vim.fn.maparg("<leader>rc", "n", false, true)
-  ok("dr → <leader>rl is auto-run's Run Last",
-    type(rl) == "table" and rl.desc == "Run: Run Last", vim.inspect(rl.desc))
-  ok("dM/dN → <leader>rc is auto-run's scaffold",
-    type(rc) == "table" and rc.desc == "Run: New Run Config (scaffold)")
+  ok("dr → <leader>rl is auto-run's Again (last run)",
+    type(rl) == "table" and rl.desc == "Run: Again (last run)", vim.inspect(rl.desc))
 end
 
 -- ── [34] doctor — git/worktree + config rows + --fix repair ─────
@@ -3444,7 +3441,7 @@ do
 end
 
 -- ── [35] keymaps — rt/rf/dt discovery-position routing ──────────
-print("\n[35] keymaps — rt/rf/dt discovery-position routing + fallback")
+print("\n[35] keymaps — rt/rf/rT discovery-position routing + fallback")
 do
   worktree.set_active(gofix)
   P3.discovery._reset_for_tests()
@@ -3553,38 +3550,38 @@ do
   vim.cmd.edit(vim.fn.fnameescape(calc_test))
   local sub_line = line_of('t.Run("sub one"')
   vim.api.nvim_win_set_cursor(0, { sub_line, 0 })
-  local ok_dt, dt_err = pcall(cb_of("dt"))
+  local ok_dt, dt_err = pcall(cb_of("rT"))
   dapmod_dt.launch = saved_launch_dt
-  ok("<leader>dt routes the nearest go test through debug_position",
+  ok("<leader>rT routes the nearest go test through debug_position",
     ok_dt and captured_launch_dt ~= nil, tostring(dt_err))
-  ok("dt jumps the cursor to the resolved position",
+  ok("rT jumps the cursor to the resolved position",
     vim.api.nvim_win_get_cursor(0)[1] == sub_line
       and vim.api.nvim_buf_get_name(0) == calc_test)
-  ok("dt anchors -test.run at the nearest SUBTEST position",
+  ok("rT anchors -test.run at the nearest SUBTEST position",
     captured_launch_dt ~= nil and captured_launch_dt.args[1] == "-test.run"
       and captured_launch_dt.args[2] == "^TestAdd$/^sub_one$",
     vim.inspect(captured_launch_dt and captured_launch_dt.args))
-  ok("dt merges the repo's kind=test config into the launch",
+  ok("rT merges the repo's kind=test config into the launch",
     captured_launch_dt ~= nil and captured_launch_dt.extra
       and captured_launch_dt.extra.buildFlags == "-count=1",
     vim.inspect(captured_launch_dt))
 
-  -- dt fallback: unclaimed buffer → Phase 2 pick + debug_test.
+  -- rT fallback: unclaimed buffer → Phase 2 pick + debug_test.
   captured = nil
   vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
-  local ok_dtf, dtf_err = pcall(cb_of("dt"))
-  ok("dt on an unclaimed buffer falls back to the config path",
+  local ok_dtf, dtf_err = pcall(cb_of("rT"))
+  ok("rT on an unclaimed buffer falls back to the config path",
     ok_dtf and captured ~= nil and captured.buildFlags == "-count=1",
     tostring(dtf_err) .. " " .. vim.inspect(captured))
 
   package.loaded["dap-go"] = saved_dg
 end
 
--- ── [35b] keymaps — dt language leak + dc dead-end message ──────
+-- ── [35b] keymaps — rT language leak + dc resume-only ─────────────
 -- Runs inside a FUNCTION, not a plain do-block: [35] already carries enough
 -- locals that adding these tipped the main chunk over Lua's 200-local cap —
 -- the same reason [36] is a function.
-print("\n[35b] keymaps — dt language leak + dc dead-end message")
+print("\n[35b] keymaps — rT language leak + dc resume-only")
 local section35b = function()
   local disc = P3.discovery
   auto_run.default_keymaps()
@@ -3618,8 +3615,8 @@ local section35b = function()
   -- tell "never called" from "called with nil" — and with no kind=test config
   -- here the pre-fix path called debug_test(nil), so such a cell passed under
   -- the mutation. Counting is the noun in the claim.
-  ok("[35b] dt does NOT invoke the go debugger for a claimed non-go buffer",
-    select(1, pcall(cb_of("dt"))) and dg_calls == 0,
+  ok("[35b] rT does NOT invoke the go debugger for a claimed non-go buffer",
+    select(1, pcall(cb_of("rT"))) and dg_calls == 0,
     "dap-go invocations: " .. tostring(dg_calls))
 
   -- POSITIVE CONTROL: the same stub must still record the legitimate
@@ -3628,7 +3625,7 @@ local section35b = function()
   P2.exec.remember_pick("test", "gofix-tests")
   vim.cmd.edit(vim.fn.fnameescape(gofix .. "/calc/calc.go"))
   ok("[35b] …while an UNCLAIMED buffer still reaches it (control)",
-    select(1, pcall(cb_of("dt"))) and dg_calls == 1,
+    select(1, pcall(cb_of("rT"))) and dg_calls == 1,
     "dap-go invocations: " .. tostring(dg_calls))
 
   -- ONE OWNER: dt must share rt/rf's fallback contract, not re-derive it.
@@ -3647,84 +3644,50 @@ local section35b = function()
   pcall(cb_of("rt"))
   local rt_fell_back = rt_ran
   rt_ran = false
-  pcall(cb_of("dt"))
-  ok("[35b] dt and rt agree on the no_file fallback (one owner, not two gates)",
+  pcall(cb_of("rT"))
+  ok("[35b] rT and rt agree on the no_file fallback (one owner, not two gates)",
     rt_ran == rt_fell_back, ("rt=%s dt=%s"):format(tostring(rt_fell_back), tostring(rt_ran)))
   P2.exec.pick_config = saved_pick
   package.loaded["dap-go"] = saved_dg
 
-  -- dc: replace nvim-dap's dead end with an actionable message. With no
-  -- session nvim-dap gathers configs from every provider and, finding none,
-  -- says "add configs to `dap.configurations.<ft>`" (dap.lua:545-548) — a
-  -- surface auto-run never writes, since it owns a providers.configs slot.
-  -- ASSERT THE MESSAGE, not a stubbed `continue` counter: bound as raw
-  -- `dap.continue`, the pre-fix keymap captures the function VALUE at bind
-  -- time, so a later stub is never consulted and `continued == 0` passes for
-  -- entirely the wrong reason.
+  -- dc is RESUME-ONLY (ADR 0199 §4.2). It used to resume a session OR launch
+  -- one, and every failure in the 2026-09-23 manual verification began with
+  -- the launch branch; a v0.1.14 interception rewrote nvim-dap's "No
+  -- configuration found" prose to cope. With no session dc now launches
+  -- nothing — it evaluates NO provider — and names the keys that start one.
   local dapm = require("dap")
   local saved_providers = dapm.providers.configs
-  dapm.providers.configs = {}
+  local provider_calls = 0
+  dapm.providers.configs = {
+    ["smoke-counter"] = function() provider_calls = provider_calls + 1; return {} end,
+  }
+  local saved_continue, saved_session = dapm.continue, dapm.session
+  local continued = 0
+  dapm.continue = function() continued = continued + 1 end
+  dapm.session = function() return nil end
   local msgs = {}
-  -- BOTH sinks: auto-run's log routes to auto-core's logger when that is on
-  -- the rtp (it is here); nvim-dap's message goes through vim.notify.
   local logmod = require("auto-run.log")
-  local saved_warn, saved_notify = logmod.warn, vim.notify
+  local saved_warn, saved_info, saved_notify = logmod.warn, logmod.info, vim.notify
   logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
+  logmod.info = function(_, m) msgs[#msgs + 1] = tostring(m) end
   vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
   pcall(cb_of("dc"))
-  wait_for(function() return #msgs > 0 end, 5000)
-  logmod.warn, vim.notify = saved_warn, saved_notify
   local said = table.concat(msgs, "\n")
-  ok("[35b] dc names the gestures that work when nothing provides a config",
-    said:find("<leader>rc", 1, true) ~= nil
-      and said:find("<leader>dt", 1, true) ~= nil, "said: " .. said)
+  ok("[35b] dc with no session launches nothing: no continue, no provider read",
+    continued == 0 and provider_calls == 0,
+    ("continue=%d provider_calls=%d"):format(continued, provider_calls))
+  ok("[35b] …and names the keys that start a session",
+    said:find("<leader>rT", 1, true) ~= nil and said:find("<leader>rP", 1, true) ~= nil, "said: " .. said)
   ok("[35b] …and never sends the user to dap.configurations",
     said:find("dap.configurations", 1, true) == nil, said)
-
-  -- ONCE-ONLY over the REAL boundary. The previous non-empty control stubbed
-  -- dap.continue, so nvim-dap never performed its own provider evaluation and
-  -- the cell could not see that the mapping read every provider twice per
-  -- keypress. `dap.providers.configs` is a public extension point: a stateful
-  -- provider that yields a config once and none after must still launch, and a
-  -- provider that raises must keep nvim-dap's semantics rather than being
-  -- reclassified as "empty". No stub of dap.continue here — that is the point.
-  local calls = 0
-  dapm.providers.configs = {
-    ["smoke-stateful"] = function()
-      calls = calls + 1
-      if calls == 1 then
-        -- A type with no registered adapter: nvim-dap proceeds past the
-        -- empty-config branch (which is what we are asserting) and then
-        -- reports a missing adapter, which is emphatically NOT our dead end.
-        return { { type = "smoke-absent-adapter", request = "launch", name = "probe" } }
-      end
-      return {}
-    end,
-  }
-  msgs = {}
-  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
-  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
+  -- With a session, dc resumes it — looked up at KEYPRESS time, so a stub
+  -- installed after binding is consulted (a raw `dap.continue` bound at setup
+  -- would not be).
+  dapm.session = function() return { id = 1 } end
   pcall(cb_of("dc"))
-  logmod.warn, vim.notify = saved_warn, saved_notify
-  ok("[35b] dc evaluates each provider EXACTLY once per keypress",
-    calls == 1, "provider calls: " .. tostring(calls))
-  ok("[35b] …so a stateful provider's config is not lost to a second read",
-    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
-    table.concat(msgs, "\n"))
-
-  -- A raising provider is nvim-dap's business; it must not become "no configs".
-  dapm.providers.configs = {
-    ["smoke-raises"] = function() error("provider blew up") end,
-  }
-  msgs = {}
-  logmod.warn = function(_, m) msgs[#msgs + 1] = tostring(m) end
-  vim.notify = function(m) msgs[#msgs + 1] = tostring(m) end
-  pcall(cb_of("dc"))
-  logmod.warn, vim.notify = saved_warn, saved_notify
-  ok("[35b] a provider that RAISES is not reclassified as empty",
-    table.concat(msgs, "\n"):find("no debug configs", 1, true) == nil,
-    table.concat(msgs, "\n"))
-
+  ok("[35b] dc with a session resumes it", continued == 1, "continue=" .. continued)
+  logmod.warn, logmod.info, vim.notify = saved_warn, saved_info, saved_notify
+  dapm.continue, dapm.session = saved_continue, saved_session
   dapm.providers.configs = saved_providers
 end
 section35b()
@@ -4719,6 +4682,210 @@ local section36h = function()
   require("auto-run.store.paths").invalidate()
 end
 section36h()
+
+-- ── [36i] keymaps — the ADR 0199 §4.2 table ─────────────────────────
+-- Lowercase runs, UPPERCASE debugs, under <leader>r — which is auto-run's
+-- alone now: remote-sync moved to <leader>R (Johno, 2026-09-27) after its
+-- rp / rc / rl turned out to be shadowed by these very keys.
+print("\n[36i] keymaps — the ADR 0199 §4.2 table")
+local section36i = function()
+  auto_run.default_keymaps()
+  local want = {
+    rt = "Run: Nearest Test",        rT = "Debug: Nearest Test",
+    rf = "Run: Current Test File",   rF = "Debug: Choose a Test in This File",
+    rp = "Run: Pick an Entry Point", rP = "Debug: Pick an Entry Point",
+    rl = "Run: Again (last run)",    rL = "Debug: Again (last debug)",
+    dc = "Debug: Continue (resume only)",
+    di = "Debug: Step Into", ["do"] = "Debug: Step Over", dO = "Debug: Step Out",
+  }
+  local bad = {}
+  for k, d in pairs(want) do
+    local m = vim.fn.maparg("<leader>" .. k, "n", false, true)
+    if type(m) ~= "table" or m.desc ~= d then bad[#bad + 1] = k .. " = " .. tostring(m.desc) end
+  end
+  table.sort(bad)
+  ok("[36i] every key in the table is bound, with its description", #bad == 0, vim.inspect(bad))
+  local ours = function(m) return type(m) == "table" and type(m.desc) == "string"
+    and (m.desc:match("^Run:") or m.desc:match("^Debug:")) end
+  local lingering = {}
+  for _, k in ipairs({ "rr", "rc", "dt", "dm", "dD" }) do
+    if ours(vim.fn.maparg("<leader>" .. k, "n", false, true)) then lingering[#lingering + 1] = k end
+  end
+  ok("[36i] the replaced keys are gone (rr, rc, dt, dm, dD)", #lingering == 0, vim.inspect(lingering))
+  local leader = vim.g.mapleader or "\\"
+  local under_R = {}
+  for _, m in ipairs(vim.api.nvim_get_keymap("n")) do
+    if m.lhs:sub(1, #leader + 1) == leader .. "R" and ours(m) then under_R[#under_R + 1] = m.lhs end
+  end
+  ok("[36i] auto-run binds nothing under <leader>R (remote-sync's prefix)", #under_R == 0, vim.inspect(under_R))
+
+  -- da / dA are delve-only: bound in go buffers, never globally.
+  ok("[36i] dA is not a global mapping", not ours(vim.fn.maparg("<leader>dA", "n", false, true)))
+  vim.cmd("enew!")
+  vim.bo.filetype = "go"
+  local dA = vim.fn.maparg("<leader>dA", "n", false, true)
+  ok("[36i] dA is bound in a go buffer", ours(dA) and dA.buffer == 1, vim.inspect(dA))
+  vim.cmd("enew!")
+
+  -- rF: choose a test IN THIS FILE to debug.
+  worktree.set_active(gofix)
+  require("auto-run.store.paths").invalidate()
+  local disc = P3.discovery
+  disc._reset_for_tests()
+  disc.parse_file(calc_test, P3.adapters.get("go"))
+  vim.cmd.edit(vim.fn.fnameescape(calc_test))
+  local offered, debugged
+  local real_select, real_dp = vim.ui.select, disc.debug_position
+  vim.ui.select = function(items, opts, cb)
+    offered = items
+    for i, it in ipairs(items) do
+      local label = opts and opts.format_item and opts.format_item(it) or tostring(it)
+      if label:find("TestFail", 1, true) then return cb(it, i) end
+    end
+    cb(nil, nil)
+  end
+  disc.debug_position = function(id) debugged = id; return true end
+  pcall(vim.fn.maparg("<leader>rF", "n", false, true).callback)
+  vim.ui.select, disc.debug_position = real_select, real_dp
+  ok("[36i] rF offers this file's tests and debugs the chosen one",
+    debugged == calc_test .. "::TestFail" and type(offered) == "table" and #offered >= 2,
+    tostring(debugged) .. " " .. vim.inspect(offered))
+
+  -- rp / rP: pick an entry point, dispatching on kind (the :AutoRun run/debug rule).
+  local exec, darp = P2.exec, require("auto-run.dap")
+  -- Own fixture: the dispatch reads the config's kind, so it must exist here.
+  if not store.get("gofix-tests") then
+    store.add({ name = "gofix-tests", kind = "test", runtime = "go", program = "./calc" }, { tier = "tracked" })
+  end
+  local calls = {}
+  local real = { pc = exec.pick_config, tr = exec.test_run, st = exec.start, dt = darp.debug_test, ds = darp.debug_start }
+  exec.pick_config = function(_, cb) cb("gofix-tests") end
+  exec.test_run = function(n) calls[#calls + 1] = "test_run:" .. n; return { id = "x", strategy = "run" } end
+  exec.start = function(n) calls[#calls + 1] = "start:" .. n; return { id = "x", strategy = "run" } end
+  darp.debug_test = function(n) calls[#calls + 1] = "debug_test:" .. tostring(n); return true end
+  darp.debug_start = function(n) calls[#calls + 1] = "debug_start:" .. n; return true end
+  pcall(vim.fn.maparg("<leader>rp", "n", false, true).callback)
+  pcall(vim.fn.maparg("<leader>rP", "n", false, true).callback)
+  exec.pick_config, exec.test_run, exec.start = real.pc, real.tr, real.st
+  darp.debug_test, darp.debug_start = real.dt, real.ds
+  ok("[36i] rp / rP dispatch a picked test config to test_run / debug_test",
+    vim.deep_equal(calls, { "test_run:gofix-tests", "debug_test:gofix-tests" }), vim.inspect(calls))
+end
+section36i()
+
+-- ── [36j] Again: replay the last run / debug (ADR 0199 §4.2a) ──────────
+-- Recorded once, at the TRUE launch boundary: a run when its job spawned, a
+-- debug when the launch reached nvim-dap — never at the synchronous return of
+-- an async prepare, which can still fail or be cancelled. The record is a
+-- descriptor (position id / config name + the anchor it ran under), so a
+-- replay re-resolves; a target that is gone, or a changed active worktree, is
+-- refused rather than silently substituted.
+print("\n[36j] Again — the last-run recorder")
+local section36j = function()
+  local okl, last = pcall(require, "auto-run.last")
+  ok("[36j] auto-run.last exists", okl, tostring(last))
+  if not okl then return end
+  last._reset_for_tests()
+  worktree.set_active(gofix)
+  require("auto-run.store.paths").invalidate()
+  local disc = P3.discovery
+  disc._reset_for_tests()
+  disc.parse_file(calc_test, P3.adapters.get("go"))
+  local job = require("auto-run.exec.job")
+  local real_spawn = job.spawn
+  local spawned = {}
+  job.spawn = function(spec) spawned[#spawned + 1] = spec; return { id = spec.id }, nil end
+  local function ran(needle)
+    for _, sp in ipairs(spawned) do
+      if table.concat(sp.cmd or {}, " "):find(needle, 1, true) then return true end
+    end
+    return false
+  end
+  local fail_id = calc_test .. "::TestFail"
+
+  -- A position run — what the tests pane's `r` calls — is recorded.
+  disc.run_position(fail_id)
+  local d = last.peek("run")
+  ok("[36j] a position run (the tests pane's path) is recorded as a descriptor",
+    d and d.via == "position" and d.id == fail_id and d.anchor == gofix, vim.inspect(d))
+  spawned = {}
+  local okr, rerr = last.replay("run")
+  ok("[36j] Again re-runs that position", okr and ran("TestFail"), tostring(rerr) .. vim.inspect(spawned))
+
+  -- A config run is recorded, and replays by name.
+  store.add({ name = "last-run", kind = "run", runtime = "go", program = "${worktree}/calc" }, { tier = "tracked" })
+  P2.exec.start("last-run")
+  d = last.peek("run")
+  ok("[36j] a config run is recorded by name", d and d.via == "config" and d.name == "last-run", vim.inspect(d))
+
+  -- Refusals: a vanished config, a vanished position, a changed worktree.
+  store.remove("last-run", { tier = "tracked" })
+  spawned = {}
+  okr, rerr = last.replay("run")
+  ok("[36j] a config that no longer exists is refused, not substituted",
+    okr == nil and tostring(rerr):find("last-run", 1, true) ~= nil and #spawned == 0, tostring(rerr))
+  disc.run_position(fail_id)
+  disc._reset_for_tests()
+  spawned = {}
+  okr, rerr = last.replay("run")
+  ok("[36j] a position that is no longer discovered is refused",
+    okr == nil and tostring(rerr):find("TestFail", 1, true) ~= nil and #spawned == 0, tostring(rerr))
+  disc.parse_file(calc_test, P3.adapters.get("go"))
+  disc.run_position(fail_id)
+  worktree.set_active(jestfix)
+  require("auto-run.store.paths").invalidate()
+  spawned = {}
+  okr, rerr = last.replay("run")
+  ok("[36j] after a worktree change, Again refuses and names where the last run was",
+    okr == nil and tostring(rerr):find(gofix, 1, true) ~= nil and #spawned == 0, tostring(rerr))
+  worktree.set_active(gofix)
+  require("auto-run.store.paths").invalidate()
+  disc._reset_for_tests()
+  disc.parse_file(calc_test, P3.adapters.get("go"))
+  job.spawn = real_spawn
+
+  -- Debug: recorded only when the launch reaches nvim-dap.
+  local go = P3.adapters.get("go")
+  local darp = require("auto-run.dap")
+  local real_pd, real_launch = go.prepare_debug, darp.launch
+  local launched = 0
+  darp.launch = function() launched = launched + 1; return true end
+  last._reset_for_tests()
+  go.prepare_debug = function(_, _, cb) cb(nil, { message = "injected build failure" }) end
+  disc.debug_position(fail_id)
+  ok("[36j] a debug whose async prepare FAILS is not recorded", last.peek("debug") == nil, vim.inspect(last.peek("debug")))
+  go.prepare_debug = function(_, token, cb) token.cancelled = true; cb({ dap_type = "go", program = "x" }) end
+  disc.debug_position(fail_id)
+  ok("[36j] a debug CANCELLED mid-prepare is not recorded", last.peek("debug") == nil and launched == 0,
+    vim.inspect(last.peek("debug")) .. " launched=" .. launched)
+  darp.launch = function() launched = launched + 1; return nil, "injected dap.run failure" end
+  go.prepare_debug = function(_, _, cb) cb({ dap_type = "go", program = "x" }) end
+  disc.debug_position(fail_id)
+  ok("[36j] a debug whose launch FAILS is not recorded", last.peek("debug") == nil, vim.inspect(last.peek("debug")))
+  darp.launch = function() launched = launched + 1; return true end
+  disc.debug_position(fail_id)
+  d = last.peek("debug")
+  ok("[36j] a debug that reaches nvim-dap is recorded, once", d and d.via == "position" and d.id == fail_id,
+    vim.inspect(d))
+  local replayed_id
+  local real_dp = disc.debug_position
+  disc.debug_position = function(id) replayed_id = id; return true end
+  okr, rerr = last.replay("debug")
+  disc.debug_position = real_dp
+  ok("[36j] Again (debug) debugs the same position", okr and replayed_id == fail_id, tostring(rerr))
+  go.prepare_debug, darp.launch = real_pd, real_launch
+
+  -- rL with nothing recorded falls back to nvim-dap's own run_last.
+  last._reset_for_tests()
+  local dapm = require("dap")
+  local real_rl, rl_calls = dapm.run_last, 0
+  dapm.run_last = function() rl_calls = rl_calls + 1 end
+  auto_run.default_keymaps()
+  pcall(vim.fn.maparg("<leader>rL", "n", false, true).callback)
+  dapm.run_last = real_rl
+  ok("[36j] rL with nothing recorded falls back to nvim-dap's run_last", rl_calls == 1, "calls=" .. rl_calls)
+end
+section36j()
 
 -- ── [37] dap failed-start capture — no false positive on success ──
 -- Runs LAST: the genuine-failure assertion persists `last_failure` in the
