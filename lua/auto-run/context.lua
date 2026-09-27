@@ -92,14 +92,47 @@ function M.test_config(runtime)
   return { name = name, source = source, ignored_pick = ignored }
 end
 
----Everything a header needs in one call.
----@param opts { runtimes: string[]? }?  runtimes to report a test config for
+---Runtimes that have test positions in the current discovery tree, sorted —
+---one entry per adapter that claims a discovered test file. The tests-pane
+---header shows one Test config entry per runtime listed here, and an explicit
+---absence when the list is empty (ADR 0199 §5.2).
+---@return string[]
+function M.test_runtimes()
+  local okd, disc = pcall(require, "auto-run.discovery")
+  local oka, adapters = pcall(require, "auto-run.adapters")
+  if not (okd and oka) then return {} end
+  local okt, tree = pcall(disc.tree)
+  if not okt or type(tree) ~= "table" or not tree.root then return {} end
+  local seen, out = {}, {}
+  local function walk(node)
+    for _, child in ipairs(node.children or {}) do
+      if child.type == "file" then
+        local oks, ad = pcall(adapters.adapter_for, child.path)
+        if oks and ad and ad.name and not seen[ad.name] then
+          seen[ad.name] = true
+          out[#out + 1] = ad.name
+        end
+      elseif child.type == "dir" then
+        walk(child)
+      end
+    end
+  end
+  walk(tree.root)
+  table.sort(out)
+  return out
+end
+
+---Everything a header needs in one call. `runtimes` defaults to the runtimes
+---that have discovered test positions.
+---@param opts { runtimes: string[]? }?
 ---@return table
 function M.resolve(opts)
   opts = opts or {}
+  local runtimes = opts.runtimes or M.test_runtimes()
   local tests = {}
-  for _, rt in ipairs(opts.runtimes or {}) do tests[rt] = M.test_config(rt) end
-  return { worktree = M.worktree(), env = M.env(), base = M.base(), tests = tests }
+  for _, rt in ipairs(runtimes) do tests[rt] = M.test_config(rt) end
+  return { worktree = M.worktree(), env = M.env(), base = M.base(),
+           runtimes = runtimes, tests = tests }
 end
 
 function M._reset_for_tests()

@@ -4349,10 +4349,17 @@ local section36e = function()
       t.source == c.source and t.ignored_pick == c.ignored, vim.inspect(t))
   end
 
-  -- One call for the whole header.
-  local all = ctxm.resolve({ runtimes = { "go" } })
-  ok("[36e] resolve() carries every header field",
-    all.worktree and all.env and all.base and all.tests and all.tests.go ~= nil, vim.inspect(all))
+  -- One call for the whole header. After ran() the go test file is in the
+  -- discovery tree, so resolve()'s DEFAULT runtimes must find go by itself.
+  ok("[36e] test_runtimes() reports the runtimes that have test positions",
+    vim.deep_equal(ctxm.test_runtimes(), { "go" }), vim.inspect(ctxm.test_runtimes()))
+  local all = ctxm.resolve()
+  ok("[36e] resolve() defaults to the discovered runtimes and carries every header field",
+    all.worktree and all.env and all.base and vim.deep_equal(all.runtimes, { "go" })
+      and all.tests.go ~= nil, vim.inspect(all))
+  disc._reset_for_tests()
+  ok("[36e] with nothing discovered, test_runtimes() is empty (the header shows the absence)",
+    vim.deep_equal(ctxm.test_runtimes(), {}), vim.inspect(ctxm.test_runtimes()))
 
   job.spawn = real_spawn
   exec.clear_pick(nil)
