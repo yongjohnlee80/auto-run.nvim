@@ -4550,6 +4550,14 @@ local section36g = function()
     type(path) == "string" and vim.fn.filereadable(path) == 1 and eff and eff.kind == "debug"
       and eff.runtime == "go", tostring(err) .. " " .. vim.inspect(eff))
   ok("[36g] …and announces it (the panes re-render)", changed ~= nil, vim.inspect(changed))
+  -- The runtime must SELECT the adapter: with go alone, the adapter's defaults
+  -- and the go-shaped fallback both say runtime=go, so a scaffold that ignored
+  -- `runtime` would pass. Rust's defaults say rust and carry no program.
+  local pr, er = reg.scaffold("test", "sc-rs", "rust")
+  local effr = pr and store.get("sc-rs")
+  ok("[36g] the runtime selects the adapter's defaults (rust → runtime=rust, no program)",
+    effr and effr.runtime == "rust" and effr.kind == "test" and effr.program == nil,
+    tostring(er) .. " " .. vim.inspect(effr))
   local p2, e2 = reg.scaffold("run", "sc-plain", nil)
   local eff2 = p2 and store.get("sc-plain")
   ok("[36g] no runtime → the historical go-shaped default", eff2 and eff2.kind == "run"
@@ -4560,7 +4568,7 @@ local section36g = function()
   ok("[36g] an unknown kind is refused", p4 == nil and type(e4) == "string", tostring(e4))
   local p5, e5 = reg.scaffold("run", "", "go")
   ok("[36g] an empty name is refused", p5 == nil and type(e5) == "string", tostring(e5))
-  for _, n in ipairs({ "sc-go", "sc-plain" }) do pcall(store.remove, n) end
+  for _, n in ipairs({ "sc-go", "sc-plain", "sc-rs" }) do pcall(store.remove, n) end
   worktree.set_active(prev)
   require("auto-run.store.paths").invalidate()
 end
