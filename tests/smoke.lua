@@ -5924,6 +5924,73 @@ else
   end)()
 end
 
+-- ── [43] field docs, folder-aware scaffolds, env files in .auto-run/ ──
+-- Johno, 2026-09-29: a scaffolded config said nothing about what else it
+-- could hold ("what are the available fields and allowed values"), a Go
+-- scaffold in a chosen folder pointed at the repo root (no go.mod there), and
+-- a new env file could not live in .auto-run/.
+print("\n[43] field docs, folder-aware scaffolds, env files in .auto-run/")
+;(function()
+  local schema = require("auto-run.store.schema")
+  for _, rec in ipairs({ "config", "profile" }) do
+    local missing = {}
+    for _, f in ipairs(schema.field_names(rec)) do
+      local d = schema.field_doc(rec, f)
+      if not (d and type(d.help) == "string" and d.help ~= "") then missing[#missing + 1] = f end
+    end
+    ok("[43] every " .. rec .. " field has a help text", #missing == 0, vim.inspect(missing))
+    local stray = {}
+    local known = {}
+    for _, f in ipairs(schema.field_names(rec)) do known[f] = true end
+    for f in pairs(schema.FIELD_DOCS[rec]) do if not known[f] then stray[#stray + 1] = f end end
+    ok("[43] no " .. rec .. " doc names a field the schema rejects", #stray == 0, vim.inspect(stray))
+  end
+  local kinds = {}
+  for k in pairs(schema.VALID_KIND) do kinds[#kinds + 1] = k end
+  table.sort(kinds)
+  local kv = vim.deepcopy(schema.field_doc("config", "kind").values); table.sort(kv)
+  ok("[43] kind's allowed values are exactly the ones validation accepts", vim.deep_equal(kinds, kv), vim.inspect(kv))
+  ok("[43] cargo_target_kind lists lib, bin, test",
+    vim.deep_equal(schema.field_doc("config", "cargo_target_kind").values, { "lib", "bin", "test" }))
+
+  -- The Go scaffold, anchored at the working directory.
+  local prev_wt = worktree.get_active()
+  local mono = fx .. "/mono43"
+  ok("[43] fixture: a repo with a Go folder", make_plain_repo(mono))
+  vim.fn.mkdir(mono .. "/svc", "p")
+  local go = require("auto-run.adapters.go")
+  worktree.set_active(mono .. "/svc")
+  store_paths.invalidate()
+  local t = go.default_config("test", "unit")
+  local r = go.default_config("debug", "server")
+  ok("[43] in a chosen folder, a Go test config targets the folder and runs there",
+    t.program == "${worktree}/svc" and t.cwd == "${worktree}/svc", vim.inspect(t))
+  ok("[43] ... and a Go entry point sits under the folder's cmd/",
+    r.program == "${worktree}/svc/cmd/server" and r.cwd == "${worktree}/svc", vim.inspect(r))
+  worktree.set_active(mono)
+  store_paths.invalidate()
+  local t2 = go.default_config("test", "unit")
+  ok("[43] at the repo root the scaffold is unchanged (no cwd)",
+    t2.program == "${worktree}" and t2.cwd == nil, vim.inspect(t2))
+
+  -- An env file in .auto-run/: created, and listed by discovery.
+  local env = require("auto-run.env")
+  local path, cerr = env.create_file(mono .. "/.auto-run/.env")
+  ok("[43] an env file can be created in .auto-run/ (the directory is made)",
+    path ~= nil and vim.fn.filereadable(mono .. "/.auto-run/.env") == 1, vim.inspect(cerr))
+  local listed = false
+  for _, c in ipairs(env.files_list() or {}) do
+    if c.path == require("auto-core.fs.path").normalize(mono .. "/.auto-run/.env") then listed = true end
+  end
+  ok("[43] env discovery lists it", listed)
+  local bad, berr = env.create_file(mono .. "/.auto-run/configs/.env")
+  ok("[43] a deeper directory is still refused", bad == nil and tostring(berr and berr.message):find("not one of them", 1, true) ~= nil,
+    vim.inspect(berr))
+
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end)()
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

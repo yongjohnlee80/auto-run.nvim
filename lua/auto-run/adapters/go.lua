@@ -507,12 +507,24 @@ end
 ---@param name string?
 ---@return table
 function M.default_config(kind, name)
-  return {
+  -- Anchored at the working directory: when a FOLDER of the repo was chosen
+  -- (go-contacts/ in a multi-project repo), `${worktree}` alone names the repo
+  -- root, which has no go.mod. The folder is recorded as `cwd` too, so the
+  -- config keeps working after the working directory moves elsewhere.
+  local dirs = require("auto-run.store").resolve_run_dirs()
+  local root, workdir = dirs.root, dirs.workdir
+  local folder
+  if root and workdir and workdir ~= root and workdir:sub(1, #root + 1) == root .. "/" then
+    folder = workdir:sub(#root + 2)
+  end
+  local base = folder and ("${worktree}/" .. folder) or "${worktree}"
+  local cfg = {
     runtime = "go",
     kind = kind,
-    program = kind == "test" and "${worktree}"
-      or ("${worktree}/cmd/" .. tostring(name or "app")),
+    program = kind == "test" and base or (base .. "/cmd/" .. tostring(name or "app")),
   }
+  if folder then cfg.cwd = base end
+  return cfg
 end
 
 ---argv for the run/term strategies (NEVER a DAP launch — that is

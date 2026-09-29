@@ -169,6 +169,11 @@ scaffolding through `adapters.scaffold`), by hand under
 `.auto-run/configs/`, or by importing a `launch.json` (`:AutoRun import` —
 its `env` and `envFile` land as `env` and `env_files`).
 
+**Every field and its allowed values** are documented in
+`auto-run.store.schema.FIELD_DOCS`; auto-finder's panes show them beside each
+field of an expanded config (`o`), and `e` sets one, with a chooser for the
+fixed sets (kind, runtime, profile, extends, cargo_target_kind).
+
 **Environment.** Both adapters compose identically, so anything that works
 for go works for jest:
 

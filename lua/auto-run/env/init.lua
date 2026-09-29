@@ -347,7 +347,7 @@ end
 -- What env-file DISCOVERY scans, shared with `create_file` so a file it creates
 -- is always one discovery lists: these names, in these subdirectories of the
 -- worktree root and of the bare-repo container (non-recursive).
-local ENV_SUBDIRS = { "", ".config", ".vscode" }
+local ENV_SUBDIRS = { "", ".config", ".vscode", ".auto-run" }
 local function is_env_name(f)
   return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
 end
@@ -731,7 +731,7 @@ function M.create_file(path)
         "create_file: " .. path .. " is outside the worktree (" .. tostring(bases[1]) .. ")", { path = path })
     end
     return nil, structured_err("not_discoverable",
-      "create_file: env files live in the worktree root or its .config/ or .vscode/"
+      "create_file: env files live in the worktree root or its .config/, .vscode/ or .auto-run/"
       .. " (where env discovery looks); " .. parent .. " is not one of them", { path = path })
   end
   if not is_env_name(name) then
