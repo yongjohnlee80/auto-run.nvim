@@ -815,6 +815,10 @@ print("\n[8] import — JSONC parse, read-through, one-shot migration")
 local import = require("auto-run.import")
 
 local lj = fx .. "/lj-repo"
+-- The launch.json's "Debug Gold" builds ${workspaceFolder}/cmd/gold: give it
+-- that package directory, or the go adapter refuses the missing program
+-- before launch (v0.1.18) — as it should for a config that could never build.
+vim.fn.mkdir(lj .. "/cmd/gold", "p")
 ok("launch.json fixture repo created", make_plain_repo(lj))
 write_file(lj .. "/.vscode/launch.json", [[
 {
