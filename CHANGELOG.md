@@ -307,6 +307,13 @@ Patch.
   events, so `run.session:changed` never fired and auto-finder's debug pane
   kept listing the session. nvim-dap drops every session through
   `listeners.on_session`; auto-run now publishes `state = "closed"` there.
+- **A Go `program` path that does not exist is refused before launch.** A
+  program given as a path (`/…`, `./…`, `../…`, relative ones against the
+  launch cwd) must be an existing directory or file; otherwise run, debug and
+  nvim-dap's picker (`translate`) stop with "program … does not exist" and
+  code `program_missing`. It went to delve, which failed its build and left a
+  dead session behind. Import paths, `...` patterns and unresolved tokens are
+  left to go. `adapters.go.program_error(eff)`.
 - **Env files can live in `.auto-run/`**: env discovery lists
   `.auto-run/{.env,.env.*,*.env}`, and `env.create_file` accepts it (the
   directory is created if missing). Files there are tracked with the repo.

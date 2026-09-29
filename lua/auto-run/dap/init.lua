@@ -335,6 +335,12 @@ end
 function M.translate(name, opts)
   local eff, comp, err, detail = resolve_effective(name, opts)
   if not eff then return nil, err, detail end
+  -- The same program check the go adapter's launch paths make, so nvim-dap's
+  -- own picker cannot start delve on a directory that does not exist.
+  if eff.runtime == "go" or eff.runtime == nil then
+    local perr = require("auto-run.adapters.go").program_error(eff)
+    if perr then return nil, perr, { code = "program_missing", message = perr } end
+  end
   return eff_to_dap(eff, comp), nil
 end
 

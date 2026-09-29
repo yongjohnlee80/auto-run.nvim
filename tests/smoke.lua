@@ -6032,6 +6032,61 @@ print("\n[44] a session that closes without terminated/exited is announced")
   core.events.unsubscribe(sub)
 end)()
 
+-- ── [45] a Go program directory that does not exist is refused ──────
+-- Johno, 2026-09-29: `program: ${worktree}/cmd/server` in a repo whose server
+-- lives in go-contacts/ — delve failed its build ("directory not found") and
+-- nvim-dap kept a dead session. Checked before delve is ever started now.
+print("\n[45] a Go program directory that does not exist is refused before launch")
+;(function()
+  local go = require("auto-run.adapters.go")
+  local root = fx .. "/prog45"
+  vim.fn.mkdir(root .. "/svc/cmd/server", "p")
+  local function eff(program, cwd) return { name = "c45", kind = "debug", runtime = "go", program = program, cwd = cwd } end
+
+  local e1 = go.program_error(eff(root .. "/cmd/server", root))
+  ok("[45] a missing absolute program directory is refused, naming it",
+    type(e1) == "string" and e1:find("does not exist", 1, true) ~= nil and e1:find("cmd/server", 1, true) ~= nil, tostring(e1))
+  ok("[45] an existing absolute directory passes", go.program_error(eff(root .. "/svc/cmd/server", root)) == nil)
+  ok("[45] a relative path resolves against cwd (exists → passes)", go.program_error(eff("./cmd/server", root .. "/svc")) == nil)
+  ok("[45] a relative path resolves against cwd (missing → refused)",
+    type(go.program_error(eff("./cmd/server", root))) == "string")
+  ok("[45] import paths, ... patterns and unresolved tokens are left to go",
+    go.program_error(eff("example.com/x/cmd/y", root)) == nil and go.program_error(eff("./...", root)) == nil
+      and go.program_error(eff("${worktree}/cmd/x", root)) == nil and go.program_error(eff(nil, root)) == nil)
+
+  local argv, aerr = go.build_run_argv({ name = "r45", kind = "run", runtime = "go", program = root .. "/cmd/server", cwd = root })
+  ok("[45] a run is refused the same way", argv == nil and tostring(aerr):find("does not exist", 1, true) ~= nil, tostring(aerr))
+  local targv = go.build_run_argv({ name = "t45", kind = "test", runtime = "go", program = root .. "/nope", cwd = root },
+    { package = "./svc/..." })
+  ok("[45] a test run with a position's package does not consult program", targv ~= nil, vim.inspect(targv))
+
+  local got, gerr, fired
+  go.prepare_debug_config(eff(root .. "/cmd/server", root), {}, function(l, e) got, gerr, fired = l, e, true end)
+  ok("[45] a debug is refused before delve, with code program_missing",
+    fired and got == nil and gerr and gerr.code == "program_missing", vim.inspect(gerr))
+
+  -- translate (nvim-dap's own picker path) refuses too, and no session starts.
+  local prev_wt = worktree.get_active()
+  ok("[45] fixture: a repo for translate", make_plain_repo(root .. "/repo"))
+  worktree.set_active(root .. "/repo")
+  store_paths.invalidate()
+  store.add({ name = "missing-prog", kind = "debug", runtime = "go", program = "${worktree}/cmd/server" }, { tier = "tracked" })
+  local cfg, terr = require("auto-run.dap").translate("missing-prog")
+  ok("[45] translate refuses a missing program", cfg == nil and tostring(terr):find("does not exist", 1, true) ~= nil,
+    tostring(terr))
+  local okd, dap = pcall(require, "dap")
+  if okd then
+    local before = vim.tbl_count(dap.sessions())
+    require("auto-run.dap").debug_start("missing-prog")
+    vim.wait(200, function() return false end)
+    ok("[45] debug_start on it leaves nvim-dap without a new session", vim.tbl_count(dap.sessions()) == before,
+      vim.inspect(vim.tbl_keys(dap.sessions())))
+  end
+  store.remove("missing-prog")
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end)()
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end
