@@ -521,6 +521,14 @@ target that no longer exists, or a changed active worktree, is refused with a
 message rather than silently substituted. `rL` with no auto-run debug yet falls
 back to nvim-dap's own `run_last`.
 
+`<leader>rw` chooses the **working directory**: a worktree from the same list
+`<leader>gw` shows, then the worktree root, one of its project folders (a
+`go.mod`, `Cargo.toml`, `package.json`, `pubspec.yaml` … within two levels) or
+a typed directory. That directory is where test discovery looks and where runs
+and debugs start when a config sets no `cwd`; the store stays at the repo root.
+The editor's cwd never moves (auto-core's `git.worktree.choose_active`, also the
+debug and tests panes' `w`).
+
 | Key | Action |
 |---|---|
 | `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out |

@@ -4,6 +4,7 @@
 ---`<leader>r` LAUNCHES — lowercase runs, the same letter UPPERCASE debugs:
 ---  rt / rT  nearest test          rf / rF  current file (rF: choose a test in it)
 ---  rp / rP  pick an entry point   rl / rL  again (the last run / debug)
+---  rw       the working directory: a worktree, then a folder in it (the cwd stays)
 ---`<leader>d` controls what is running: dc resume (never launches), di / do /
 ---dO step into / over / out, db dB dC breakpoints, dq dR terminate / restart,
 ---dv dw de view / watch / evaluate; da / dA (delve attach) in go buffers only.
@@ -195,6 +196,18 @@ function M.default_keymaps()
     local _, err = last.replay("debug")
     if err then log().warn("keymaps", err) end
   end, "Debug: Again (last debug)")
+
+  -- rw — where runs, debugs and test discovery work: a worktree from the list
+  -- <leader>gw shows, then its root, a project folder or a typed directory.
+  -- auto-core's choose_active; the editor's cwd never moves.
+  bind("n", "<leader>rw", function()
+    local okw, wt = pcall(require, "auto-core.git.worktree")
+    if not okw or type(wt.choose_active) ~= "function" then
+      return log().warn("keymaps", "choosing the working directory needs auto-core.nvim >= 0.2.32")
+    end
+    local ok, err = wt.choose_active()
+    if not ok then log().warn("keymaps", err) end
+  end, "Run: Working Directory (worktree / folder)")
 
   -- ── <leader>d — debug/DAP only (slimmed namespace) ─────────────
 

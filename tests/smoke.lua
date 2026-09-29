@@ -4697,6 +4697,7 @@ local section36i = function()
     rf = "Run: Current Test File",   rF = "Debug: Choose a Test in This File",
     rp = "Run: Pick an Entry Point", rP = "Debug: Pick an Entry Point",
     rl = "Run: Again (last run)",    rL = "Debug: Again (last debug)",
+    rw = "Run: Working Directory (worktree / folder)",
     dc = "Debug: Continue (resume only)",
     di = "Debug: Step Into", ["do"] = "Debug: Step Over", dO = "Debug: Step Out",
   }
@@ -5774,6 +5775,81 @@ do
   ok(("rust assertion floor: ran %d, expected at least %d"):format(rust_cells, RUST_MIN),
     rust_cells >= RUST_MIN, "a rust section stopped contributing assertions")
 end
+-- ── [42] working directory — a chosen folder inside a repo ─────────
+-- A multi-project repo (go-contacts/, rust-contacts/ ... in one repo) is one
+-- worktree. auto-core's choose_active (the panes' `w`, <leader>rw) can make a
+-- FOLDER of it the active directory; that folder is then where test discovery
+-- looks and where runs and debugs start, while the store stays at the repo
+-- root. Before, every path collapsed the anchor to the repo root, so choosing
+-- a folder changed nothing.
+print("\n[42] working directory — a chosen folder scopes discovery, runs and debugs")
+;(function()
+  local prev_wt = worktree.get_active()
+  local mono = fx .. "/mono42"
+  ok("[42] fixture: a repo with a project folder", make_plain_repo(mono))
+  vim.fn.mkdir(mono .. "/svc/cmd/x", "p")
+  store_paths.invalidate()
+
+  worktree.set_active(mono .. "/svc")
+  local d = store.resolve_run_dirs()
+  ok("[42] a chosen folder is the working directory", d.workdir == mono .. "/svc", tostring(d.workdir))
+  ok("[42] the store stays at the repo root",
+    d.root == mono and d.tracked == mono .. "/.auto-run", vim.inspect({ d.root, d.tracked }))
+  local w = require("auto-run.context").worktree()
+  ok("[42] the context names the folder inside the repo",
+    w.folder == "svc" and w.workdir == mono .. "/svc" and w.root == mono, vim.inspect(w))
+  ok("[42] test discovery looks in the folder",
+    require("auto-run.discovery").tree().root.path == mono .. "/svc",
+    tostring(require("auto-run.discovery").tree().root.path))
+
+  local okr, rerr = store.add({ name = "wd-run", kind = "run", program = "./cmd/x" }, { tier = "tracked" })
+  local okd, derr = store.add({ name = "wd-debug", kind = "debug", runtime = "go", program = "./cmd/x" },
+    { tier = "tracked" })
+  ok("[42] fixture: configs with no cwd", okr and okd, tostring(rerr or derr))
+  local cmd = require("auto-run.exec").command_line("wd-run")
+  ok("[42] a run with no cwd starts in the folder",
+    type(cmd) == "string" and cmd:find("^cd ") ~= nil and cmd:find(mono .. "/svc", 1, true) ~= nil, tostring(cmd))
+  local dcfg = require("auto-run.dap").translate("wd-debug")
+  ok("[42] a debug with no cwd starts in the folder",
+    type(dcfg) == "table" and dcfg.cwd == mono .. "/svc", vim.inspect(dcfg and dcfg.cwd))
+
+  -- The repo root chosen (as <leader>gw sets it): everything as before.
+  worktree.set_active(mono)
+  local r = store.resolve_run_dirs()
+  ok("[42] the repo root chosen: the working directory is the root", r.workdir == mono, tostring(r.workdir))
+  ok("[42] ... and the context names no folder", require("auto-run.context").worktree().folder == nil)
+
+  -- No choice at all: the cwd fallback keeps the repo root, even from a folder.
+  worktree.set_active(nil)
+  local cwd = vim.fn.getcwd()
+  vim.cmd.cd(vim.fn.fnameescape(mono .. "/svc"))
+  local c = store.resolve_run_dirs()
+  vim.cmd.cd(vim.fn.fnameescape(cwd))
+  ok("[42] with no choice, a cwd inside the repo still works at the repo root",
+    c.workdir == mono and c.root == mono, vim.inspect({ c.workdir, c.root }))
+
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end)()
+
+-- ── [42b] <leader>rw — auto-core's choose_active ──────────────────
+print("\n[42b] <leader>rw — the working directory, from auto-core's shared picker")
+;(function()
+  auto_run.default_keymaps()
+  local m = vim.fn.maparg("<leader>rw", "n", false, true)
+  ok("[42b] <leader>rw is bound", type(m) == "table" and m.desc == "Run: Working Directory (worktree / folder)",
+    vim.inspect(m and m.desc))
+  local wtm = require("auto-core.git.worktree")
+  local real = wtm.choose_active
+  local called = 0
+  wtm.choose_active = function() called = called + 1; return true end
+  pcall(m.callback)
+  wtm.choose_active = function() called = called + 1; return false, "no worktrees found under ~/x" end
+  pcall(m.callback)
+  wtm.choose_active = real
+  ok("[42b] <leader>rw calls auto-core's choose_active", called == 2, tostring(called))
+end)()
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

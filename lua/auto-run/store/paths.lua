@@ -156,6 +156,7 @@ end
 ---@field anchor string         resolved anchor path (additive diagnostic field)
 ---@field root string|nil       anchor's worktree root (additive diagnostic field)
 ---@field container string|nil  repo container for linked layouts (additive diagnostic field)
+---@field workdir string        the directory runs, debugs and discovery work in (see below)
 
 ---Resolve both store tiers for the current session. See the module
 ---doc for the locked contract; the return shape's first three fields
@@ -163,8 +164,8 @@ end
 ---(doctor, `run.status`, substitution context).
 ---@return AutoRunDirs
 function M.resolve_run_dirs()
-  local anchor = M.anchor()
-  if _cache and _cache.anchor == anchor then
+  local anchor, source = M.anchor_with_source()
+  if _cache and _cache.anchor == anchor and _cache.source == source then
     return _cache.dirs
   end
 
@@ -210,7 +211,18 @@ function M.resolve_run_dirs()
     }
   end
 
-  _cache = { anchor = anchor, dirs = dirs }
+  -- The working directory. A CHOSEN active directory is used as it is, so a
+  -- folder inside a repo (go-contacts/ in a multi-project repo) scopes test
+  -- discovery and is where runs and debugs start. The store stays at the
+  -- repo root either way: one set of configs per repo. The cwd fallback keeps
+  -- the repo root, as before; only a deliberate choice narrows the scope.
+  if source == "active" then
+    dirs.workdir = anchor
+  else
+    dirs.workdir = root or anchor
+  end
+
+  _cache = { anchor = anchor, source = source, dirs = dirs }
   return dirs
 end
 

@@ -284,6 +284,28 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.17] — 2026-09-29 — a folder inside a repo can be the working directory
+
+Patch. Needs auto-core.nvim v0.2.32.
+
+A repo holding several projects (go-contacts/, rust-contacts/, web/ ...) is
+one worktree, and every execution path collapsed the anchor to the repo root,
+so there was no way to work in one of its folders. `resolve_run_dirs()` now
+carries `workdir`: the active directory as chosen when it was chosen (a folder
+inside the repo), else the repo root as before. It is what test discovery
+scans, the default cwd of a run and of a debug (delve builds inside the
+module), and where Cargo metadata is resolved from. The store stays at the
+repo root, so one set of configs serves every folder. The cwd fallback is
+unchanged: only a deliberate choice narrows the scope. `context.worktree()`
+adds `workdir` and `folder` (its path inside the repo) for the pane headers.
+
+`<leader>rw` chooses it: auto-core's `choose_active`, the worktree list
+`<leader>gw` shows, then the worktree root, a project folder or a typed
+directory. The editor's cwd never moves.
+
+Smoke [42] (folder scope for discovery, runs, debugs and the store; the root
+and cwd cases unchanged) and [42b] (`<leader>rw`); [36i] lists `rw`.
+
 ## [v0.1.16] — 2026-09-27 — the APIs for managing env files and profiles from the panes (ADR 0199 §6.5)
 
 Patch, additive. Pairs with auto-finder v0.5.3 (delete, test-config editing, env

@@ -658,8 +658,10 @@ end
 ---failed with "no Cargo metadata at $WORKSPACE" (ADR 0199 §7.2).
 ---@return string
 local function anchor_dir()
+  -- The working directory: a chosen folder (rust-contacts/ in a
+  -- multi-project repo, where the repo root has no Cargo.toml), else the root.
   local dirs = require("auto-run.store").resolve_run_dirs()
-  return dirs.root or dirs.anchor
+  return dirs.workdir or dirs.root or dirs.anchor
 end
 
 ---The ONE authoritative Cargo identity for a GENERIC (non-position) config,
