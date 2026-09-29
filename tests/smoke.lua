@@ -5991,6 +5991,47 @@ print("\n[43] field docs, folder-aware scaffolds, env files in .auto-run/")
   store_paths.invalidate()
 end)()
 
+-- ── [44] a session that closes without terminated/exited ─────────
+-- Johno, 2026-09-29: delve failed its build ("directory not found"), the
+-- session closed before `initialized`, and the debug pane kept listing it:
+-- run.session:changed fired only on the adapter's terminated / exited events,
+-- which such a session never sends. nvim-dap drops every session through
+-- set_session → listeners.on_session; that is announced now.
+print("\n[44] a session that closes without terminated/exited is announced")
+;(function()
+  local okd, dap = pcall(require, "dap")
+  if not (okd and type(dap.listeners.on_session) == "table") then
+    print("  SKIP  [44] this nvim-dap has no listeners.on_session")
+    return
+  end
+  local seen = {}
+  local sub = core.events.subscribe("run.session:changed", function(p) seen[#seen + 1] = p end)
+  -- The real path: a closed session is current, and <leader>dq terminates it.
+  local fake = { id = 4242, closed = true, config = { name = "[auto-run] go" }, on_close = {}, capabilities = {} }
+  dap.set_session(fake)
+  vim.wait(100, function() return false end)
+  seen = {}
+  dap.terminate()
+  vim.wait(500, function() return #seen > 0 end)
+  ok("[44] terminating an already-closed session announces it as closed",
+    #seen == 1 and seen[1].id == "4242" and seen[1].state == "closed" and seen[1].config == "[auto-run] go",
+    vim.inspect(seen))
+  ok("[44] ... and nvim-dap no longer holds it", dap.session() == nil and dap.sessions()[4242] == nil)
+
+  -- A switch between two live sessions is not a close.
+  seen = {}
+  local a = { id = 4301, closed = false, config = { name = "a" }, on_close = {} }
+  local b = { id = 4302, closed = false, config = { name = "b" }, on_close = {} }
+  dap.set_session(a)
+  dap.set_session(b)
+  vim.wait(100, function() return false end)
+  local closed = vim.tbl_filter(function(p) return p.state == "closed" end, seen)
+  ok("[44] switching between live sessions announces no close", #closed == 0, vim.inspect(seen))
+  dap.sessions()[4301], dap.sessions()[4302] = nil, nil
+  dap.set_session(nil)
+  core.events.unsubscribe(sub)
+end)()
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

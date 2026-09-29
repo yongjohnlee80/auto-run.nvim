@@ -301,6 +301,12 @@ Patch.
   (go-contacts/ in a multi-project repo) a new Go config targets
   `${worktree}/<folder>` and records it as `cwd`. It pointed at the repo
   root, which has no go.mod. At the repo root nothing changes.
+- **A debug session that closes without `terminated` / `exited` is announced.**
+  delve failing its build closes the session before `initialized`, and
+  terminating an already-closed session only drops it; neither sends those
+  events, so `run.session:changed` never fired and auto-finder's debug pane
+  kept listing the session. nvim-dap drops every session through
+  `listeners.on_session`; auto-run now publishes `state = "closed"` there.
 - **Env files can live in `.auto-run/`**: env discovery lists
   `.auto-run/{.env,.env.*,*.env}`, and `env.create_file` accepts it (the
   directory is created if missing). Files there are tracked with the repo.

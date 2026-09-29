@@ -64,7 +64,7 @@ M.TOPICS = {
   },
   ["run.session:changed"] = {
     doc     = "A DAP session started / stopped / changed state (dap bridge, §6).",
-    payload = "{ id: string, config?: string, state: string }",
+    payload = "{ id: string, config?: string, state: 'running'|'terminated'|'exited'|'closed' }",
   },
   ["run.breakpoints:changed"] = {
     doc     = "The persisted breakpoint store changed (§9).",

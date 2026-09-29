@@ -239,6 +239,18 @@ local function setup_session_events(dap)
   dap.listeners.after.event_exited[key] = function(session)
     publish("run.session:changed", session_payload(session, "exited"))
   end
+  -- A session can close without either event: delve failing its build exits
+  -- before `initialized`, and terminating an already-closed session only
+  -- drops it. nvim-dap routes every such drop through set_session, which
+  -- calls on_session(old, new); announce the old one as closed so the panes
+  -- stop listing it. (Older nvim-dap has no on_session: nothing to hook.)
+  if type(dap.listeners.on_session) == "table" then
+    dap.listeners.on_session[key] = function(old, new)
+      if type(old) == "table" and old.closed and old ~= new then
+        publish("run.session:changed", session_payload(old, "closed"))
+      end
+    end
+  end
 end
 
 -- ── translation (effective config → dap config) ─────────────────
