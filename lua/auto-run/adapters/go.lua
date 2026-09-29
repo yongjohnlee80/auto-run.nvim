@@ -623,7 +623,9 @@ function M.prepare_debug(pos, _opts, cb)
     args = { "-test.run", run_regex(pos) },
     cwd = pkg_dir,
     -- delve's own build dir; without it delve builds from nvim's cwd.
-    extra = { mode = "test", dlvCwd = pkg_dir },
+    -- outputMode "remote": the test's output as DAP output events (dap-view
+    -- and the session journal); delve's default keeps it on its own stdout.
+    extra = { mode = "test", dlvCwd = pkg_dir, outputMode = "remote" },
   }
   local applied, err = require("auto-run.adapters.config").test_config(M.name)
   if err then return cb(nil, { code = "config_failed", message = err }) end
@@ -650,7 +652,7 @@ function M.prepare_debug_config(eff, _opts, cb)
     program = eff.program,
     cwd = cwd,
     env = eff.env,
-    extra = { mode = eff.kind == "test" and "test" or "debug", dlvCwd = cwd },
+    extra = { mode = eff.kind == "test" and "test" or "debug", dlvCwd = cwd, outputMode = "remote" },
   }
   if type(eff.args) == "table" and #eff.args > 0 then launch.args = eff.args end
   if type(eff.build_flags) == "string" and eff.build_flags ~= "" then

@@ -312,6 +312,10 @@ local function eff_to_dap(eff, comp)
       type = "go", request = "launch",
       mode = eff.kind == "test" and "test" or "debug",
       name = eff.name, program = eff.program, cwd = cwd, dlvCwd = cwd,
+      -- The program's stdout / stderr as DAP output events, so they reach
+      -- dap-view's REPL / console and the session journal (dap/sessions).
+      -- delve's default ("local") writes them to delve's own stdout instead.
+      outputMode = "remote",
     }
     if type(eff.args) == "table" and #eff.args > 0 then dap_cfg.args = eff.args end
     if type(eff.build_flags) == "string" and eff.build_flags ~= "" then

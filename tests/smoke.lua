@@ -6155,7 +6155,7 @@ print("\n[46] dap.sessions — the program's pid, port and an output journal")
   srv:bind("127.0.0.1", 0)
   srv:listen(1, function() end)
   local port = srv:getsockname().port
-  local snap = S._snapshot()
+  local snap = S._snapshot(true) -- fresh: an earlier info() cached one without this port
   local me = vim.fn.getpid()
   local listed = false
   for _, p in ipairs(snap.procs) do if p.pid == me then listed = true end end
@@ -6170,6 +6170,16 @@ print("\n[46] dap.sessions — the program's pid, port and an output journal")
   ok("[46] a closed session's journal is finished", S.info(s).ended_at ~= nil)
   os.remove(info.log)
   S._reset_for_tests()
+
+  -- delve forwards the program's output only with outputMode "remote".
+  local go = require("auto-run.adapters.go")
+  local root = fx .. "/out46"
+  vim.fn.mkdir(root .. "/cmd/srv", "p")
+  local launch
+  go.prepare_debug_config({ name = "o46", kind = "debug", runtime = "go", program = root .. "/cmd/srv", cwd = root }, {},
+    function(l) launch = l end)
+  ok("[46] a Go debug launch asks delve to forward the program's output (outputMode remote)",
+    launch and launch.extra and launch.extra.outputMode == "remote", vim.inspect(launch and launch.extra))
 end)()
 
 -- ── summary ─────────────────────────────────────────────────────

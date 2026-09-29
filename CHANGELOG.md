@@ -325,6 +325,10 @@ Patch.
   port it listens on. The port is the one the program listens on (`ss`,
   `lsof` on macOS), else the launch env's `PORT`. `info` also returns the
   `tail -f` and `kill` commands.
+- **Go debug launches forward the program's output** (`outputMode =
+  "remote"`). delve's default wrote the program's stdout / stderr to delve's
+  own stdout, so a server's logs never reached dap-view's REPL / console (nor
+  the session journal): only delve's "Building …" lines did.
 - **Env files can live in `.auto-run/`**: env discovery lists
   `.auto-run/{.env,.env.*,*.env}`, and `env.create_file` accepts it (the
   directory is created if missing). Files there are tracked with the repo.

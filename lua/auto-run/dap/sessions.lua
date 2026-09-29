@@ -115,9 +115,10 @@ local function run(cmd)
 end
 
 ---{ procs = { {pid, ppid, command} }, listen = { [pid] = { "addr:port", … } } }
-function M._snapshot()
+---@param fresh boolean?  skip the 1s cache
+function M._snapshot(fresh)
   local now = vim.uv.now()
-  if _cache.data and now - _cache.at < 1000 then return _cache.data end
+  if not fresh and _cache.data and now - _cache.at < 1000 then return _cache.data end
   local procs = {}
   for line in (run({ "ps", "-A", "-o", "pid=,ppid=,command=" }) or ""):gmatch("[^\n]+") do
     local pid, ppid, cmd = line:match("^%s*(%d+)%s+(%d+)%s+(.*)$")
