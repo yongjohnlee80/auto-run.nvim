@@ -276,12 +276,13 @@ local function resolve_effective(name, opts)
   if not comp then
     return nil, nil, cerr and cerr.message or "env composition failed", cerr
   end
-  -- Working dir default: the config's cwd, else the anchor's worktree root.
-  -- WITHOUT this, delve builds from nvim's cwd (outside the module in a
-  -- multi-repo parent) → "go.mod not found" → "Failed to launch".
+  -- Working dir default: the config's cwd, else the working directory (a
+  -- chosen folder, else the anchor's worktree root). WITHOUT this, delve
+  -- builds from nvim's cwd (outside the module in a multi-repo parent) →
+  -- "go.mod not found" → "Failed to launch".
   if type(eff.cwd) ~= "string" or eff.cwd == "" then
     local dirs = store.resolve_run_dirs()
-    eff.cwd = dirs.root or dirs.anchor
+    eff.cwd = dirs.workdir or dirs.root or dirs.anchor
   end
   return eff, comp, nil
 end

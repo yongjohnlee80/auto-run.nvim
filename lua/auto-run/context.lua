@@ -51,12 +51,19 @@ local function repo_identity(root)
 end
 
 ---Where auto-run is looking, and why.
----@return { anchor: string, source: "active"|"cwd", root: string?, is_repo: boolean, label: string, branch: string? }
+---`workdir` is where runs, debugs and discovery work; `folder` is its path
+---inside the repo when it is not the repo root (a chosen project folder).
+---@return { anchor: string, source: "active"|"cwd", root: string?, is_repo: boolean, label: string, branch: string?, workdir: string, folder: string? }
 function M.worktree()
   local anchor, source = require("auto-run.store.paths").anchor_with_source()
   local dirs = require("auto-run.store").resolve_run_dirs()
   local root = dirs.root
   local id = root and repo_identity(root) or {}
+  local workdir = dirs.workdir or root or anchor
+  local folder
+  if root and workdir ~= root and workdir:sub(1, #root + 1) == root .. "/" then
+    folder = workdir:sub(#root + 2)
+  end
   return {
     anchor  = anchor,
     source  = source,
@@ -64,6 +71,8 @@ function M.worktree()
     is_repo = root ~= nil,
     label   = id.label or vim.fn.fnamemodify(root or anchor, ":t"),
     branch  = id.branch,
+    workdir = workdir,
+    folder  = folder,
   }
 end
 

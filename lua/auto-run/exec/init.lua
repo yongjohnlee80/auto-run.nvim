@@ -119,7 +119,7 @@ end
 local function launch_cwd(eff)
   if type(eff.cwd) == "string" and eff.cwd ~= "" then return eff.cwd end
   local dirs = require("auto-run.store").resolve_run_dirs()
-  return dirs.root or dirs.anchor
+  return dirs.workdir or dirs.root or dirs.anchor
 end
 
 ---Build a terminal-ready shell command for RUNNING a config, without

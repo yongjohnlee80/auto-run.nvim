@@ -252,12 +252,13 @@ local _scan_gen = 0
 ---event-subscription handles (slot-replace pattern).
 local _subs = {}
 
----Anchor for discovery: the resolver's worktree root (anchor when
----outside a repo). Never getcwd, never the workspace root.
+---Anchor for discovery: the resolver's working directory — a chosen folder
+---inside a repo, else its worktree root (the anchor when outside a repo).
+---Never getcwd, never the workspace root.
 ---@return string
 local function anchor_root()
   local dirs = require("auto-run.store").resolve_run_dirs()
-  return dirs.root or dirs.anchor
+  return dirs.workdir or dirs.root or dirs.anchor
 end
 
 ---The position tree for the current anchor. A root change (worktree
