@@ -314,6 +314,17 @@ Patch.
   code `program_missing`. It went to delve, which failed its build and left a
   dead session behind. Import paths, `...` patterns and unresolved tokens are
   left to go. `adapters.go.program_error(eff)`.
+- **A debug session's pid, port and output journal** (`dap.sessions`,
+  `dap.session_info(session)`). The program's stdout / stderr, which DAP
+  delivers as `output` events and which went only to dap-view's console, are
+  also appended to `stdpath("state")/auto-run/sessions/<time>-<id>-<name>.log`
+  (the adapter's own lines marked `[dap]`, telemetry dropped; files older than
+  7 days swept), so `tail -f` follows them. The pid is the adapter's `process`
+  event's, else the adapter's child that is not the adapter itself (delve runs
+  `__debug_bin…`; its telemetry fork is skipped), the adapter found by the
+  port it listens on. The port is the one the program listens on (`ss`,
+  `lsof` on macOS), else the launch env's `PORT`. `info` also returns the
+  `tail -f` and `kill` commands.
 - **Env files can live in `.auto-run/`**: env discovery lists
   `.auto-run/{.env,.env.*,*.env}`, and `env.create_file` accepts it (the
   directory is created if missing). Files there are tracked with the repo.

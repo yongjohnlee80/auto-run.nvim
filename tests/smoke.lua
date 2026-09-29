@@ -6091,6 +6091,87 @@ print("\n[45] a Go program directory that does not exist is refused before launc
   store_paths.invalidate()
 end)()
 
+-- ── [46] a session's pid, port and output journal ─────────────────
+-- Johno, 2026-09-29: the debug pane's Active Sessions showed id / config /
+-- state only — "display the port number and pid … including how to journal
+-- the logs, with commands". nvim-dap keeps none of these.
+print("\n[46] dap.sessions — the program's pid, port and an output journal")
+;(function()
+  local okd, dap = pcall(require, "dap")
+  if not okd then print("  SKIP  [46] nvim-dap is not installed"); return end
+  local S = require("auto-run.dap.sessions")
+  S._reset_for_tests()
+  ok("[46] the listeners are attached by setup",
+    dap.listeners.after.event_output["auto-run-sessions"] ~= nil
+      and dap.listeners.after.event_process["auto-run-sessions"] ~= nil)
+
+  -- The journal: program output verbatim, the adapter's marked, telemetry dropped.
+  local s = { id = 7701, config = { name = "go server", env = { PORT = "9999" } }, adapter = { type = "server" } }
+  dap.listeners.after.event_initialized["auto-run-sessions"](s)
+  local out = dap.listeners.after.event_output["auto-run-sessions"]
+  out(s, { category = "stdout", output = "listening on :9999\n" })
+  out(s, { category = "stderr", output = "warn: slow\n" })
+  out(s, { category = "console", output = "Type 'dlv help' for list of commands.\n" })
+  out(s, { category = "telemetry", output = "{\"secret\":1}\n" })
+  local info = S.info(s)
+  ok("[46] a journal file is named for the session, under stdpath('state')/auto-run/sessions",
+    type(info.log) == "string" and vim.startswith(info.log, S.journal_dir()) and info.log:find("7701%-go_server%.log$") ~= nil,
+    tostring(info.log))
+  local body = info.log and table.concat(vim.fn.readfile(info.log), "\n") or ""
+  ok("[46] program output lands verbatim, the adapter's is marked, telemetry is not written",
+    body == "listening on :9999\nwarn: slow\n[dap] Type 'dlv help' for list of commands.", body)
+  ok("[46] with no process to read, the port comes from the launch env's PORT",
+    info.port == 9999 and info.port_source == "env", vim.inspect(info))
+  ok("[46] tail -f is offered for the journal", info.commands.tail == "tail -f " .. vim.fn.shellescape(info.log))
+
+  -- The adapter's process event names the pid.
+  dap.listeners.after.event_process["auto-run-sessions"](s, { systemProcessId = 424242, name = "x" })
+  info = S.info(s)
+  ok("[46] a process event's systemProcessId is the pid, and kill is offered",
+    info.pid == 424242 and info.commands.kill == "kill 424242", vim.inspect(info))
+
+  -- The process tree: the program is the adapter's child that is not the adapter itself.
+  local real_snap = S._snapshot
+  S._snapshot = function()
+    return {
+      procs = {
+        { pid = 500, ppid = 1, command = "/opt/dlv dap -l 127.0.0.1:38439" },
+        { pid = 501, ppid = 500, command = "/opt/dlv ** telemetry **" },
+        { pid = 502, ppid = 500, command = "/w/go-contacts/__debug_bin123" },
+      },
+      listen = { [500] = { "127.0.0.1:38439" }, [502] = { "*:8081" } },
+    }
+  end
+  local t = { id = 7702, config = { name = "t", env = { PORT = "1" } }, adapter = { type = "server", port = 38439, executable = { command = "dlv" } } }
+  local ti = S.info(t)
+  ok("[46] without a process event: the adapter's child that is not the adapter (delve's telemetry fork skipped)",
+    ti.pid == 502, vim.inspect(ti))
+  ok("[46] ... and the port it listens on wins over the env's", ti.port == 8081 and ti.port_source == "listening",
+    vim.inspect(ti))
+  S._snapshot = real_snap
+
+  -- The real snapshot parses this machine's process table and sockets.
+  local srv = vim.uv.new_tcp()
+  srv:bind("127.0.0.1", 0)
+  srv:listen(1, function() end)
+  local port = srv:getsockname().port
+  local snap = S._snapshot()
+  local me = vim.fn.getpid()
+  local listed = false
+  for _, p in ipairs(snap.procs) do if p.pid == me then listed = true end end
+  local mine = false
+  for _, a in ipairs(snap.listen[me] or {}) do if a:match(":" .. port .. "$") then mine = true end end
+  ok("[46] the real process table lists this nvim", listed)
+  ok("[46] the real socket table finds a port this nvim listens on", mine, vim.inspect(snap.listen[me]))
+  srv:close()
+
+  -- A closed session finishes its journal.
+  dap.listeners.on_session["auto-run-sessions"]({ id = 7701, closed = true }, nil)
+  ok("[46] a closed session's journal is finished", S.info(s).ended_at ~= nil)
+  os.remove(info.log)
+  S._reset_for_tests()
+end)()
+
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
 if fail_count > 0 then os.exit(1) end

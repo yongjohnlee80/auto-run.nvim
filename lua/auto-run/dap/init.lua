@@ -332,6 +332,14 @@ end
 ---@param name string
 ---@param opts { profile: string?, args: table? }?
 ---@return table? dap_cfg, string? err, table? detail
+---What a debug session is running: the program's pid, its port, and the
+---journal of its output with the commands to follow it. See
+---`auto-run.dap.sessions.info`.
+---@param session table  an nvim-dap session
+function M.session_info(session)
+  return require("auto-run.dap.sessions").info(session)
+end
+
 function M.translate(name, opts)
   local eff, comp, err, detail = resolve_effective(name, opts)
   if not eff then return nil, err, detail end
@@ -747,6 +755,8 @@ function M.setup()
   setup_winfixbuf_guard(dap)
   setup_error_capture(dap)
   setup_session_events(dap)
+  -- The program's pid, port and an output journal per session (dap/sessions).
+  require("auto-run.dap.sessions").attach(dap)
   return true
 end
 
