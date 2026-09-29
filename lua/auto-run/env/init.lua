@@ -407,15 +407,17 @@ function M.files_list()
   end
   -- Env-file discovery across the worktree root AND the bare-repo
   -- container (which, in a linked-worktree layout, usually holds the
-  -- shared `.config/` / `.vscode/`), each scanned at its root plus its
-  -- `.config/` and `.vscode/` subdirs. Per-file dedup (`seen`) makes a
-  -- repeated dir (e.g. container == root in a plain clone) harmless.
-  local is_env = is_env_name
+  -- shared `.config/` / `.vscode/`), each scanned at its root plus the
+  -- ENV_SUBDIRS that `create_file` also accepts, so a file it creates is
+  -- always listed. (These were hardcoded here while the comment on
+  -- ENV_SUBDIRS claimed the sharing; adding `.auto-run` exposed it.)
+  -- Per-file dedup (`seen`) makes a repeated dir (container == root in a
+  -- plain clone) harmless.
   for _, base in ipairs({ dirs.root or dirs.anchor, dirs.container }) do
     if base then
-      scan_dir(base, is_env)
-      scan_dir(fs_path.join(base, ".config"), is_env)
-      scan_dir(fs_path.join(base, ".vscode"), is_env)
+      for _, d in ipairs(ENV_SUBDIRS) do
+        scan_dir(d == "" and base or fs_path.join(base, d), is_env_name)
+      end
     end
   end
   table.sort(found)
