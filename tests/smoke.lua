@@ -5832,23 +5832,97 @@ print("\n[42] working directory — a chosen folder scopes discovery, runs and d
   store_paths.invalidate()
 end)()
 
--- ── [42b] <leader>rw — auto-core's choose_active ──────────────────
-print("\n[42b] <leader>rw — the working directory, from auto-core's shared picker")
+-- ── [42b] <leader>rw — auto-core's choose_active, for real ─────────
+-- Drives the REAL choose_active through both prompts (worktree, then folder):
+-- against an auto-core without it (< v0.2.32) the key only warns and these
+-- cells go red. An earlier version replaced choose_active with a stub, which
+-- stayed green on the old auto-core CI pinned (Zen, PR #14 r0).
+print("\n[42b] <leader>rw — the working directory, through auto-core's real picker")
 ;(function()
   auto_run.default_keymaps()
   local m = vim.fn.maparg("<leader>rw", "n", false, true)
   ok("[42b] <leader>rw is bound", type(m) == "table" and m.desc == "Run: Working Directory (worktree / folder)",
     vim.inspect(m and m.desc))
-  local wtm = require("auto-core.git.worktree")
-  local real = wtm.choose_active
-  local called = 0
-  wtm.choose_active = function() called = called + 1; return true end
-  pcall(m.callback)
-  wtm.choose_active = function() called = called + 1; return false, "no worktrees found under ~/x" end
-  pcall(m.callback)
-  wtm.choose_active = real
-  ok("[42b] <leader>rw calls auto-core's choose_active", called == 2, tostring(called))
+  ok("[42b] this auto-core has git.worktree.choose_active (>= v0.2.32)", type(worktree.choose_active) == "function")
+
+  local ws = fx .. "/ws42b"
+  vim.fn.mkdir(ws, "p")
+  ok("[42b] fixture: a repo in a workspace", make_plain_repo(ws .. "/mono"))
+  vim.fn.mkdir(ws .. "/mono/svc", "p")
+  local f = assert(io.open(ws .. "/mono/svc/go.mod", "w")); f:write("module example.com/svc\n"); f:close()
+
+  local prev_ws, prev_wt = worktree.get_workspace_root(), worktree.get_active()
+  worktree.set_workspace_root(ws)
+  worktree.set_active(nil)
+  local real_select = vim.ui.select
+  local prompts, answers = {}, { "mono", "svc" }
+  vim.ui.select = function(items, o, cb)
+    prompts[#prompts + 1] = o.prompt
+    local want = table.remove(answers, 1)
+    for _, it in ipairs(items) do
+      local label = o.format_item and o.format_item(it) or tostring(it)
+      if want and label:find(want, 1, true) then return cb(it) end
+    end
+    cb(nil)
+  end
+  local cwd_before = vim.fn.getcwd()
+  local okcall, cerr = pcall(m.callback)
+  vim.ui.select = real_select
+  ok("[42b] <leader>rw runs", okcall, tostring(cerr))
+  ok("[42b] it asks for a worktree, then a folder in it",
+    prompts[1] == "Active worktree (cwd stays):" and prompts[2] == "Working directory in mono:", vim.inspect(prompts))
+  ok("[42b] the chosen folder is auto-run's working directory",
+    store.resolve_run_dirs().workdir == ws .. "/mono/svc", tostring(store.resolve_run_dirs().workdir))
+  ok("[42b] the cwd did not move", vim.fn.getcwd() == cwd_before, vim.fn.getcwd())
+
+  worktree.set_workspace_root(prev_ws)
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
 end)()
+
+-- ── [42c] working directory — a nested Cargo folder ───────────────
+-- rust-contacts/ in a repo whose root has no Cargo.toml: with the folder
+-- chosen, run and debug resolve the folder's package; with the root chosen
+-- there is no Cargo manifest to resolve and the error says so. Before, Cargo
+-- resolved from the repo root regardless of the choice (Zen, PR #14 r0).
+print("\n[42c] working directory — a nested Cargo folder resolves from the folder")
+if not HAVE_CARGO then
+  print("  SKIP  [42c] cargo is not installed")
+else
+  (function()
+    local prev_wt = worktree.get_active()
+    local mono = fx .. "/mono42c"
+    ok("[42c] fixture: a repo with no Cargo.toml at its root", make_plain_repo(mono))
+    vim.fn.mkdir(mono .. "/rust-app/src", "p")
+    local f = assert(io.open(mono .. "/rust-app/Cargo.toml", "w"))
+    f:write('[package]\nname = "rustapp"\nversion = "0.1.0"\nedition = "2021"\n'); f:close()
+    f = assert(io.open(mono .. "/rust-app/src/main.rs", "w")); f:write("fn main() {}\n"); f:close()
+    local R = require("auto-run.adapters.rust")
+
+    worktree.set_active(mono .. "/rust-app")
+    store_paths.invalidate()
+    local argv, aerr = R.build_run_argv({ name = "r", kind = "run", runtime = "rust" })
+    ok("[42c] a run with no cwd resolves the chosen folder's package",
+      argv ~= nil and table.concat(argv, " ") == "cargo run -p rustapp --bin rustapp", vim.inspect(argv or aerr))
+    local dl, de, fired
+    R.prepare_debug_config({ name = "d", kind = "debug", runtime = "rust" }, {}, function(l, e)
+      dl, de, fired = l, e, true
+    end)
+    vim.wait(180000, function() return fired end, 50)
+    ok("[42c] a debug with no cwd builds the folder's package in the folder",
+      de == nil and dl ~= nil and dl.cwd == mono .. "/rust-app" and type(dl.program) == "string"
+        and dl.program:find("rustapp", 1, true) ~= nil, vim.inspect(de or (dl and { dl.cwd, dl.program })))
+
+    worktree.set_active(mono)
+    store_paths.invalidate()
+    local rargv, rerr = R.build_run_argv({ name = "r", kind = "run", runtime = "rust" })
+    ok("[42c] with the repo root chosen there is no Cargo manifest, and the error says so",
+      rargv == nil and tostring(rerr):find("no Cargo metadata", 1, true) ~= nil, vim.inspect(rargv or rerr))
+
+    worktree.set_active(prev_wt)
+    store_paths.invalidate()
+  end)()
+end
 
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))

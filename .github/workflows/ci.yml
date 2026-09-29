@@ -94,7 +94,7 @@ jobs:
       # is paid by the `drift` job below, not by weakening this one.
       - name: install plugin dependencies
         env:
-          AUTO_CORE_REF: "bc4d998bc22f0644b80e3e89cfe3e1b92d71d32a"  # main @ v0.2.15
+          AUTO_CORE_REF: "7be30a898e76001a0c26f32664b5f06bdcfb7f5f"  # fix/worktree-prunable @ v0.2.32 (repin to the merge commit)
           PLENARY_REF:   "74b06c6c75e4eeb3108ec01852001636d85a932b"
           NVIM_DAP_REF:  "c9a0738e45f1bd41d792a126941348dce661cf9b"
         run: ./.github/install-deps.sh
@@ -150,7 +150,7 @@ jobs:
       - name: report how stale the auto-core pin is
         env:
           GH_TOKEN: ${{ github.token }}
-          AUTO_CORE_REF: "bc4d998bc22f0644b80e3e89cfe3e1b92d71d32a"
+          AUTO_CORE_REF: "7be30a898e76001a0c26f32664b5f06bdcfb7f5f"
         run: |
           # One API call rather than a second clone: compare gives the distance
           # to the default branch directly.
