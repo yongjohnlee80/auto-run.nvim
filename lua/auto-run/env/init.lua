@@ -347,7 +347,7 @@ end
 -- What env-file DISCOVERY scans, shared with `create_file` so a file it creates
 -- is always one discovery lists: these names, in these subdirectories of the
 -- worktree root and of the bare-repo container (non-recursive).
-local ENV_SUBDIRS = { "", ".config", ".vscode" }
+local ENV_SUBDIRS = { "", ".config", ".vscode", ".auto-run" }
 local function is_env_name(f)
   return f == ".env" or f:match("^%.env%.") ~= nil or f:match("%.env$") ~= nil
 end
@@ -407,15 +407,17 @@ function M.files_list()
   end
   -- Env-file discovery across the worktree root AND the bare-repo
   -- container (which, in a linked-worktree layout, usually holds the
-  -- shared `.config/` / `.vscode/`), each scanned at its root plus its
-  -- `.config/` and `.vscode/` subdirs. Per-file dedup (`seen`) makes a
-  -- repeated dir (e.g. container == root in a plain clone) harmless.
-  local is_env = is_env_name
+  -- shared `.config/` / `.vscode/`), each scanned at its root plus the
+  -- ENV_SUBDIRS that `create_file` also accepts, so a file it creates is
+  -- always listed. (These were hardcoded here while the comment on
+  -- ENV_SUBDIRS claimed the sharing; adding `.auto-run` exposed it.)
+  -- Per-file dedup (`seen`) makes a repeated dir (container == root in a
+  -- plain clone) harmless.
   for _, base in ipairs({ dirs.root or dirs.anchor, dirs.container }) do
     if base then
-      scan_dir(base, is_env)
-      scan_dir(fs_path.join(base, ".config"), is_env)
-      scan_dir(fs_path.join(base, ".vscode"), is_env)
+      for _, d in ipairs(ENV_SUBDIRS) do
+        scan_dir(d == "" and base or fs_path.join(base, d), is_env_name)
+      end
     end
   end
   table.sort(found)
@@ -731,7 +733,7 @@ function M.create_file(path)
         "create_file: " .. path .. " is outside the worktree (" .. tostring(bases[1]) .. ")", { path = path })
     end
     return nil, structured_err("not_discoverable",
-      "create_file: env files live in the worktree root or its .config/ or .vscode/"
+      "create_file: env files live in the worktree root or its .config/, .vscode/ or .auto-run/"
       .. " (where env discovery looks); " .. parent .. " is not one of them", { path = path })
   end
   if not is_env_name(name) then

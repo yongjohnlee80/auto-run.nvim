@@ -239,6 +239,18 @@ local function setup_session_events(dap)
   dap.listeners.after.event_exited[key] = function(session)
     publish("run.session:changed", session_payload(session, "exited"))
   end
+  -- A session can close without either event: delve failing its build exits
+  -- before `initialized`, and terminating an already-closed session only
+  -- drops it. nvim-dap routes every such drop through set_session, which
+  -- calls on_session(old, new); announce the old one as closed so the panes
+  -- stop listing it. (Older nvim-dap has no on_session: nothing to hook.)
+  if type(dap.listeners.on_session) == "table" then
+    dap.listeners.on_session[key] = function(old, new)
+      if type(old) == "table" and old.closed and old ~= new then
+        publish("run.session:changed", session_payload(old, "closed"))
+      end
+    end
+  end
 end
 
 -- ── translation (effective config → dap config) ─────────────────
@@ -300,6 +312,10 @@ local function eff_to_dap(eff, comp)
       type = "go", request = "launch",
       mode = eff.kind == "test" and "test" or "debug",
       name = eff.name, program = eff.program, cwd = cwd, dlvCwd = cwd,
+      -- The program's stdout / stderr as DAP output events, so they reach
+      -- dap-view's REPL / console and the session journal (dap/sessions).
+      -- delve's default ("local") writes them to delve's own stdout instead.
+      outputMode = "remote",
     }
     if type(eff.args) == "table" and #eff.args > 0 then dap_cfg.args = eff.args end
     if type(eff.build_flags) == "string" and eff.build_flags ~= "" then
@@ -320,9 +336,23 @@ end
 ---@param name string
 ---@param opts { profile: string?, args: table? }?
 ---@return table? dap_cfg, string? err, table? detail
+---What a debug session is running: the program's pid, its port, and the
+---journal of its output with the commands to follow it. See
+---`auto-run.dap.sessions.info`.
+---@param session table  an nvim-dap session
+function M.session_info(session)
+  return require("auto-run.dap.sessions").info(session)
+end
+
 function M.translate(name, opts)
   local eff, comp, err, detail = resolve_effective(name, opts)
   if not eff then return nil, err, detail end
+  -- The same program check the go adapter's launch paths make, so nvim-dap's
+  -- own picker cannot start delve on a directory that does not exist.
+  if eff.runtime == "go" or eff.runtime == nil then
+    local perr = require("auto-run.adapters.go").program_error(eff)
+    if perr then return nil, perr, { code = "program_missing", message = perr } end
+  end
   return eff_to_dap(eff, comp), nil
 end
 
@@ -729,6 +759,8 @@ function M.setup()
   setup_winfixbuf_guard(dap)
   setup_error_capture(dap)
   setup_session_events(dap)
+  -- The program's pid, port and an output journal per session (dap/sessions).
+  require("auto-run.dap.sessions").attach(dap)
   return true
 end
 

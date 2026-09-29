@@ -36,7 +36,7 @@
 
 local M = {}
 
-M.version = "0.1.17"
+M.version = "0.1.18"
 
 ---@type boolean
 M._initialized = false
@@ -64,7 +64,7 @@ M.TOPICS = {
   },
   ["run.session:changed"] = {
     doc     = "A DAP session started / stopped / changed state (dap bridge, §6).",
-    payload = "{ id: string, config?: string, state: string }",
+    payload = "{ id: string, config?: string, state: 'running'|'terminated'|'exited'|'closed' }",
   },
   ["run.breakpoints:changed"] = {
     doc     = "The persisted breakpoint store changed (§9).",

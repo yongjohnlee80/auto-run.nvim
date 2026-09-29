@@ -246,6 +246,71 @@ function M.validate_profile_fragment(t)
   return validate_against(t, PROFILE_FIELDS, {}, "profile fragment")
 end
 
+-- ── field documentation ─────────────────────────────────────────
+
+---What each field means, for the people editing configs: a one-line `help`,
+---and where the field takes a fixed set, `values` (or `values_from`, a set the
+---caller resolves: `runtimes`, `configs`, `profiles`). `kinds` limits a config
+---field to the kinds it matters for; `runtimes` to the runtimes. The panes
+---show this beside each field. Every field in the catalogs above has an
+---entry (smoke asserts it), so a new field cannot ship undocumented.
+M.FIELD_DOCS = {
+  config = {
+    name        = { help = "the config's name — also its file name" },
+    kind        = { help = "what it is for", values = { "run", "test", "debug" } },
+    runtime     = { help = "the adapter that runs it", values_from = "runtimes" },
+    extends     = { help = "another config whose fields this one inherits", values_from = "configs" },
+    program     = { help = "go: the package directory to build · rust: unset (Cargo builds it) or an executable · other: the command" },
+    args        = { help = "arguments for the program (for a test config, the test binary)" },
+    cwd         = { help = "where it runs — unset: the working directory (w / <leader>rw)" },
+    build_flags = { help = "go build / test flags, e.g. -tags=integration -count=1", runtimes = { "go" } },
+    env         = { help = "inline KEY=value pairs — win over every env file" },
+    env_files   = { help = "env files applied in order — anchor with ${worktree}/" },
+    profile     = { help = "an env profile applied to this config", values_from = "profiles" },
+    tags        = { help = "labels — informational" },
+    depends     = { help = "reserved — not used by auto-run yet" },
+    params      = { help = "launch-time parameters (imported launch.json inputs)" },
+    origin      = { help = "where the config came from (import) — informational" },
+    replace     = { help = "append fields this layer replaces instead of extending (written by the panes)" },
+    base_env_files   = { help = "profile pipeline: env files applied first" },
+    secret_manifests = { help = "profile pipeline: secret manifests resolved at launch" },
+    command_env      = { help = "profile pipeline: values taken from commands' output" },
+    runtime_env      = { help = "profile pipeline: literal KEY=value pairs" },
+    cargo_package     = { help = "rust: the Cargo package (-p)", runtimes = { "rust" } },
+    cargo_target      = { help = "rust: a target of that package — set with cargo_target_kind", runtimes = { "rust" } },
+    cargo_target_kind = { help = "rust: the target's kind", values = { "lib", "bin", "test" }, runtimes = { "rust" } },
+  },
+  profile = {
+    name             = { help = "the profile's name — also its file name" },
+    base_env_files   = { help = "env files applied first, in order" },
+    secret_manifests = { help = "secret manifests resolved at launch" },
+    command_env      = { help = "values taken from commands' output ({ key, command, required? })" },
+    runtime_env      = { help = "literal KEY=value pairs" },
+    tags             = { help = "labels — informational" },
+    replace          = { help = "append fields this layer replaces instead of extending (written by the panes)" },
+    origin           = { help = "where the profile came from — informational" },
+  },
+}
+
+---The documentation of `field` on a `record` ("config" or "profile"), or nil.
+---@param record "config"|"profile"
+---@param field string
+---@return { help: string, values: string[]?, values_from: string?, kinds: string[]?, runtimes: string[]? }?
+function M.field_doc(record, field)
+  local docs = M.FIELD_DOCS[record]
+  return docs and docs[field] or nil
+end
+
+---Every field name a record accepts, sorted (for completeness checks).
+---@param record "config"|"profile"
+---@return string[]
+function M.field_names(record)
+  local out = {}
+  for k in pairs(record == "profile" and PROFILE_FIELDS or CONFIG_FIELDS) do out[#out + 1] = k end
+  table.sort(out)
+  return out
+end
+
 ---Is `name` usable as a config/profile name (and therefore filename)?
 ---@param name any
 ---@return boolean ok, string? err

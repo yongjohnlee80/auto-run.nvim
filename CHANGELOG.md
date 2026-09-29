@@ -284,6 +284,55 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.18] — 2026-09-29 — field help, folder-aware Go scaffolds, env files in .auto-run/
+
+Patch.
+
+- **Every config and profile field is documented** in
+  `store.schema.FIELD_DOCS`: a one-line help, the allowed values where the set
+  is fixed (`kind`: run | test | debug; `cargo_target_kind`: lib | bin | test),
+  or the set to offer (`runtime`, `profile`, `extends`). `schema.field_doc`
+  and `schema.field_names` read it. auto-finder's panes show it beside each
+  field, so a scaffolded config says what else it can hold. Smoke asserts
+  every field the schema accepts has help, and no doc names a field it
+  rejects. JSON comments were not an option: the store is strict JSON and
+  the panes rewrite files on edit.
+- **The Go scaffold follows the working directory.** In a chosen folder
+  (go-contacts/ in a multi-project repo) a new Go config targets
+  `${worktree}/<folder>` and records it as `cwd`. It pointed at the repo
+  root, which has no go.mod. At the repo root nothing changes.
+- **A debug session that closes without `terminated` / `exited` is announced.**
+  delve failing its build closes the session before `initialized`, and
+  terminating an already-closed session only drops it; neither sends those
+  events, so `run.session:changed` never fired and auto-finder's debug pane
+  kept listing the session. nvim-dap drops every session through
+  `listeners.on_session`; auto-run now publishes `state = "closed"` there.
+- **A Go `program` path that does not exist is refused before launch.** A
+  program given as a path (`/…`, `./…`, `../…`, relative ones against the
+  launch cwd) must be an existing directory or file; otherwise run, debug and
+  nvim-dap's picker (`translate`) stop with "program … does not exist" and
+  code `program_missing`. It went to delve, which failed its build and left a
+  dead session behind. Import paths, `...` patterns and unresolved tokens are
+  left to go. `adapters.go.program_error(eff)`.
+- **A debug session's pid, port and output journal** (`dap.sessions`,
+  `dap.session_info(session)`). The program's stdout / stderr, which DAP
+  delivers as `output` events and which went only to dap-view's console, are
+  also appended to `stdpath("state")/auto-run/sessions/<time>-<id>-<name>.log`
+  (the adapter's own lines marked `[dap]`, telemetry dropped; files older than
+  7 days swept), so `tail -f` follows them. The pid is the adapter's `process`
+  event's, else the adapter's child that is not the adapter itself (delve runs
+  `__debug_bin…`; its telemetry fork is skipped), the adapter found by the
+  port it listens on. The port is the one the program listens on (`ss`,
+  `lsof` on macOS), else the launch env's `PORT`. `info` also returns the
+  `tail -f` and `kill` commands.
+- **Go debug launches forward the program's output** (`outputMode =
+  "remote"`). delve's default wrote the program's stdout / stderr to delve's
+  own stdout, so a server's logs never reached dap-view's REPL / console (nor
+  the session journal): only delve's "Building …" lines did.
+- **Env files can live in `.auto-run/`**: env discovery lists
+  `.auto-run/{.env,.env.*,*.env}`, and `env.create_file` accepts it (the
+  directory is created if missing). Files there are tracked with the repo.
+
 ## [v0.1.17] — 2026-09-29 — a folder inside a repo can be the working directory
 
 Patch. Needs auto-core.nvim v0.2.32.

@@ -507,12 +507,24 @@ end
 ---@param name string?
 ---@return table
 function M.default_config(kind, name)
-  return {
+  -- Anchored at the working directory: when a FOLDER of the repo was chosen
+  -- (go-contacts/ in a multi-project repo), `${worktree}` alone names the repo
+  -- root, which has no go.mod. The folder is recorded as `cwd` too, so the
+  -- config keeps working after the working directory moves elsewhere.
+  local dirs = require("auto-run.store").resolve_run_dirs()
+  local root, workdir = dirs.root, dirs.workdir
+  local folder
+  if root and workdir and workdir ~= root and workdir:sub(1, #root + 1) == root .. "/" then
+    folder = workdir:sub(#root + 2)
+  end
+  local base = folder and ("${worktree}/" .. folder) or "${worktree}"
+  local cfg = {
     runtime = "go",
     kind = kind,
-    program = kind == "test" and "${worktree}"
-      or ("${worktree}/cmd/" .. tostring(name or "app")),
+    program = kind == "test" and base or (base .. "/cmd/" .. tostring(name or "app")),
   }
+  if folder then cfg.cwd = base end
+  return cfg
 end
 
 ---argv for the run/term strategies (NEVER a DAP launch — that is
@@ -526,6 +538,36 @@ end
 ---@param eff table
 ---@param opts { test_name: string?, package: string?, strategy: string? }?
 ---@return string[]? argv, string? err
+---Why a Go config's `program` cannot be built, or nil when it can (or when it
+---is not a filesystem path this can judge). A program given as a PATH — `/…`,
+---`./…`, `../…` — must exist as a directory (the package) or a file; relative
+---ones resolve against the launch cwd. Import paths (`example.com/x`),
+---`...` patterns and unresolved `${…}` tokens are left to go / delve.
+---Checked BEFORE handing the launch to delve: a missing directory made delve
+---fail its build and left nvim-dap holding a dead session (Johno,
+---2026-09-29: "stat …/playground/cmd/server: directory not found").
+---@param eff table   substituted effective config
+---@return string? err
+function M.program_error(eff)
+  local p = eff and eff.program
+  if type(p) ~= "string" or p == "" or p:find("${", 1, true) or p:find("...", 1, true) then return nil end
+  local is_abs = p:sub(1, 1) == "/"
+  if not (is_abs or p:sub(1, 2) == "./" or p:sub(1, 3) == "../") then return nil end
+  local abs = p
+  if not is_abs then
+    local cwd = eff.cwd
+    if type(cwd) ~= "string" or cwd == "" then
+      local dirs = require("auto-run.store").resolve_run_dirs()
+      cwd = dirs.workdir or dirs.root or dirs.anchor
+    end
+    abs = fs_path.join(cwd, p)
+  end
+  abs = fs_path.normalize(abs)
+  if fs_path.is_dir(abs) or fs_path.is_file(abs) then return nil end
+  return ("config '%s': program %s does not exist — set `program` to the package directory to build"
+    .. " (e.g. ${worktree}/<folder>/cmd/<name>)"):format(tostring(eff.name), vim.fn.fnamemodify(abs, ":~"))
+end
+
 function M.build_run_argv(eff, opts)
   opts = opts or {}
   local function with_flags(base)
@@ -534,6 +576,11 @@ function M.build_run_argv(eff, opts)
         base[#base + 1] = flag
       end
     end
+  end
+
+  if not (eff.kind == "test" and opts.package) then
+    local perr = M.program_error(eff)
+    if perr then return nil, perr end
   end
 
   if eff.kind == "test" then
@@ -576,7 +623,9 @@ function M.prepare_debug(pos, _opts, cb)
     args = { "-test.run", run_regex(pos) },
     cwd = pkg_dir,
     -- delve's own build dir; without it delve builds from nvim's cwd.
-    extra = { mode = "test", dlvCwd = pkg_dir },
+    -- outputMode "remote": the test's output as DAP output events (dap-view
+    -- and the session journal); delve's default keeps it on its own stdout.
+    extra = { mode = "test", dlvCwd = pkg_dir, outputMode = "remote" },
   }
   local applied, err = require("auto-run.adapters.config").test_config(M.name)
   if err then return cb(nil, { code = "config_failed", message = err }) end
@@ -594,6 +643,8 @@ end
 ---@param _opts table
 ---@param cb fun(launch: table|nil, err: table|nil)
 function M.prepare_debug_config(eff, _opts, cb)
+  local perr = M.program_error(eff)
+  if perr then return cb(nil, { code = "program_missing", message = perr }) end
   local cwd = eff.cwd
   local launch = {
     dap_type = "go",
@@ -601,7 +652,7 @@ function M.prepare_debug_config(eff, _opts, cb)
     program = eff.program,
     cwd = cwd,
     env = eff.env,
-    extra = { mode = eff.kind == "test" and "test" or "debug", dlvCwd = cwd },
+    extra = { mode = eff.kind == "test" and "test" or "debug", dlvCwd = cwd, outputMode = "remote" },
   }
   if type(eff.args) == "table" and #eff.args > 0 then launch.args = eff.args end
   if type(eff.build_flags) == "string" and eff.build_flags ~= "" then

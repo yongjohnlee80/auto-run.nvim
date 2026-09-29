@@ -815,6 +815,10 @@ print("\n[8] import — JSONC parse, read-through, one-shot migration")
 local import = require("auto-run.import")
 
 local lj = fx .. "/lj-repo"
+-- The launch.json's "Debug Gold" builds ${workspaceFolder}/cmd/gold: give it
+-- that package directory, or the go adapter refuses the missing program
+-- before launch (v0.1.18) — as it should for a config that could never build.
+vim.fn.mkdir(lj .. "/cmd/gold", "p")
 ok("launch.json fixture repo created", make_plain_repo(lj))
 write_file(lj .. "/.vscode/launch.json", [[
 {
@@ -5923,6 +5927,260 @@ else
     store_paths.invalidate()
   end)()
 end
+
+-- ── [43] field docs, folder-aware scaffolds, env files in .auto-run/ ──
+-- Johno, 2026-09-29: a scaffolded config said nothing about what else it
+-- could hold ("what are the available fields and allowed values"), a Go
+-- scaffold in a chosen folder pointed at the repo root (no go.mod there), and
+-- a new env file could not live in .auto-run/.
+print("\n[43] field docs, folder-aware scaffolds, env files in .auto-run/")
+;(function()
+  local schema = require("auto-run.store.schema")
+  for _, rec in ipairs({ "config", "profile" }) do
+    local missing = {}
+    for _, f in ipairs(schema.field_names(rec)) do
+      local d = schema.field_doc(rec, f)
+      if not (d and type(d.help) == "string" and d.help ~= "") then missing[#missing + 1] = f end
+    end
+    ok("[43] every " .. rec .. " field has a help text", #missing == 0, vim.inspect(missing))
+    local stray = {}
+    local known = {}
+    for _, f in ipairs(schema.field_names(rec)) do known[f] = true end
+    for f in pairs(schema.FIELD_DOCS[rec]) do if not known[f] then stray[#stray + 1] = f end end
+    ok("[43] no " .. rec .. " doc names a field the schema rejects", #stray == 0, vim.inspect(stray))
+  end
+  local kinds = {}
+  for k in pairs(schema.VALID_KIND) do kinds[#kinds + 1] = k end
+  table.sort(kinds)
+  local kv = vim.deepcopy(schema.field_doc("config", "kind").values); table.sort(kv)
+  ok("[43] kind's allowed values are exactly the ones validation accepts", vim.deep_equal(kinds, kv), vim.inspect(kv))
+  ok("[43] cargo_target_kind lists lib, bin, test",
+    vim.deep_equal(schema.field_doc("config", "cargo_target_kind").values, { "lib", "bin", "test" }))
+
+  -- The Go scaffold, anchored at the working directory.
+  local prev_wt = worktree.get_active()
+  local mono = fx .. "/mono43"
+  ok("[43] fixture: a repo with a Go folder", make_plain_repo(mono))
+  vim.fn.mkdir(mono .. "/svc", "p")
+  local go = require("auto-run.adapters.go")
+  worktree.set_active(mono .. "/svc")
+  store_paths.invalidate()
+  local t = go.default_config("test", "unit")
+  local r = go.default_config("debug", "server")
+  ok("[43] in a chosen folder, a Go test config targets the folder and runs there",
+    t.program == "${worktree}/svc" and t.cwd == "${worktree}/svc", vim.inspect(t))
+  ok("[43] ... and a Go entry point sits under the folder's cmd/",
+    r.program == "${worktree}/svc/cmd/server" and r.cwd == "${worktree}/svc", vim.inspect(r))
+  worktree.set_active(mono)
+  store_paths.invalidate()
+  local t2 = go.default_config("test", "unit")
+  ok("[43] at the repo root the scaffold is unchanged (no cwd)",
+    t2.program == "${worktree}" and t2.cwd == nil, vim.inspect(t2))
+
+  -- An env file in .auto-run/: created, and listed by discovery.
+  local env = require("auto-run.env")
+  local path, cerr = env.create_file(mono .. "/.auto-run/.env")
+  ok("[43] an env file can be created in .auto-run/ (the directory is made)",
+    path ~= nil and vim.fn.filereadable(mono .. "/.auto-run/.env") == 1, vim.inspect(cerr))
+  local listed = false
+  for _, c in ipairs(env.files_list() or {}) do
+    if c.path == require("auto-core.fs.path").normalize(mono .. "/.auto-run/.env") then listed = true end
+  end
+  ok("[43] env discovery lists it", listed)
+  local bad, berr = env.create_file(mono .. "/.auto-run/configs/.env")
+  ok("[43] a deeper directory is still refused", bad == nil and tostring(berr and berr.message):find("not one of them", 1, true) ~= nil,
+    vim.inspect(berr))
+
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end)()
+
+-- ── [44] a session that closes without terminated/exited ─────────
+-- Johno, 2026-09-29: delve failed its build ("directory not found"), the
+-- session closed before `initialized`, and the debug pane kept listing it:
+-- run.session:changed fired only on the adapter's terminated / exited events,
+-- which such a session never sends. nvim-dap drops every session through
+-- set_session → listeners.on_session; that is announced now.
+print("\n[44] a session that closes without terminated/exited is announced")
+;(function()
+  local okd, dap = pcall(require, "dap")
+  if not (okd and type(dap.listeners.on_session) == "table") then
+    print("  SKIP  [44] this nvim-dap has no listeners.on_session")
+    return
+  end
+  local seen = {}
+  local sub = core.events.subscribe("run.session:changed", function(p) seen[#seen + 1] = p end)
+  -- The real path: a closed session is current, and <leader>dq terminates it.
+  local fake = { id = 4242, closed = true, config = { name = "[auto-run] go" }, on_close = {}, capabilities = {} }
+  dap.set_session(fake)
+  vim.wait(100, function() return false end)
+  seen = {}
+  dap.terminate()
+  vim.wait(500, function() return #seen > 0 end)
+  ok("[44] terminating an already-closed session announces it as closed",
+    #seen == 1 and seen[1].id == "4242" and seen[1].state == "closed" and seen[1].config == "[auto-run] go",
+    vim.inspect(seen))
+  ok("[44] ... and nvim-dap no longer holds it", dap.session() == nil and dap.sessions()[4242] == nil)
+
+  -- A switch between two live sessions is not a close.
+  seen = {}
+  local a = { id = 4301, closed = false, config = { name = "a" }, on_close = {} }
+  local b = { id = 4302, closed = false, config = { name = "b" }, on_close = {} }
+  dap.set_session(a)
+  dap.set_session(b)
+  vim.wait(100, function() return false end)
+  local closed = vim.tbl_filter(function(p) return p.state == "closed" end, seen)
+  ok("[44] switching between live sessions announces no close", #closed == 0, vim.inspect(seen))
+  dap.sessions()[4301], dap.sessions()[4302] = nil, nil
+  dap.set_session(nil)
+  core.events.unsubscribe(sub)
+end)()
+
+-- ── [45] a Go program directory that does not exist is refused ──────
+-- Johno, 2026-09-29: `program: ${worktree}/cmd/server` in a repo whose server
+-- lives in go-contacts/ — delve failed its build ("directory not found") and
+-- nvim-dap kept a dead session. Checked before delve is ever started now.
+print("\n[45] a Go program directory that does not exist is refused before launch")
+;(function()
+  local go = require("auto-run.adapters.go")
+  local root = fx .. "/prog45"
+  vim.fn.mkdir(root .. "/svc/cmd/server", "p")
+  local function eff(program, cwd) return { name = "c45", kind = "debug", runtime = "go", program = program, cwd = cwd } end
+
+  local e1 = go.program_error(eff(root .. "/cmd/server", root))
+  ok("[45] a missing absolute program directory is refused, naming it",
+    type(e1) == "string" and e1:find("does not exist", 1, true) ~= nil and e1:find("cmd/server", 1, true) ~= nil, tostring(e1))
+  ok("[45] an existing absolute directory passes", go.program_error(eff(root .. "/svc/cmd/server", root)) == nil)
+  ok("[45] a relative path resolves against cwd (exists → passes)", go.program_error(eff("./cmd/server", root .. "/svc")) == nil)
+  ok("[45] a relative path resolves against cwd (missing → refused)",
+    type(go.program_error(eff("./cmd/server", root))) == "string")
+  ok("[45] import paths, ... patterns and unresolved tokens are left to go",
+    go.program_error(eff("example.com/x/cmd/y", root)) == nil and go.program_error(eff("./...", root)) == nil
+      and go.program_error(eff("${worktree}/cmd/x", root)) == nil and go.program_error(eff(nil, root)) == nil)
+
+  local argv, aerr = go.build_run_argv({ name = "r45", kind = "run", runtime = "go", program = root .. "/cmd/server", cwd = root })
+  ok("[45] a run is refused the same way", argv == nil and tostring(aerr):find("does not exist", 1, true) ~= nil, tostring(aerr))
+  local targv = go.build_run_argv({ name = "t45", kind = "test", runtime = "go", program = root .. "/nope", cwd = root },
+    { package = "./svc/..." })
+  ok("[45] a test run with a position's package does not consult program", targv ~= nil, vim.inspect(targv))
+
+  local got, gerr, fired
+  go.prepare_debug_config(eff(root .. "/cmd/server", root), {}, function(l, e) got, gerr, fired = l, e, true end)
+  ok("[45] a debug is refused before delve, with code program_missing",
+    fired and got == nil and gerr and gerr.code == "program_missing", vim.inspect(gerr))
+
+  -- translate (nvim-dap's own picker path) refuses too, and no session starts.
+  local prev_wt = worktree.get_active()
+  ok("[45] fixture: a repo for translate", make_plain_repo(root .. "/repo"))
+  worktree.set_active(root .. "/repo")
+  store_paths.invalidate()
+  store.add({ name = "missing-prog", kind = "debug", runtime = "go", program = "${worktree}/cmd/server" }, { tier = "tracked" })
+  local cfg, terr = require("auto-run.dap").translate("missing-prog")
+  ok("[45] translate refuses a missing program", cfg == nil and tostring(terr):find("does not exist", 1, true) ~= nil,
+    tostring(terr))
+  local okd, dap = pcall(require, "dap")
+  if okd then
+    local before = vim.tbl_count(dap.sessions())
+    require("auto-run.dap").debug_start("missing-prog")
+    vim.wait(200, function() return false end)
+    ok("[45] debug_start on it leaves nvim-dap without a new session", vim.tbl_count(dap.sessions()) == before,
+      vim.inspect(vim.tbl_keys(dap.sessions())))
+  end
+  store.remove("missing-prog")
+  worktree.set_active(prev_wt)
+  store_paths.invalidate()
+end)()
+
+-- ── [46] a session's pid, port and output journal ─────────────────
+-- Johno, 2026-09-29: the debug pane's Active Sessions showed id / config /
+-- state only — "display the port number and pid … including how to journal
+-- the logs, with commands". nvim-dap keeps none of these.
+print("\n[46] dap.sessions — the program's pid, port and an output journal")
+;(function()
+  local okd, dap = pcall(require, "dap")
+  if not okd then print("  SKIP  [46] nvim-dap is not installed"); return end
+  local S = require("auto-run.dap.sessions")
+  S._reset_for_tests()
+  ok("[46] the listeners are attached by setup",
+    dap.listeners.after.event_output["auto-run-sessions"] ~= nil
+      and dap.listeners.after.event_process["auto-run-sessions"] ~= nil)
+
+  -- The journal: program output verbatim, the adapter's marked, telemetry dropped.
+  local s = { id = 7701, config = { name = "go server", env = { PORT = "9999" } }, adapter = { type = "server" } }
+  dap.listeners.after.event_initialized["auto-run-sessions"](s)
+  local out = dap.listeners.after.event_output["auto-run-sessions"]
+  out(s, { category = "stdout", output = "listening on :9999\n" })
+  out(s, { category = "stderr", output = "warn: slow\n" })
+  out(s, { category = "console", output = "Type 'dlv help' for list of commands.\n" })
+  out(s, { category = "telemetry", output = "{\"secret\":1}\n" })
+  local info = S.info(s)
+  ok("[46] a journal file is named for the session, under stdpath('state')/auto-run/sessions",
+    type(info.log) == "string" and vim.startswith(info.log, S.journal_dir()) and info.log:find("7701%-go_server%.log$") ~= nil,
+    tostring(info.log))
+  local body = info.log and table.concat(vim.fn.readfile(info.log), "\n") or ""
+  ok("[46] program output lands verbatim, the adapter's is marked, telemetry is not written",
+    body == "listening on :9999\nwarn: slow\n[dap] Type 'dlv help' for list of commands.", body)
+  ok("[46] with no process to read, the port comes from the launch env's PORT",
+    info.port == 9999 and info.port_source == "env", vim.inspect(info))
+  ok("[46] tail -f is offered for the journal", info.commands.tail == "tail -f " .. vim.fn.shellescape(info.log))
+
+  -- The adapter's process event names the pid.
+  dap.listeners.after.event_process["auto-run-sessions"](s, { systemProcessId = 424242, name = "x" })
+  info = S.info(s)
+  ok("[46] a process event's systemProcessId is the pid, and kill is offered",
+    info.pid == 424242 and info.commands.kill == "kill 424242", vim.inspect(info))
+
+  -- The process tree: the program is the adapter's child that is not the adapter itself.
+  local real_snap = S._snapshot
+  S._snapshot = function()
+    return {
+      procs = {
+        { pid = 500, ppid = 1, command = "/opt/dlv dap -l 127.0.0.1:38439" },
+        { pid = 501, ppid = 500, command = "/opt/dlv ** telemetry **" },
+        { pid = 502, ppid = 500, command = "/w/go-contacts/__debug_bin123" },
+      },
+      listen = { [500] = { "127.0.0.1:38439" }, [502] = { "*:8081" } },
+    }
+  end
+  local t = { id = 7702, config = { name = "t", env = { PORT = "1" } }, adapter = { type = "server", port = 38439, executable = { command = "dlv" } } }
+  local ti = S.info(t)
+  ok("[46] without a process event: the adapter's child that is not the adapter (delve's telemetry fork skipped)",
+    ti.pid == 502, vim.inspect(ti))
+  ok("[46] ... and the port it listens on wins over the env's", ti.port == 8081 and ti.port_source == "listening",
+    vim.inspect(ti))
+  S._snapshot = real_snap
+
+  -- The real snapshot parses this machine's process table and sockets.
+  local srv = vim.uv.new_tcp()
+  srv:bind("127.0.0.1", 0)
+  srv:listen(1, function() end)
+  local port = srv:getsockname().port
+  local snap = S._snapshot(true) -- fresh: an earlier info() cached one without this port
+  local me = vim.fn.getpid()
+  local listed = false
+  for _, p in ipairs(snap.procs) do if p.pid == me then listed = true end end
+  local mine = false
+  for _, a in ipairs(snap.listen[me] or {}) do if a:match(":" .. port .. "$") then mine = true end end
+  ok("[46] the real process table lists this nvim", listed)
+  ok("[46] the real socket table finds a port this nvim listens on", mine, vim.inspect(snap.listen[me]))
+  srv:close()
+
+  -- A closed session finishes its journal.
+  dap.listeners.on_session["auto-run-sessions"]({ id = 7701, closed = true }, nil)
+  ok("[46] a closed session's journal is finished", S.info(s).ended_at ~= nil)
+  os.remove(info.log)
+  S._reset_for_tests()
+
+  -- delve forwards the program's output only with outputMode "remote".
+  local go = require("auto-run.adapters.go")
+  local root = fx .. "/out46"
+  vim.fn.mkdir(root .. "/cmd/srv", "p")
+  local launch
+  go.prepare_debug_config({ name = "o46", kind = "debug", runtime = "go", program = root .. "/cmd/srv", cwd = root }, {},
+    function(l) launch = l end)
+  ok("[46] a Go debug launch asks delve to forward the program's output (outputMode remote)",
+    launch and launch.extra and launch.extra.outputMode == "remote", vim.inspect(launch and launch.extra))
+end)()
 
 -- ── summary ─────────────────────────────────────────────────────
 print(string.format("\n%d passed, %d failed", pass_count, fail_count))
