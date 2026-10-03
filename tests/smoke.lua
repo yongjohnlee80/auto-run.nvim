@@ -6422,6 +6422,11 @@ print("\n[49] playwright — discovery, file:line runs, the JSON report, browser
   ok("[49] a Playwright spec is discovered by the playwright adapter", outcome == "parsed", tostring(perr))
   local file_node = P3.discovery.tree():get(spec)
   ok("[49] ... owned by playwright", file_node and file_node.adapter == "playwright")
+  if not (file_node and file_node.adapter == "playwright") then
+    -- Every cell below needs Playwright's positions; stop here (failed above).
+    NEW.restore(prev)
+    return
+  end
   local ids = NEW.ids_by_name(P3.discovery.tree().root)
   ok("[49] describes nest; test / test.fixme / test.skip are tests; a title-less test.skip() is not",
     ids["outer"] == spec .. "::outer" and ids["deep"] == spec .. "::outer::inner::deep"
