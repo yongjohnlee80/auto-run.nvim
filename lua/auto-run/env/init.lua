@@ -555,6 +555,10 @@ local function rewrite_env_file(path, mutate)
   if st then  -- fs.atomic's rename resets the mode; restore it
     pcall(vim.uv.fs_chmod, path, require("bit").band(st.mode, 511))
   end
+  -- An edit of an env file in .auto-run/ is a write into that folder, so it
+  -- refreshes the folder's AGENTS.md / marker like any store write (ADR 0213
+  -- §2.5). The one place every update_var / add_var / remove_var lands.
+  require("auto-run.store").touch(path)
   return true, nil
 end
 

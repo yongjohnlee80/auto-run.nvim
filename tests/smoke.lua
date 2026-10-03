@@ -6861,6 +6861,43 @@ print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNot
   L.event_terminated[KEY](s2)
   local st = require("auto-run.dap.dart_tests")._state()
   ok("[51] every session's state is cleared after it ends", next(st.active) == nil and next(st.pending) == nil, vim.inspect(st))
+  -- Lector r1 (PR #16) finding 1: a session that ends with `exited` ALONE
+  -- finalises (no terminated / disconnect ever arrives).
+  local ex = NEW.capture_dap_run(function() P3.discovery.debug_position(ids["two"]) end)
+  local s5 = { id = 99005, config = ex and ex[1] }
+  ok("[51] exited-only: the debugged test is running first", status(ids["two"]) == "running")
+  L.event_exited[KEY](s5, { exitCode = 2 })
+  ok("[51] exited-only: `exited` alone finalises — failed (exit 2, nothing reported)",
+    status(ids["two"]) == "failed" and tostring((P3.discovery.results()[ids["two"]] or {}).output):find("code=2", 1, true) ~= nil,
+    vim.inspect(P3.discovery.results()[ids["two"]]))
+  ok("[51] exited-only: its session state is cleared", next(require("auto-run.dap.dart_tests")._state().active) == nil)
+  L.event_terminated[KEY](s5)
+  L.disconnect[KEY](s5)
+  ok("[51] a terminated / disconnect after exited changes nothing (idempotent)", status(ids["two"]) == "failed")
+
+  -- Lector r1 finding 2: a dap.run that throws leaves no pending run behind.
+  local real_run = dap.run
+  dap.run = function() error("adapter exploded") end
+  local okp2 = P3.discovery.debug_position(ids["three"])
+  dap.run = real_run
+  ok("[51] dap.run throwing: debug_position itself returned (the launch failed in its callback)", okp2 == true)
+  ok("[51] dap.run throwing: the test's running mark is unwound", P3.discovery.results()[ids["three"]] == nil
+    or status(ids["three"]) ~= "running", vim.inspect(P3.discovery.results()[ids["three"]]))
+  ok("[51] dap.run throwing: no pending run is left", next(require("auto-run.dap.dart_tests")._state().pending) == nil,
+    vim.inspect(require("auto-run.dap.dart_tests")._state().pending))
+
+  -- ... and a run whose session never arrives expires on its own timer, with
+  -- no later debug needed to sweep it.
+  local DT = require("auto-run.dap.dart_tests")
+  local prev_exp = DT.EXPIRY_MS
+  DT.EXPIRY_MS = 60
+  DT.begin(P3.discovery.tree():get(ids["four"]), pkg)
+  ok("[51] expiry: begin marks running", status(ids["four"]) == "running")
+  wait_for(function() return next(DT._state().pending) == nil end, 2000)
+  DT.EXPIRY_MS = prev_exp
+  ok("[51] expiry: a run with no session unwinds by itself", P3.discovery.results()[ids["four"]] == nil
+    and next(DT._state().pending) == nil, vim.inspect(P3.discovery.results()[ids["four"]]))
+
   -- a launch that never got a session unwinds its marks
   local rid = require("auto-run.dap.dart_tests").begin(P3.discovery.tree():get(ids["one"]), pkg)
   ok("[51] begin marks running", status(ids["one"]) == "running")
@@ -6977,6 +7014,34 @@ print("\n[52] AGENTS.md, CLAUDE.md and the auto-run.nvim-v<version> marker")
   ok("[52] hand-written AGENTS.md + AGENTS.local.md: neither is overwritten",
     read(folder .. "/AGENTS.md") == "# hand-written again\n" and read(folder .. "/AGENTS.local.md") == "# our own notes\n")
   ok("[52] ... and doctor reports the conflict", agents.status(folder).state:find("conflict", 1, true) ~= nil, agents.status(folder).state)
+
+  -- Lector r1 (PR #16) finding 3: editing an existing env file in .auto-run/
+  -- is a write into the folder, so an old marker refreshes on it.
+  os.remove(folder .. "/AGENTS.md")
+  os.remove(folder .. "/AGENTS.local.md")
+  for _, n in ipairs(vim.fn.readdir(folder) or {}) do
+    if n:find(agents.MARKER_PREFIX, 1, true) == 1 then os.remove(folder .. "/" .. n) end
+  end
+  write_file(folder .. "/.env", "A=1\n")
+  write_file(folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2", "")
+  write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nstale\n")
+  local function env_edit_refreshes(label, fn)
+    agents._reset_for_tests()
+    os.rename(folder .. "/" .. marker, folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2")
+    write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nstale\n")
+    local okv, verr = fn()
+    ok("[52] " .. label .. " on .auto-run/.env refreshes AGENTS.md and the marker",
+      okv and tostring(read(folder .. "/AGENTS.md")):find("stale", 1, true) == nil
+        and vim.fn.filereadable(folder .. "/" .. marker) == 1
+        and vim.fn.filereadable(folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2") == 0, tostring(verr))
+  end
+  -- first refresh needs the current marker to exist for the rename helper
+  agents._reset_for_tests()
+  local okf = envmod.add_var(folder .. "/.env", "B", "2")
+  ok("[52] add_var on .auto-run/.env refreshes AGENTS.md (old marker → current)",
+    okf and tostring(read(folder .. "/AGENTS.md")):find("stale", 1, true) == nil and vim.fn.filereadable(folder .. "/" .. marker) == 1)
+  env_edit_refreshes("update_var", function() return envmod.update_var(folder .. "/.env", "B", "3") end)
+  env_edit_refreshes("remove_var", function() return envmod.remove_var(folder .. "/.env", "B") end)
 
   -- the bare-repo layout: the container's shared .auto-run gets its own copy
   worktree.set_active(container .. "/main")

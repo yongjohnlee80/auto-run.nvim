@@ -608,7 +608,15 @@ function M.launch(launch)
     log.warn("dap", "could not open the debug view: " .. tostring(verr))
   end
   local okr, rerr = pcall(dap.run, cfg)
-  if not okr then return nil, "dap.run: " .. tostring(rerr) end
+  if not okr then
+    -- No session will ever exist for this launch: a debugged Dart test's
+    -- running marks must unwind now (the launch token was already settled,
+    -- so nothing else would abort it).
+    if launch.dap_type == "dart" then
+      require("auto-run.dap.dart_tests").abort(cfg.autoRunRunId)
+    end
+    return nil, "dap.run: " .. tostring(rerr)
+  end
   return true, nil
 end
 

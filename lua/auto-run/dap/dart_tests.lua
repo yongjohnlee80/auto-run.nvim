@@ -9,18 +9,22 @@
 ---  first event       → binds `session.id` to the run (never "the latest
 ---                      launch", so two launches cannot cross)
 ---  testDone          → published at once through discovery.debug_results
----  terminated/exited → unreported tests fill (skipped, or failed when the
----                      runner exited non-zero with no reports); state cleared
+---  exited/terminated/disconnect → unreported tests fill (skipped, or failed
+---                      when the runner exited non-zero with no reports);
+---                      state cleared. The first of them finalises; the rest
+---                      find nothing and do nothing.
 ---
 ---Events of a session that never bound (foreign, or already finalised) are
----ignored. A pending run that never got a session is cleared by the launch
----token's abort and by a 10-minute expiry.
+---ignored. A pending run that never got a session is cleared by a launch
+---failure (dap.launch aborts it), by the launch token's abort, and by its own
+---expiry timer (M.EXPIRY_MS, armed at begin).
 ---@module 'auto-run.dap.dart_tests'
 
 local M = {}
 
 local KEY = "auto-run.dart_tests"
-local EXPIRY_MS = 10 * 60 * 1000
+---How long a launched run may wait for its session before it is abandoned.
+M.EXPIRY_MS = 10 * 60 * 1000
 
 ---run id → { scope_id, root, created }
 local _pending = {}
@@ -35,7 +39,7 @@ local function dart() return require("auto-run.adapters.dart") end
 local function sweep()
   local now = vim.uv.now()
   for rid, p in pairs(_pending) do
-    if now - p.created > EXPIRY_MS then M.abort(rid) end
+    if now - p.created > M.EXPIRY_MS then M.abort(rid) end
   end
 end
 
@@ -49,6 +53,12 @@ function M.begin(pos, root)
   local run_id = ("dart-%d-%d"):format(os.time(), _seq)
   _pending[run_id] = { scope_id = pos.id, root = root, created = vim.uv.now() }
   discovery().debug_results(pos.id, nil, { running = true })
+  -- Its own expiry: a run whose session never arrives (an adapter that fails
+  -- to start after dap.run returned) must not stay running until some LATER
+  -- debug happens to sweep. abort() is a no-op once the run has bound.
+  vim.defer_fn(function()
+    if _pending[run_id] then M.abort(run_id) end
+  end, M.EXPIRY_MS)
   return run_id
 end
 
@@ -132,8 +142,12 @@ function M.attach(dap)
   dap.listeners.after["event_dart.testNotification"][KEY] = function(session, body)
     M.on_notification(session, body)
   end
+  -- `exited` finalises on its own (ADR 0196 r3 §2.3.1): an adapter or
+  -- connection that ends without a later terminated/disconnect must not leave
+  -- the scope running. A following terminated/disconnect finds no state.
   dap.listeners.after.event_exited[KEY] = function(session, body)
     M.on_exited(session, body)
+    M.finish(session)
   end
   dap.listeners.after.event_terminated[KEY] = function(session)
     M.finish(session)
