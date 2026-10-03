@@ -122,6 +122,16 @@ local function launch_cwd(eff)
   return dirs.workdir or dirs.root or dirs.anchor
 end
 
+---Preflight a resolved config for `purpose` with its runtime's adapter
+---(ADR 0213 §2.4): `(true)`, or `(nil, message)` naming what is missing.
+---@param eff table   substituted effective config
+---@param purpose "run"|"test"|"debug"
+---@return boolean? ok, string? err
+function M.preflight(eff, purpose)
+  local adapter = require("auto-run.adapters").get(eff.runtime or "go")
+  return require("auto-run.adapters").check(adapter, { root = launch_cwd(eff), purpose = purpose, eff = eff })
+end
+
 ---Build a terminal-ready shell command for RUNNING a config, without
 ---launching it (the auto-finder debug panel's `r` chansends this into a
 ---playground terminal). Go-aware: `go run <build_flags> <program>` for
@@ -138,6 +148,8 @@ function M.command_line(name, opts)
   local prep, perr, detail = prepare(name, opts)
   if not prep then return nil, perr, detail end
   local eff = prep.eff
+  local okp, pferr = M.preflight(eff, "run")
+  if not okp then return nil, pferr end
 
   -- Capability-only dispatch (ADR 0194 §2.3.4, Lector P1-5): the runtime's
   -- adapter builds the TERM command — go `go run`/`go test`, rust `cargo
@@ -240,6 +252,8 @@ function M.start(name, opts)
 
   local prep, perr, detail = prepare(name, opts)
   if not prep then return nil, perr, detail end
+  local okp, pferr = M.preflight(prep.eff, "run")
+  if not okp then return nil, pferr end
   local argv, aerr = build_argv(prep.eff, opts)
   if not argv then return nil, aerr end
   local cwd = launch_cwd(prep.eff)

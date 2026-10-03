@@ -2173,8 +2173,8 @@ do
 
   local names = {}
   for _, a in ipairs(adapters.list()) do names[#names + 1] = a.name end
-  ok("builtin roster is go + jest + rust (registration order)",
-    vim.deep_equal(names, { "go", "jest", "rust" }), vim.inspect(names))
+  ok("builtin roster is go + playwright + jest + rust + dart + node (registration order)",
+    vim.deep_equal(names, { "go", "playwright", "jest", "rust", "dart", "node" }), vim.inspect(names))
 
   local go = adapters.get("go")
   local iface_ok = go ~= nil
@@ -6180,6 +6180,892 @@ print("\n[46] dap.sessions — the program's pid, port and an output journal")
     function(l) launch = l end)
   ok("[46] a Go debug launch asks delve to forward the program's output (outputMode remote)",
     launch and launch.extra and launch.extra.outputMode == "remote", vim.inspect(launch and launch.extra))
+end)()
+
+-- ── shared helpers for [47]–[52] (ADR 0213 / ADR 0196 r3) ──────────
+local NEW = {}
+---Capture dap.run calls (the real nvim-dap stays loaded) for the duration of fn.
+function NEW.capture_dap_run(fn)
+  local okd, dap = pcall(require, "dap")
+  if not okd then return nil, "nvim-dap missing" end
+  local calls = {}
+  local real = dap.run
+  dap.run = function(cfg) calls[#calls + 1] = cfg end
+  local okf, ferr = pcall(fn, dap)
+  dap.run = real
+  if not okf then error(ferr) end
+  return calls
+end
+function NEW.repo(path)
+  vim.fn.delete(path, "rf")
+  local okr = make_plain_repo(path)
+  worktree.set_active(path)
+  store_paths.invalidate()
+  return okr
+end
+function NEW.restore(prev)
+  worktree.set_active(prev)
+  store_paths.invalidate()
+end
+function NEW.ids_by_name(node, out)
+  out = out or {}
+  out[node.name] = out[node.name] or node.id
+  for _, c in ipairs(node.children or {}) do NEW.ids_by_name(c, out) end
+  return out
+end
+
+-- ── [47] the node runtime adapter ────────────────────────────────
+-- Johno, 2026-10-03: "are we equiped with running ndoe application… like
+-- running the playground web". ADR 0213 §2.1.
+print("\n[47] node runtime — a file or a package.json script, run and debugged")
+;(function()
+  local js = require("auto-run.adapters.js")
+  local node = require("auto-run.adapters.node")
+  local prev = worktree.get_active()
+  local root = fx .. "/node47"
+  ok("[47] fixture repo", NEW.repo(root))
+  write_file(root .. "/web/package.json", vim.json.encode({ name = "web", scripts = { dev = "vite", start = "node server.js" } }))
+  write_file(root .. "/web/server.js", "console.log('hi')\n")
+
+  -- the package manager comes from the lockfile
+  ok("[47] no lockfile → npm", js.package_manager(root .. "/web") == "npm")
+  write_file(root .. "/web/pnpm-lock.yaml", "")
+  ok("[47] pnpm-lock.yaml → pnpm", js.package_manager(root .. "/web") == "pnpm")
+  os.remove(root .. "/web/pnpm-lock.yaml")
+  write_file(root .. "/yarn.lock", "")
+  ok("[47] a yarn.lock above the package (workspace root) → yarn", js.package_manager(root .. "/web") == "yarn")
+  os.remove(root .. "/yarn.lock")
+  write_file(root .. "/web/bun.lockb", "")
+  ok("[47] bun.lockb → bun", js.package_manager(root .. "/web") == "bun")
+  os.remove(root .. "/web/bun.lockb")
+
+  local function eff(t) return vim.tbl_extend("force", { name = "n47", kind = "run", runtime = "node", cwd = root .. "/web" }, t) end
+  local a1 = node.build_run_argv(eff({ program = root .. "/web/server.js" }))
+  ok("[47] a program runs as `node <file>`", vim.deep_equal(a1, { "node", root .. "/web/server.js" }), vim.inspect(a1))
+  local a2 = node.build_run_argv(eff({ script = "dev", args = { "--port", "1" } }))
+  ok("[47] an npm script with args gets the `--` separator", vim.deep_equal(a2, { "npm", "run", "dev", "--" }), vim.inspect(a2))
+  write_file(root .. "/web/pnpm-lock.yaml", "")
+  local a3 = node.build_run_argv(eff({ script = "dev", args = { "--port", "1" } }))
+  ok("[47] pnpm passes script args without `--`", vim.deep_equal(a3, { "pnpm", "run", "dev" }), vim.inspect(a3))
+  os.remove(root .. "/web/pnpm-lock.yaml")
+  write_file(root .. "/web/src/main.ts", "")
+  write_file(root .. "/web/node_modules/.bin/tsx", "#!/bin/sh\n")
+  local a4 = node.build_run_argv(eff({ program = "src/main.ts" }))
+  ok("[47] a .ts entry runs through the project's tsx", a4 and a4[1] == root .. "/web/node_modules/.bin/tsx", vim.inspect(a4))
+  vim.fn.delete(root .. "/web/node_modules", "rf")
+
+  local e1 = node.program_error(eff({ program = root .. "/web/nope.js" }))
+  ok("[47] a missing program is refused", tostring(e1):find("does not exist", 1, true) ~= nil, tostring(e1))
+  local e2 = node.program_error(eff({ script = "build" }))
+  ok("[47] an unknown script is refused, listing the package's scripts",
+    tostring(e2):find("no script 'build'", 1, true) ~= nil and tostring(e2):find("dev, start", 1, true) ~= nil, tostring(e2))
+  ok("[47] program and script together are refused",
+    tostring(node.program_error(eff({ program = "server.js", script = "dev" }))):find("not both", 1, true) ~= nil)
+  ok("[47] neither is refused", tostring(node.program_error(eff({}))):find("set `program`", 1, true) ~= nil)
+
+  -- scaffolding from the working directory's package.json
+  worktree.set_active(root .. "/web")
+  store_paths.invalidate()
+  local d1 = node.default_config("run", "start")
+  ok("[47] scaffold: a name that is a script becomes `script`, cwd is the package folder",
+    d1.script == "start" and d1.cwd == "${worktree}/web" and d1.program == nil, vim.inspect(d1))
+  local d2 = node.default_config("debug", "server")
+  ok("[47] scaffold: otherwise dev/start/serve", d2.script == "dev", vim.inspect(d2))
+  ok("[47] the `a` chooser offers node", vim.tbl_contains(require("auto-run.adapters").scaffold_runtimes(), "node"))
+
+  -- debug launch fields (pwa-node), through the public debug_start path
+  local cb_launch
+  node.prepare_debug_config(eff({ script = "dev", args = { "--x" } }), {}, function(l) cb_launch = l end)
+  ok("[47] a script debugs as runtimeExecutable npm + runtimeArgs run dev -- args, with outputCapture std",
+    cb_launch and cb_launch.dap_type == "pwa-node" and cb_launch.extra.runtimeExecutable == "npm"
+      and vim.deep_equal(cb_launch.extra.runtimeArgs, { "run", "dev", "--", "--x" })
+      and cb_launch.extra.outputCapture == "std", vim.inspect(cb_launch))
+  worktree.set_active(root)
+  store_paths.invalidate()
+  store.add({ name = "web-dev", kind = "debug", runtime = "node", script = "dev", cwd = "${worktree}/web" }, { tier = "tracked" })
+  local calls = NEW.capture_dap_run(function(dap)
+    local had = dap.adapters["pwa-node"]
+    dap.adapters["pwa-node"] = had or { type = "server", host = "127.0.0.1", port = 1 }
+    local okd, derr = require("auto-run.dap").debug_start("web-dev")
+    ok("[47] debug_start on a node config succeeds", okd == true, tostring(derr))
+    dap.adapters["pwa-node"] = had
+  end)
+  local c = calls and calls[1]
+  ok("[47] nvim-dap receives type pwa-node with the verified fields",
+    c and c.type == "pwa-node" and c.runtimeExecutable == "npm" and c.outputCapture == "std"
+      and c.cwd == root .. "/web" and vim.deep_equal(c.runtimeArgs, { "run", "dev" }), vim.inspect(c))
+  local calls2 = NEW.capture_dap_run(function(dap)
+    local had = dap.adapters["pwa-node"]
+    dap.adapters["pwa-node"] = nil
+    local real_cmd = require("auto-run.dap").js_debug_command
+    require("auto-run.dap").js_debug_command = function() return nil end
+    local okd, derr = require("auto-run.dap").debug_start("web-dev")
+    ok("[47] without any JavaScript debug adapter the debug is refused, naming the fix",
+      okd == nil and tostring(derr):find("js-debug-adapter", 1, true) ~= nil, tostring(derr))
+    require("auto-run.dap").js_debug_command = real_cmd
+    dap.adapters["pwa-node"] = had
+  end)
+  ok("[47] ... and nvim-dap is never called", calls2 and #calls2 == 0)
+  store.remove("web-dev")
+  NEW.restore(prev)
+end)()
+
+-- ── [48] jest: RTL, debug, preflight, Playwright exclusion ───────
+print("\n[48] jest — debug a test, preflight, and Playwright specs are not Jest's")
+;(function()
+  local prev = worktree.get_active()
+  local root = fx .. "/jest48"
+  ok("[48] fixture repo", NEW.repo(root))
+  write_file(root .. "/package.json", vim.json.encode({ name = "j48" }))
+  write_file(root .. "/node_modules/.bin/jest", "#!/bin/sh\nexit 0\n")
+  vim.uv.fs_chmod(root .. "/node_modules/.bin/jest", tonumber("755", 8))
+  write_file(root .. "/node_modules/jest/bin/jest.js", "")
+  local tfile = root .. "/test/App.test.tsx"
+  write_file(tfile, table.concat({
+    "import { render } from '@testing-library/preact';",
+    "describe('outer', () => {",
+    "  test('adds (one)', () => { render(<p/>); });",
+    "  test('adds', () => {});",
+    "});", "" }, "\n"))
+  P3.discovery._reset_for_tests()
+  require("auto-run.adapters.jest")._reset_for_tests()
+  local outcome, perr = P3.discovery.parse_file(tfile)
+  ok("[48] an RTL .tsx test file is discovered by jest", outcome == "parsed", tostring(perr))
+  local ids = NEW.ids_by_name(P3.discovery.tree().root)
+  local calls = NEW.capture_dap_run(function(dap)
+    local had = dap.adapters["pwa-node"]
+    dap.adapters["pwa-node"] = had or { type = "server", host = "127.0.0.1", port = 1 }
+    local okd, derr = P3.discovery.debug_position(ids["adds (one)"])
+    ok("[48] debug_position on a jest test succeeds", okd == true, tostring(derr))
+    dap.adapters["pwa-node"] = had
+  end)
+  local c = calls and calls[1]
+  local args = c and table.concat(c.args or {}, " ") or ""
+  ok("[48] jest debug runs jest/bin/jest.js under pwa-node, --runInBand first, output captured",
+    c and c.type == "pwa-node" and c.program == root .. "/node_modules/jest/bin/jest.js"
+      and c.args[1] == "--runInBand" and c.outputCapture == "std" and c.cwd == root, vim.inspect(c))
+  ok("[48] ... selecting exactly that test (anchored, escaped) in that file",
+    args:find("--testNamePattern=^outer adds \\(one\\)$", 1, true) ~= nil and args:find("App\\.test\\.tsx", 1, true) ~= nil, args)
+
+  -- preflight: dependencies declared, node_modules absent → refused, nothing spawns
+  local root2 = fx .. "/jest48b"
+  ok("[48] fixture repo b", NEW.repo(root2))
+  write_file(root2 .. "/package.json", vim.json.encode({ name = "b", devDependencies = { jest = "^30" } }))
+  write_file(root2 .. "/a.test.js", "test('x', () => {})\n")
+  P3.discovery._reset_for_tests()
+  require("auto-run.adapters.jest")._reset_for_tests()
+  P3.discovery.parse_file(root2 .. "/a.test.js")
+  local before = #require("auto-run.exec").list()
+  local launched, lerr = P3.discovery.run_position(root2 .. "/a.test.js")
+  ok("[48] a missing node_modules refuses the run with the install command",
+    launched == nil and tostring(lerr):find("dependencies are not installed", 1, true) ~= nil
+      and tostring(lerr):find("npm install", 1, true) ~= nil, tostring(lerr))
+  ok("[48] ... and no job spawned", #require("auto-run.exec").list() == before)
+  local rs = P3.discovery.results()
+  ok("[48] ... and nothing was left marked running", rs[root2 .. "/a.test.js::x"] == nil, vim.inspect(rs))
+  vim.fn.mkdir(root2 .. "/node_modules", "p")
+  local issues = require("auto-run.adapters").preflight(require("auto-run.adapters.jest"), { root = root2, purpose = "test" })
+  ok("[48] node_modules present but no jest → jest_missing with its install command",
+    #issues == 1 and issues[1].code == "jest_missing" and issues[1].fix == "npm install -D jest", vim.inspect(issues))
+  local doc = require("auto-run.adapters").doctor(root2)
+  local jrow
+  for _, r in ipairs(doc) do if r.name == "jest" then jrow = r end end
+  ok("[48] doctor lists jest's issue for this directory", jrow and #jrow.issues >= 1, vim.inspect(doc))
+
+  -- a spec importing @playwright/test under a Playwright root is Playwright's
+  local root3 = fx .. "/pw48"
+  write_file(root3 .. "/package.json", "{}")
+  write_file(root3 .. "/e2e/a.spec.ts", "import { test } from '@playwright/test';\ntest('t', async () => {});\n")
+  write_file(root3 .. "/unit/b.spec.ts", "test('u', () => {});\n")
+  local jest = require("auto-run.adapters.jest")
+  ok("[48] without a playwright config, a @playwright/test spec is still jest-shaped (no Playwright root)",
+    jest.is_test_file(root3 .. "/e2e/a.spec.ts"))
+  write_file(root3 .. "/playwright.config.ts", "export default {}\n")
+  ok("[48] with a playwright config, jest declines the @playwright/test spec", not jest.is_test_file(root3 .. "/e2e/a.spec.ts"))
+  ok("[48] ... and keeps the plain spec beside it", jest.is_test_file(root3 .. "/unit/b.spec.ts"))
+  local a_pw = P3.adapters.adapter_for(root3 .. "/e2e/a.spec.ts")
+  local a_js = P3.adapters.adapter_for(root3 .. "/unit/b.spec.ts")
+  ok("[48] adapter_for attributes them: playwright / jest",
+    a_pw and a_pw.name == "playwright" and a_js and a_js.name == "jest",
+    vim.inspect({ a_pw and a_pw.name, a_js and a_js.name }))
+  NEW.restore(prev)
+end)()
+
+-- ── [49] playwright ──────────────────────────────────────────────
+print("\n[49] playwright — discovery, file:line runs, the JSON report, browsers, debug")
+;(function()
+  local pw = require("auto-run.adapters.playwright")
+  local prev = worktree.get_active()
+  local root = fx .. "/pw49"
+  ok("[49] fixture repo", NEW.repo(root))
+  write_file(root .. "/package.json", vim.json.encode({ name = "pw", devDependencies = { ["@playwright/test"] = "^1" } }))
+  write_file(root .. "/playwright.config.ts", "export default { testDir: './tests' }\n")
+  local cli = root .. "/node_modules/@playwright/test/cli.js"
+  write_file(cli, "")
+  vim.fn.mkdir(root .. "/node_modules/.bin", "p")
+  vim.uv.fs_symlink("../@playwright/test/cli.js", root .. "/node_modules/.bin/playwright")
+  local spec = root .. "/tests/a.spec.ts"
+  write_file(spec, table.concat({
+    "import { test, expect } from '@playwright/test';", -- 1
+    "test.describe('outer', () => {",                   -- 2
+    "  test('adds', async () => {});",                  -- 3
+    "  test.fixme('later', async () => {});",           -- 4
+    "  test.skip('skipped', async () => {});",          -- 5
+    "  test.describe('inner', () => {",                 -- 6
+    "    test('deep', async () => { test.skip(); });",  -- 7
+    "  });",                                            -- 8
+    "});",                                              -- 9
+    "test('top', async ({ page }) => {});",             -- 10
+    "" }, "\n"))
+  P3.discovery._reset_for_tests()
+  local outcome, perr = P3.discovery.parse_file(spec)
+  ok("[49] a Playwright spec is discovered by the playwright adapter", outcome == "parsed", tostring(perr))
+  local file_node = P3.discovery.tree():get(spec)
+  ok("[49] ... owned by playwright", file_node and file_node.adapter == "playwright")
+  if not (file_node and file_node.adapter == "playwright") then
+    -- Every cell below needs Playwright's positions; stop here (failed above).
+    NEW.restore(prev)
+    return
+  end
+  local ids = NEW.ids_by_name(P3.discovery.tree().root)
+  ok("[49] describes nest; test / test.fixme / test.skip are tests; a title-less test.skip() is not",
+    ids["outer"] == spec .. "::outer" and ids["deep"] == spec .. "::outer::inner::deep"
+      and ids["later"] ~= nil and ids["skipped"] ~= nil and ids["top"] == spec .. "::top"
+      and #(P3.discovery.tree():get(ids["deep"]).children or {}) == 0, vim.inspect(ids))
+
+  local run_dir = fx .. "/pw49-run"
+  vim.fn.mkdir(run_dir, "p")
+  local tree = P3.discovery.tree()
+  local s1 = pw.build_spec({ position = tree:get(ids["deep"]), tree = tree, root = root, run_id = "r", run_dir = run_dir })
+  ok("[49] a test runs by position: playwright test --reporter=json tests/a.spec.ts:7",
+    s1 and s1.cmd[1] == root .. "/node_modules/.bin/playwright"
+      and vim.deep_equal({ unpack(s1.cmd, 2) }, { "test", "--reporter=json", "tests/a.spec.ts:7" })
+      and s1.env.PLAYWRIGHT_JSON_OUTPUT_NAME == run_dir .. "/playwright.json", vim.inspect(s1))
+  local s2 = pw.build_spec({ position = tree:get(ids["outer"]), tree = tree, root = root, run_id = "r", run_dir = run_dir })
+  ok("[49] a describe runs by its line", s2 and s2.cmd[#s2.cmd] == "tests/a.spec.ts:2", vim.inspect(s2 and s2.cmd))
+
+  -- the report: the real shape recorded on VM43 (ADR 0213 P2)
+  local report = {
+    config = { rootDir = root .. "/tests" },
+    suites = { {
+      title = "a.spec.ts", file = "a.spec.ts", line = 0,
+      specs = { { title = "top", line = 10, file = "a.spec.ts", tests = {
+        { projectName = "chromium", status = "expected", results = { { status = "passed", duration = 5 } } },
+        { projectName = "firefox", status = "unexpected", results = { { status = "failed", duration = 3,
+          error = { message = "\27[31mbrowserType.launch: Executable doesn't exist\27[39m" } } } },
+      } } },
+      suites = { {
+        title = "outer", file = "a.spec.ts", line = 2,
+        specs = {
+          { title = "adds", line = 3, file = "a.spec.ts", tests = { { projectName = "chromium", status = "expected",
+            results = { { status = "passed", duration = 1, stdout = { { text = "hello\n" } } } } } } },
+          { title = "skipped", line = 5, file = "a.spec.ts", tests = { { projectName = "chromium", status = "skipped",
+            results = { { status = "skipped" } } } } },
+        },
+        suites = { { title = "inner", file = "a.spec.ts", line = 6, specs = {
+          { title = "deep", line = 7, file = "a.spec.ts", tests = { { projectName = "chromium", status = "flaky",
+            results = { { status = "failed" }, { status = "passed" } } } } },
+        } } },
+      } },
+    } },
+  }
+  write_file(run_dir .. "/playwright.json", vim.json.encode(report))
+  local res = pw.results({ context = { position_id = spec, output_file = run_dir .. "/playwright.json" } }, {}, tree)
+  ok("[49] a test failing in ONE project is failed, its error de-coloured",
+    res[ids["top"]] and res[ids["top"]].status == "failed"
+      and res[ids["top"]].output == "browserType.launch: Executable doesn't exist", vim.inspect(res[ids["top"]]))
+  ok("[49] nested describes map by title chain + rootDir-relative file",
+    res[ids["adds"]] and res[ids["adds"]].status == "passed", vim.inspect(res))
+  ok("[49] skipped is skipped; flaky counts as passed",
+    res[ids["skipped"]] and res[ids["skipped"]].status == "skipped" and res[ids["deep"]] and res[ids["deep"]].status == "passed")
+  ok("[49] the output view carries the test's stdout",
+    pw.output({ run_dir = run_dir }):find("hello", 1, true) ~= nil)
+
+  -- browsers: the installed Playwright's revisions, not "anything in the cache"
+  write_file(root .. "/node_modules/playwright-core/browsers.json", vim.json.encode({ browsers = {
+    { name = "chromium", revision = "1243", installByDefault = true },
+    { name = "chromium-headless-shell", revision = "1243", installByDefault = true },
+    { name = "firefox", revision = "1543", installByDefault = true },
+    { name = "webkit", revision = "2359", installByDefault = true },
+    { name = "ffmpeg", revision = "1011", installByDefault = true },
+  } }))
+  local cache = fx .. "/pw49-browsers"
+  vim.fn.mkdir(cache .. "/chromium-1228", "p")
+  vim.fn.mkdir(cache .. "/chromium_headless_shell-1228", "p")
+  local prev_env = vim.env.PLAYWRIGHT_BROWSERS_PATH
+  vim.env.PLAYWRIGHT_BROWSERS_PATH = cache
+  local i1 = require("auto-run.adapters").preflight(pw, { root = root, purpose = "test" })
+  local b1
+  for _, i in ipairs(i1) do if i.code == "browsers_missing" then b1 = i end end
+  ok("[49] an OLDER browser revision in the cache still counts as missing → error with the install command",
+    b1 and b1.level == "error" and b1.fix == "npx playwright install", vim.inspect(i1))
+  vim.fn.mkdir(cache .. "/chromium-1243", "p")
+  vim.fn.mkdir(cache .. "/chromium_headless_shell-1243", "p")
+  local i2 = require("auto-run.adapters").preflight(pw, { root = root, purpose = "test" })
+  local b2
+  for _, i in ipairs(i2) do if i.code == "browsers_missing" then b2 = i end end
+  ok("[49] chromium at the right revision → a warning naming the others",
+    b2 and b2.level == "warn" and b2.message:find("firefox, webkit", 1, true) ~= nil, vim.inspect(i2))
+  vim.fn.mkdir(cache .. "/firefox-1543", "p")
+  vim.fn.mkdir(cache .. "/webkit-2359", "p")
+  local i3 = require("auto-run.adapters").preflight(pw, { root = root, purpose = "test" })
+  ok("[49] all present → no browser issue", #vim.tbl_filter(function(i) return i.code == "browsers_missing" end, i3) == 0,
+    vim.inspect(i3))
+  vim.env.PLAYWRIGHT_BROWSERS_PATH = prev_env
+
+  -- debug: the CLI script under pwa-node, one worker, no timeout
+  local calls = NEW.capture_dap_run(function(dap)
+    local had = dap.adapters["pwa-node"]
+    dap.adapters["pwa-node"] = had or { type = "server", host = "127.0.0.1", port = 1 }
+    vim.env.PLAYWRIGHT_BROWSERS_PATH = cache
+    local okd, derr = P3.discovery.debug_position(ids["deep"])
+    vim.env.PLAYWRIGHT_BROWSERS_PATH = prev_env
+    ok("[49] debug_position on a playwright test succeeds", okd == true, tostring(derr))
+    dap.adapters["pwa-node"] = had
+  end)
+  local c = calls and calls[1]
+  ok("[49] playwright debug: cli.js (the real file, not the .bin link), test file:line --workers=1 --timeout=0",
+    c and c.type == "pwa-node" and c.program == vim.uv.fs_realpath(cli)
+      and vim.deep_equal(c.args, { "test", "tests/a.spec.ts:7", "--workers=1", "--timeout=0" })
+      and c.outputCapture == "std", vim.inspect(c))
+  NEW.restore(prev)
+end)()
+
+-- ── [50] dart / flutter adapter ──────────────────────────────────
+-- ADR 0196 r3. Package kind from pub's package_config.json; anchored --name;
+-- testWidgets locations in root_url. Real-SDK cells run when `dart` is on PATH
+-- (VM43 has Flutter 3.47.5); their count is asserted so an absent SDK on a
+-- machine that has one cannot pass silently.
+local HAVE_DART_TS = pcall(vim.treesitter.language.inspect, "dart")
+local HAVE_DART = vim.fn.executable("dart") == 1
+local HAVE_FLUTTER = vim.fn.executable("flutter") == 1
+local dart_real = 0
+print("\n[50] dart / flutter — package kind, discovery, selection, results"
+  .. (HAVE_DART and "" or "  (no dart on PATH: real-SDK cells skipped)"))
+;(function()
+  local dart = require("auto-run.adapters.dart")
+  local prev = worktree.get_active()
+  local root = fx .. "/dart50"
+  ok("[50] fixture repo", NEW.repo(root))
+  local pkg = root .. "/pkg"
+  local function pubspec(body) write_file(pkg .. "/pubspec.yaml", "name: d50\nenvironment:\n  sdk: ^3.0.0\n" .. body) end
+  pubspec("dev_dependencies:\n  test: any\n")
+  dart._reset_for_tests()
+
+  -- package kind
+  local k0, code0 = dart.package_kind(pkg)
+  ok("[50] no package_config.json → no kind (not_fetched), never a guess", k0 == nil and code0 == "not_fetched")
+  local issues0 = require("auto-run.adapters").preflight(dart, { root = pkg, purpose = "test" })
+  local nf
+  for _, i in ipairs(issues0) do if i.code == "not_fetched" then nf = i end end
+  ok("[50] preflight: not fetched → error with `dart pub get`", nf and nf.level == "error" and nf.fix:find("dart pub get", 1, true) ~= nil,
+    vim.inspect(issues0))
+  local function hint() return dart.pubspec_mentions_flutter(pkg) end
+  pubspec("dev_dependencies:\n  flutter_test: {sdk: flutter}  # inline\n")
+  ok("[50] pub-get hint: an inline `{sdk: flutter}` mapping reads as Flutter", hint())
+  pubspec("dependencies:\n  flutter:\n    sdk: flutter\n")
+  ok("[50] pub-get hint: a block `sdk: flutter` reads as Flutter", hint())
+  pubspec("dependencies:\n  flutter:\n    sdk: \"flutter\"\n")
+  ok("[50] pub-get hint: a quoted value reads as Flutter", hint())
+  pubspec("# this used to depend on sdk: flutter\ndependencies:\n  path: any\n")
+  ok("[50] pub-get hint: a comment mentioning it does not", not hint())
+  pubspec("dev_dependencies:\n  test: any\n")
+
+  local pc = pkg .. "/.dart_tool/package_config.json"
+  write_file(pc, vim.json.encode({ configVersion = 2, packages = { { name = "test", rootUri = "file:///x" }, { name = "d50", rootUri = "../" } } }))
+  ok("[50] resolved graph without `flutter` → dart", dart.package_kind(pkg) == "dart")
+  write_file(pc, vim.json.encode({ configVersion = 2, packages = { { name = "flutter", rootUri = "file:///sdk/packages/flutter" },
+    { name = "flutter_test", rootUri = "file:///sdk/packages/flutter_test" }, { name = "d50", rootUri = "../" } } }))
+  ok("[50] the same package after re-resolution with `flutter` (flutter_test pulls it in) → flutter, the cache re-read",
+    dart.package_kind(pkg) == "flutter")
+  write_file(pc, "{ not json")
+  local km, cm = dart.package_kind(pkg)
+  ok("[50] malformed package_config.json → a structured error, not a fallback", km == nil and cm == "malformed")
+  write_file(pc, vim.json.encode({ configVersion = 2, packages = { { name = "test", rootUri = "file:///x" } } }))
+
+  -- test files + discovery
+  local tfile = pkg .. "/test/calc_test.dart"
+  write_file(tfile, table.concat({
+    "import 'package:test/test.dart';",
+    "void main() {",
+    "  group('outer', () {",
+    "    group(\"inner\", () {",
+    "      test('add', () => expect(1 + 1, 2));",
+    "      test('adds', () => expect(2 + 2, 4));",
+    "    });",
+    "    test('fails', () => expect(1, 2));",
+    "    test('skipped', () {}, skip: 'not now');",
+    "    final x = 1;",
+    "    test('interp $x', () {});",
+    "    test(r'raw $not (interp)', () {});",
+    "  });",
+    "}", "" }, "\n"))
+  write_file(pkg .. "/integration_test/app_test.dart", "void main() {}\n")
+  write_file(pkg .. "/lib/x_test.dart", "void main() {}\n")
+  ok("[50] *_test.dart under test/ is a test file", dart.is_test_file(tfile))
+  ok("[50] integration_test/ and lib/ are not", not dart.is_test_file(pkg .. "/integration_test/app_test.dart")
+    and not dart.is_test_file(pkg .. "/lib/x_test.dart"))
+  ok("[50] literal decoding: adjacent, triple, raw, escapes; interpolation → nil",
+    dart.decode_literal("'adj' 'acent'") == "adjacent" and dart.decode_literal("'''tri'''") == "tri"
+      and dart.decode_literal("r'a$b'") == "a$b" and dart.decode_literal([['it\'s']]) == "it's"
+      and dart.decode_literal("'v $x'") == nil and dart.decode_literal("'v ${x}'") == nil)
+  if not HAVE_DART_TS then
+    ok("[50] dart treesitter parser available (install it: see .github/install-parsers.sh)", false)
+    NEW.restore(prev)
+    return
+  end
+  P3.discovery._reset_for_tests()
+  local outcome, perr = P3.discovery.parse_file(tfile)
+  ok("[50] the dart adapter discovers the file", outcome == "parsed" and (P3.discovery.tree():get(tfile) or {}).adapter == "dart",
+    tostring(perr))
+  local ids = NEW.ids_by_name(P3.discovery.tree().root)
+  ok("[50] nested groups → namespaces; interpolated description → no position; raw `$` kept",
+    ids["add"] == tfile .. "::outer::inner::add" and ids["interp $x"] == nil and ids["raw $not (interp)"] ~= nil,
+    vim.inspect(ids))
+  local tree = P3.discovery.tree()
+  ok("[50] selection: an anchored --name regex — exact for a test, a word prefix for a group, metachars escaped",
+    dart.name_pattern(tree:get(ids["add"])) == "^outer inner add$"
+      and dart.name_pattern(tree:get(ids["inner"])) == "^outer inner( |$)"
+      and dart.name_pattern(tree:get(ids["raw $not (interp)"])) == "^outer raw \\$not \\(interp\\)$")
+  local spec = dart.build_spec({ position = tree:get(ids["add"]), tree = tree, root = pkg, run_id = "r", run_dir = fx })
+  ok("[50] a test runs as `dart test --reporter=json test/calc_test.dart --name ^outer inner add$` in the package",
+    spec and vim.deep_equal(spec.cmd, { "dart", "test", "--reporter=json", "test/calc_test.dart", "--name", "^outer inner add$" })
+      and spec.cwd == pkg, vim.inspect(spec))
+  store.add({ name = "dt50", kind = "test", runtime = "dart", dart_sdk = "flutter" }, { tier = "tracked" })
+  local spec2 = dart.build_spec({ position = tree:get(tfile), tree = tree, root = pkg, run_id = "r", run_dir = fx })
+  ok("[50] the dart test config's dart_sdk overrides detection", spec2 and spec2.cmd[1] == "flutter", vim.inspect(spec2))
+  store.remove("dt50")
+
+  -- results from the reporter stream (shape verified on VM43)
+  local wfile = pkg .. "/test/w_test.dart"
+  write_file(wfile, "import 'package:flutter_test/flutter_test.dart';\nvoid main() {\n  group('g', () {\n"
+    .. "    test('adds', () {});\n    testWidgets('widget', (t) async {});\n  });\n  test('top skip', () {}, skip: true);\n}\n")
+  P3.discovery.parse_file(wfile)
+  tree = P3.discovery.tree()
+  local wids = NEW.ids_by_name(tree:get(wfile))
+  local furl = vim.uri_from_fname(wfile)
+  local lines = {
+    { type = "suite", suite = { id = 0, path = "test/w_test.dart" } },
+    { type = "testStart", test = { id = 1, name = "loading test/w_test.dart", suiteID = 0 }, time = 0 },
+    { type = "testDone", testID = 1, result = "success", skipped = false, hidden = true, time = 5 },
+    { type = "testStart", test = { id = 3, name = "g adds", suiteID = 0, line = 4, url = furl }, time = 10 },
+    { type = "testDone", testID = 3, result = "success", skipped = false, hidden = false, time = 12 },
+    { type = "testStart", test = { id = 4, name = "g widget", suiteID = 0, line = 160,
+      url = "file:///sdk/packages/flutter_test/lib/src/widget_tester.dart", root_line = 5, root_url = furl }, time = 13 },
+    { type = "error", testID = 4, error = "Expected: 1\n  Actual: 2", stackTrace = "at w_test.dart:5", time = 14 },
+    { type = "testDone", testID = 4, result = "failure", skipped = false, hidden = false, time = 15 },
+    { type = "testStart", test = { id = 5, name = "top skip", suiteID = 0, line = 7, url = furl }, time = 16 },
+    { type = "testDone", testID = 5, result = "success", skipped = true, hidden = false, time = 16 },
+    { type = "done", success = false },
+  }
+  local stdout = fx .. "/dart50-stdout"
+  local enc = {}
+  for _, l in ipairs(lines) do enc[#enc + 1] = vim.json.encode(l) end
+  write_file(stdout, "Resolving dependencies...\n" .. table.concat(enc, "\n") .. "\n")
+  local res = dart.results({ context = { position_id = wfile, root = pkg } }, { stdout_file = stdout }, tree)
+  ok("[50] a testWidgets result lands on its position through root_url (url points into flutter_test)",
+    res[wids["widget"]] and res[wids["widget"]].status == "failed"
+      and tostring(res[wids["widget"]].output):find("Expected: 1", 1, true) ~= nil, vim.inspect(res))
+  ok("[50] passed, and skip (result=success, skipped=true) → skipped; the hidden loading test is ignored",
+    res[wids["adds"]] and res[wids["adds"]].status == "passed" and res[wids["top skip"]] and res[wids["top skip"]].status == "skipped"
+      and vim.tbl_count(res) == 3, vim.inspect(res))
+  local lerr_lines = {
+    vim.json.encode({ type = "suite", suite = { id = 0, path = "test/w_test.dart" } }),
+    vim.json.encode({ type = "testStart", test = { id = 1, name = "loading test/w_test.dart", suiteID = 0 }, time = 0 }),
+    vim.json.encode({ type = "error", testID = 1, error = "Failed to load: Error: Undefined name 'x'.", time = 1 }),
+    vim.json.encode({ type = "testDone", testID = 1, result = "error", skipped = false, hidden = false, time = 2 }),
+  }
+  write_file(stdout, table.concat(lerr_lines, "\n") .. "\n")
+  local lres = dart.results({ context = { position_id = wfile, root = pkg } }, { stdout_file = stdout }, tree)
+  ok("[50] a file that fails to load (compile error) fails its tests WITH the compiler's message",
+    lres[wids["adds"]] and lres[wids["adds"]].status == "failed"
+      and tostring(lres[wids["adds"]].output):find("Undefined name", 1, true) ~= nil and vim.tbl_count(lres) == 3, vim.inspect(lres))
+
+  -- real SDK: a pure Dart package, the whole file, then ONE test by its exact name
+  if HAVE_DART then
+    vim.fn.delete(pc)
+    local pg = vim.system({ "dart", "pub", "get", "--offline" }, { cwd = pkg, text = true }):wait()
+    dart_real = dart_real + 1
+    ok("[50][real] dart pub get --offline resolves the fixture", pg.code == 0, (pg.stderr or "") .. (pg.stdout or ""))
+    os.remove(wfile)
+    P3.discovery._reset_for_tests()
+    P3.discovery.parse_file(tfile)
+    tree = P3.discovery.tree()
+    ids = NEW.ids_by_name(tree:get(tfile))
+    local done
+    local launched, lerr = P3.discovery.run_position(tfile, { on_done = function(b) done = b end })
+    ok("[50][real] dart test runs the file", launched ~= nil, tostring(lerr))
+    wait_for(function() return done end, 120000)
+    dart_real = dart_real + 1
+    ok("[50][real] add / adds passed, fails failed, skipped skipped — from real `dart test` JSON",
+      done and done[ids["add"]] and done[ids["add"]].status == "passed" and done[ids["adds"]].status == "passed"
+        and done[ids["fails"]].status == "failed" and done[ids["skipped"]].status == "skipped", vim.inspect(done))
+    done = nil
+    local l2 = P3.discovery.run_position(ids["add"], { on_done = function(b) done = b end })
+    wait_for(function() return done end, 120000)
+    local out = ""
+    if l2 and l2.runs[1] then
+      local f = io.open(require("auto-run.exec.job").run_dir(l2.runs[1].id) .. "/stdout", "r")
+      if f then out = f:read("*a") f:close() end
+    end
+    dart_real = dart_real + 1
+    ok("[50][real] running `outer inner add` does NOT also run its prefix sibling `outer inner adds` (anchored --name)",
+      out:find('"name":"outer inner add"', 1, true) ~= nil and out:find('"name":"outer inner adds"', 1, true) == nil
+        and done and done[ids["add"]] and done[ids["add"]].status == "passed", out:sub(1, 400))
+  end
+  if HAVE_FLUTTER then
+    local fpkg = root .. "/fpkg"
+    write_file(fpkg .. "/pubspec.yaml", "name: f50\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n"
+      .. "dev_dependencies:\n  flutter_test:\n    sdk: flutter\n")
+    local ffile = fpkg .. "/test/widget_test.dart"
+    write_file(ffile, "import 'package:flutter/widgets.dart';\nimport 'package:flutter_test/flutter_test.dart';\n"
+      .. "void main() {\n  group('w', () {\n    testWidgets('pumps', (tester) async {\n"
+      .. "      await tester.pumpWidget(const SizedBox());\n    });\n  });\n}\n")
+    local pg = vim.system({ "flutter", "pub", "get", "--offline" }, { cwd = fpkg, text = true }):wait()
+    dart_real = dart_real + 1
+    ok("[50][real] flutter pub get --offline resolves the Flutter fixture", pg.code == 0, (pg.stderr or "") .. (pg.stdout or ""))
+    dart_real = dart_real + 1
+    ok("[50][real] pub's resolution says flutter", dart.package_kind(fpkg) == "flutter")
+    P3.discovery.parse_file(ffile)
+    local fid = NEW.ids_by_name(P3.discovery.tree():get(ffile))["pumps"]
+    local done
+    P3.discovery.run_position(ffile, { on_done = function(b) done = b end })
+    wait_for(function() return done end, 240000)
+    dart_real = dart_real + 1
+    ok("[50][real] flutter test: the testWidgets test passes on its own position", done and done[fid] and done[fid].status == "passed",
+      vim.inspect(done))
+  end
+  NEW.restore(prev)
+end)()
+
+-- ── [51] dart debug: the launch matrix and the testNotification bridge ──
+-- ADR 0196 r3 §2.3 / §2.3.1 (Lector r2 MF1 + MF2): refusals happen before
+-- dap.run; debugged-test results reach the canonical results through the
+-- bridge, per session, with stale and foreign events ignored.
+print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNotification bridge")
+;(function()
+  if not HAVE_DART_TS then
+    ok("[51] dart treesitter parser available", false)
+    return
+  end
+  local okd, dap = pcall(require, "dap")
+  if not okd then ok("[51] nvim-dap available", false) return end
+  local bridge_mod = require("auto-run.dap")
+  bridge_mod.setup() -- idempotent: attaches the bridge listeners
+  -- The synthetic part below tests the launch matrix and the bridge, not the
+  -- SDK: preflight would (rightly) refuse every Dart debug on a machine without
+  -- one (CI), before the bridge is ever reached. So `dart` / `flutter` read as
+  -- installed until the real-SDK block, which uses the real PATH.
+  local real_executable = vim.fn.executable
+  vim.fn.executable = function(x)
+    if x == "dart" or x == "flutter" then return 1 end
+    return real_executable(x)
+  end
+  local prev = worktree.get_active()
+  local root = fx .. "/dart51"
+  ok("[51] fixture repo", NEW.repo(root))
+  local pkg = root .. "/pkg"
+  write_file(pkg .. "/pubspec.yaml", "name: d51\nenvironment:\n  sdk: ^3.0.0\ndev_dependencies:\n  test: any\n")
+  write_file(pkg .. "/.dart_tool/package_config.json", vim.json.encode({ configVersion = 2, packages = { { name = "test", rootUri = "file:///x" } } }))
+  local tfile = pkg .. "/test/b_test.dart"
+  write_file(tfile, "import 'package:test/test.dart';\nvoid main() {\n  group('g', () {\n    test('one', () {});\n"
+    .. "    test('two', () {});\n    test('three', () {});\n    test('four', () {});\n  });\n}\n")
+  require("auto-run.adapters.dart")._reset_for_tests()
+  require("auto-run.dap.dart_tests")._reset_for_tests()
+  P3.discovery._reset_for_tests()
+  P3.discovery.parse_file(tfile)
+  local ids = NEW.ids_by_name(P3.discovery.tree():get(tfile))
+
+  -- the adapter: registered when free, rows by discriminant, never overwriting another plugin's
+  local had_dart = dap.adapters.dart
+  dap.adapters.dart = nil
+  bridge_mod.ensure_dart_adapter(dap)
+  ok("[51] auto-run registers dap.adapters.dart when the key is free", bridge_mod.owns_dart_adapter(dap))
+  local rows = {}
+  for _, r in ipairs({ { "dart", "run" }, { "dart", "test" }, { "flutter", "run" }, { "flutter", "test" } }) do
+    dap.adapters.dart(function(a) rows[#rows + 1] = a.command .. " " .. table.concat(a.args, " ") end,
+      { autoRunDartKind = r[1], autoRunDartMode = r[2] })
+  end
+  ok("[51] the four rows: dart debug_adapter [--test], flutter debug-adapter [--test]",
+    vim.deep_equal(rows, { "dart debug_adapter", "dart debug_adapter --test", "flutter debug-adapter", "flutter debug-adapter --test" }),
+    vim.inspect(rows))
+  local foreign = function(cb) cb({ type = "executable", command = "x" }) end
+  dap.adapters.dart = foreign
+  bridge_mod.ensure_dart_adapter(dap)
+  ok("[51] another plugin's dap.adapters.dart is never overwritten", dap.adapters.dart == foreign)
+  local fi = require("auto-run.adapters").preflight(require("auto-run.adapters.dart"), { root = pkg, purpose = "debug" })
+  ok("[51] ... and debug preflight warns about it", #vim.tbl_filter(function(i) return i.code == "dart_adapter_foreign" and i.level == "warn" end, fi) == 1,
+    vim.inspect(fi))
+  dap.adapters.dart = nil
+  bridge_mod.ensure_dart_adapter(dap)
+
+  -- refusals before dap.run (MF1): through the public launch and debug_start
+  local calls = NEW.capture_dap_run(function()
+    local l1, e1 = bridge_mod.launch({ dap_type = "dart", program = "lib/main.dart",
+      extra = { autoRunDartKind = "flutter", autoRunDartMode = "run", autoRunDartDevice = "android" } })
+    ok("[51] a Flutter app launch on a non-desktop device is refused with the boundary named",
+      l1 == nil and tostring(e1):find("desktop devices only", 1, true) ~= nil, tostring(e1))
+    local l2, e2 = bridge_mod.launch({ dap_type = "dart", extra = { autoRunDartKind = "kotlin", autoRunDartMode = "run" } })
+    ok("[51] an unknown kind is refused", l2 == nil and tostring(e2):find("unknown kind", 1, true) ~= nil, tostring(e2))
+    write_file(pkg .. "/lib/main.dart", "void main() {}\n")
+    store.add({ name = "f51", kind = "debug", runtime = "dart", dart_sdk = "flutter", device = "chrome",
+      program = "${worktree}/pkg/lib/main.dart", cwd = "${worktree}/pkg" }, { tier = "tracked" })
+    local l3, e3 = bridge_mod.debug_start("f51")
+    ok("[51] debug_start of a Flutter config on chrome is refused", l3 == nil and tostring(e3):find("desktop devices only", 1, true) ~= nil,
+      tostring(e3))
+    store.remove("f51")
+  end)
+  ok("[51] ... none of them reached dap.run", calls and #calls == 0, vim.inspect(calls))
+
+  -- a debugged test: the launch carries the run id; events flow through nvim-dap's listener table
+  local cfgs = NEW.capture_dap_run(function()
+    for _, n in ipairs({ "one", "two", "three", "four" }) do
+      local okp, perr = P3.discovery.debug_position(ids[n])
+      ok("[51] debug_position(" .. n .. ")", okp == true, tostring(perr))
+    end
+  end)
+  local c1 = cfgs and cfgs[1]
+  ok("[51] the launch: type dart, test mode, a run id, the exact --name, the file as program",
+    c1 and c1.type == "dart" and c1.autoRunDartKind == "dart" and c1.autoRunDartMode == "test" and type(c1.autoRunRunId) == "string"
+      and vim.deep_equal(c1.toolArgs, { "--name", "^g one$" }) and c1.program == tfile and c1.cwd == pkg, vim.inspect(c1))
+  local function status(id) local r = P3.discovery.results()[id] return r and r.status end
+  local rs = P3.discovery.results()
+  ok("[51] the debugged tests show running until their session reports", status(ids["one"]) == "running",
+    vim.inspect({ ids = ids, results = rs, root = P3.discovery.tree().root.path }))
+  local L = dap.listeners.after
+  local KEY = "auto-run.dart_tests"
+  local function notify(sess, body) L["event_dart.testNotification"][KEY](sess, body) end
+  local s1 = { id = 99001, config = cfgs[1] }
+  local s2 = { id = 99002, config = cfgs[2] }
+  local furl = vim.uri_from_fname(tfile)
+  -- interleaved: two sessions at once
+  notify(s1, { type = "testStart", test = { id = 3, name = "g one", url = furl }, time = 1 })
+  notify(s2, { type = "testStart", test = { id = 3, name = "g two", url = furl }, time = 1 })
+  notify(s2, { type = "error", testID = 3, error = "boom", time = 2 })
+  notify(s1, { type = "testDone", testID = 3, result = "success", skipped = false, hidden = false, time = 3 })
+  notify(s2, { type = "testDone", testID = 3, result = "failure", skipped = false, hidden = false, time = 3 })
+  rs = P3.discovery.results()
+  ok("[51] two concurrent sessions land only in their own scopes (same testID 3 in both)",
+    status(ids["one"]) == "passed" and status(ids["two"]) == "failed" and (rs[ids["two"]] or {}).output == "boom", vim.inspect(rs))
+  ok("[51] a run's result is published (run.results:changed reached the canonical table)", rs[ids["g"]] ~= nil)
+  L.event_terminated[KEY](s1)
+  notify(s1, { type = "testStart", test = { id = 9, name = "g three", url = furl }, time = 5 })
+  notify(s1, { type = "testDone", testID = 9, result = "success", skipped = false, hidden = false, time = 6 })
+  rs = P3.discovery.results()
+  ok("[51] events after a session terminated are dropped (three stays running)", status(ids["three"]) == "running")
+  notify({ id = 99099, config = { autoRunRunId = "dart-forged-1" } },
+    { type = "testDone", testID = 1, result = "failure", skipped = false, hidden = false, time = 1 })
+  ok("[51] an event from an unknown session changes nothing", status(ids["three"]) == "running")
+  -- a runner that exits non-zero having reported nothing → failed, not skipped
+  local s3 = { id = 99003, config = cfgs[3] }
+  L.event_exited[KEY](s3, { exitCode = 254 })
+  L.event_terminated[KEY](s3)
+  rs = P3.discovery.results()
+  ok("[51] exit 254 with no reports → failed, with the reason", status(ids["three"]) == "failed"
+    and tostring((rs[ids["three"]] or {}).output):find("code=254", 1, true) ~= nil, vim.inspect(rs[ids["three"]]))
+  local s4 = { id = 99004, config = cfgs[4] }
+  L.event_exited[KEY](s4, { exitCode = 0 })
+  L.disconnect[KEY](s4)
+  ok("[51] a clean exit with nothing reported → skipped", status(ids["four"]) == "skipped")
+  L.event_terminated[KEY](s2)
+  local st = require("auto-run.dap.dart_tests")._state()
+  ok("[51] every session's state is cleared after it ends", next(st.active) == nil and next(st.pending) == nil, vim.inspect(st))
+  -- Lector r1 (PR #16) finding 1: a session that ends with `exited` ALONE
+  -- finalises (no terminated / disconnect ever arrives).
+  local ex = NEW.capture_dap_run(function() P3.discovery.debug_position(ids["two"]) end)
+  local s5 = { id = 99005, config = ex and ex[1] }
+  ok("[51] exited-only: the debugged test is running first", status(ids["two"]) == "running")
+  L.event_exited[KEY](s5, { exitCode = 2 })
+  ok("[51] exited-only: `exited` alone finalises — failed (exit 2, nothing reported)",
+    status(ids["two"]) == "failed" and tostring((P3.discovery.results()[ids["two"]] or {}).output):find("code=2", 1, true) ~= nil,
+    vim.inspect(P3.discovery.results()[ids["two"]]))
+  ok("[51] exited-only: its session state is cleared", next(require("auto-run.dap.dart_tests")._state().active) == nil)
+  L.event_terminated[KEY](s5)
+  L.disconnect[KEY](s5)
+  ok("[51] a terminated / disconnect after exited changes nothing (idempotent)", status(ids["two"]) == "failed")
+
+  -- Lector r1 finding 2: a dap.run that throws leaves no pending run behind.
+  local real_run = dap.run
+  dap.run = function() error("adapter exploded") end
+  local okp2 = P3.discovery.debug_position(ids["three"])
+  dap.run = real_run
+  ok("[51] dap.run throwing: debug_position itself returned (the launch failed in its callback)", okp2 == true)
+  ok("[51] dap.run throwing: the test's running mark is unwound", P3.discovery.results()[ids["three"]] == nil
+    or status(ids["three"]) ~= "running", vim.inspect(P3.discovery.results()[ids["three"]]))
+  ok("[51] dap.run throwing: no pending run is left", next(require("auto-run.dap.dart_tests")._state().pending) == nil,
+    vim.inspect(require("auto-run.dap.dart_tests")._state().pending))
+
+  -- ... and a run whose session never arrives expires on its own timer, with
+  -- no later debug needed to sweep it.
+  local DT = require("auto-run.dap.dart_tests")
+  local prev_exp = DT.EXPIRY_MS
+  DT.EXPIRY_MS = 60
+  DT.begin(P3.discovery.tree():get(ids["four"]), pkg)
+  ok("[51] expiry: begin marks running", status(ids["four"]) == "running")
+  wait_for(function() return next(DT._state().pending) == nil end, 2000)
+  DT.EXPIRY_MS = prev_exp
+  ok("[51] expiry: a run with no session unwinds by itself", P3.discovery.results()[ids["four"]] == nil
+    and next(DT._state().pending) == nil, vim.inspect(P3.discovery.results()[ids["four"]]))
+
+  -- a launch that never got a session unwinds its marks
+  local rid = require("auto-run.dap.dart_tests").begin(P3.discovery.tree():get(ids["one"]), pkg)
+  ok("[51] begin marks running", status(ids["one"]) == "running")
+  require("auto-run.dap.dart_tests").abort(rid)
+  ok("[51] abort (no session) unwinds the running mark", P3.discovery.results()[ids["one"]] == nil)
+
+  vim.fn.executable = real_executable
+  -- real SDK, real nvim-dap: debug one test end to end through the public path
+  if HAVE_DART then
+    vim.fn.delete(pkg .. "/.dart_tool", "rf")
+    local pg = vim.system({ "dart", "pub", "get", "--offline" }, { cwd = pkg, text = true }):wait()
+    dart_real = dart_real + 1
+    ok("[51][real] pub get", pg.code == 0, pg.stderr)
+    local okp, perr = P3.discovery.debug_position(ids["two"])
+    ok("[51][real] debug_position starts a real dart debug_adapter --test session", okp == true, tostring(perr))
+    wait_for(function()
+      local r = P3.discovery.results()[ids["two"]]
+      return r and r.status ~= "running"
+    end, 120000)
+    wait_for(function() return next(require("auto-run.dap.dart_tests")._state().active) == nil end, 30000)
+    local r = P3.discovery.results()[ids["two"]]
+    dart_real = dart_real + 1
+    ok("[51][real] its dart.testNotification events reached the tests' results: passed", r and r.status == "passed", vim.inspect(r))
+    dart_real = dart_real + 1
+    ok("[51][real] the other tests in the file were not touched by the debugged run",
+      P3.discovery.results()[ids["one"]] == nil, vim.inspect(P3.discovery.results()[ids["one"]]))
+  end
+  dap.adapters.dart = had_dart
+  if had_dart == nil then bridge_mod.ensure_dart_adapter(dap) end
+  NEW.restore(prev)
+end)()
+
+local DART_REAL_MIN = (HAVE_DART and 6 or 0) + (HAVE_FLUTTER and 3 or 0)
+ok(("dart real-SDK floor: ran %d, expected %d (dart %s, flutter %s)"):format(dart_real, DART_REAL_MIN,
+  HAVE_DART and "on PATH" or "absent", HAVE_FLUTTER and "on PATH" or "absent"), dart_real == DART_REAL_MIN)
+
+-- ── [52] AGENTS.md + the version marker in every .auto-run/ ───────
+-- Johno, 2026-10-03: "the AGENTS.md should be copied into each .auto-run
+-- folders…", "each .auto-run folder should have a empty text file that
+-- indicates .auto-run.nvim version, so when the version updates the agents.md
+-- file should be updated as well", "whenever the autorun plugin touches the
+-- folder again". ADR 0213 §2.5.
+print("\n[52] AGENTS.md, CLAUDE.md and the auto-run.nvim-v<version> marker")
+;(function()
+  local agents = require("auto-run.store.agents")
+  local ver = require("auto-run").version
+  local marker = agents.MARKER_PREFIX .. ver
+  local prev = worktree.get_active()
+  local root = fx .. "/agents52"
+  ok("[52] fixture repo", NEW.repo(root))
+  agents._reset_for_tests()
+  local folder = root .. "/.auto-run"
+
+  store.list()
+  ok("[52] reading the store writes nothing", vim.fn.isdirectory(folder) == 0)
+
+  store.add({ name = "a52", kind = "run", runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  local function read(p) local f = io.open(p, "r") if not f then return nil end local t = f:read("*a") f:close() return t end
+  local text = read(folder .. "/AGENTS.md")
+  ok("[52] the first write creates AGENTS.md (managed header, this version)",
+    text and text:sub(1, #agents.MANAGED_HEADER) == agents.MANAGED_HEADER and text:find("v" .. ver, 1, true) ~= nil)
+  ok("[52] ... CLAUDE.md pointing at it", tostring(read(folder .. "/CLAUDE.md")):find("[AGENTS.md](AGENTS.md)", 1, true) ~= nil)
+  ok("[52] ... and the EMPTY marker " .. marker, vim.fn.filereadable(folder .. "/" .. marker) == 1 and read(folder .. "/" .. marker) == "")
+  local missing = {}
+  for _, rec in ipairs({ "config", "profile" }) do
+    for _, f in ipairs(schema.field_names(rec)) do
+      if not text:find("| `" .. f .. "` |", 1, true) then missing[#missing + 1] = rec .. "." .. f end
+    end
+  end
+  ok("[52] every schema field is documented in the rendered file", #missing == 0, table.concat(missing, ", "))
+  ok("[52] no placeholder is left unrendered", text:find("{{", 1, true) == nil)
+  ok("[52] every registered runtime is listed",
+    text:find("| `node` |", 1, true) ~= nil and text:find("| `playwright` |", 1, true) ~= nil and text:find("| `dart` |", 1, true) ~= nil)
+
+  local st1 = vim.uv.fs_stat(folder .. "/AGENTS.md")
+  agents._reset_for_tests()
+  store.add({ name = "b52", kind = "run", runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  local st2 = vim.uv.fs_stat(folder .. "/AGENTS.md")
+  ok("[52] a write at the same version leaves AGENTS.md alone", st1.mtime.nsec == st2.mtime.nsec and st1.mtime.sec == st2.mtime.sec)
+
+  -- an older marker: rewritten, marker replaced, CLAUDE.md (now the user's) kept
+  write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nold text\n")
+  write_file(folder .. "/CLAUDE.md", "my own CLAUDE notes\n")
+  os.rename(folder .. "/" .. marker, folder .. "/" .. agents.MARKER_PREFIX .. "0.1.1")
+  agents._reset_for_tests()
+  store.remove("b52")
+  ok("[52] an older marker: the next write (here a remove) rewrites AGENTS.md",
+    tostring(read(folder .. "/AGENTS.md")):find("old text", 1, true) == nil)
+  ok("[52] ... replaces the marker", vim.fn.filereadable(folder .. "/" .. marker) == 1
+    and vim.fn.filereadable(folder .. "/" .. agents.MARKER_PREFIX .. "0.1.1") == 0)
+  ok("[52] ... and leaves CLAUDE.md as the user wrote it", read(folder .. "/CLAUDE.md") == "my own CLAUDE notes\n")
+
+  -- a newer marker (another machine): untouched
+  os.rename(folder .. "/" .. marker, folder .. "/" .. agents.MARKER_PREFIX .. "9.9.9")
+  write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nfrom the future\n")
+  agents._reset_for_tests()
+  store.add({ name = "c52", kind = "run", runtime = "go", program = "${worktree}" }, { tier = "tracked" })
+  ok("[52] a newer marker: nothing rewritten (no ping-pong between versions)",
+    tostring(read(folder .. "/AGENTS.md")):find("from the future", 1, true) ~= nil
+      and vim.fn.filereadable(folder .. "/" .. marker) == 0)
+  ok("[52] ... doctor says so", agents.status(folder).state:find("newer", 1, true) ~= nil, agents.status(folder).state)
+
+  -- a hand-written AGENTS.md with no marker: moved to AGENTS.local.md, never lost
+  os.remove(folder .. "/" .. agents.MARKER_PREFIX .. "9.9.9")
+  write_file(folder .. "/AGENTS.md", "# our own notes\n")
+  agents._reset_for_tests()
+  store.remove("c52")
+  ok("[52] a hand-written AGENTS.md is moved to AGENTS.local.md", read(folder .. "/AGENTS.local.md") == "# our own notes\n")
+  ok("[52] ... and the managed one written", tostring(read(folder .. "/AGENTS.md")):sub(1, #agents.MANAGED_HEADER) == agents.MANAGED_HEADER)
+  -- both exist and the marker is old: nothing is overwritten
+  os.rename(folder .. "/" .. marker, folder .. "/" .. agents.MARKER_PREFIX .. "0.0.1")
+  write_file(folder .. "/AGENTS.md", "# hand-written again\n")
+  agents._reset_for_tests()
+  store.remove("a52")
+  ok("[52] hand-written AGENTS.md + AGENTS.local.md: neither is overwritten",
+    read(folder .. "/AGENTS.md") == "# hand-written again\n" and read(folder .. "/AGENTS.local.md") == "# our own notes\n")
+  ok("[52] ... and doctor reports the conflict", agents.status(folder).state:find("conflict", 1, true) ~= nil, agents.status(folder).state)
+
+  -- Lector r1 (PR #16) finding 3: editing an existing env file in .auto-run/
+  -- is a write into the folder, so an old marker refreshes on it.
+  os.remove(folder .. "/AGENTS.md")
+  os.remove(folder .. "/AGENTS.local.md")
+  for _, n in ipairs(vim.fn.readdir(folder) or {}) do
+    if n:find(agents.MARKER_PREFIX, 1, true) == 1 then os.remove(folder .. "/" .. n) end
+  end
+  write_file(folder .. "/.env", "A=1\n")
+  write_file(folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2", "")
+  write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nstale\n")
+  local function env_edit_refreshes(label, fn)
+    agents._reset_for_tests()
+    os.rename(folder .. "/" .. marker, folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2")
+    write_file(folder .. "/AGENTS.md", agents.MANAGED_HEADER .. " -->\nstale\n")
+    local okv, verr = fn()
+    ok("[52] " .. label .. " on .auto-run/.env refreshes AGENTS.md and the marker",
+      okv and tostring(read(folder .. "/AGENTS.md")):find("stale", 1, true) == nil
+        and vim.fn.filereadable(folder .. "/" .. marker) == 1
+        and vim.fn.filereadable(folder .. "/" .. agents.MARKER_PREFIX .. "0.1.2") == 0, tostring(verr))
+  end
+  -- first refresh needs the current marker to exist for the rename helper
+  agents._reset_for_tests()
+  local okf = envmod.add_var(folder .. "/.env", "B", "2")
+  ok("[52] add_var on .auto-run/.env refreshes AGENTS.md (old marker → current)",
+    okf and tostring(read(folder .. "/AGENTS.md")):find("stale", 1, true) == nil and vim.fn.filereadable(folder .. "/" .. marker) == 1)
+  env_edit_refreshes("update_var", function() return envmod.update_var(folder .. "/.env", "B", "3") end)
+  env_edit_refreshes("remove_var", function() return envmod.remove_var(folder .. "/.env", "B") end)
+
+  -- the bare-repo layout: the container's shared .auto-run gets its own copy
+  worktree.set_active(container .. "/main")
+  store_paths.invalidate()
+  agents._reset_for_tests()
+  -- Earlier cells' state writes may already have stamped it: start clean.
+  vim.fn.delete(container .. "/.auto-run/AGENTS.md")
+  for _, n in ipairs(vim.fn.readdir(container .. "/.auto-run") or {}) do
+    if n:find(agents.MARKER_PREFIX, 1, true) == 1 then os.remove(container .. "/.auto-run/" .. n) end
+  end
+  store.write_state(store.read_state())
+  ok("[52] the container-level shared .auto-run (bare + worktrees) gets AGENTS.md on its first write",
+    vim.fn.filereadable(container .. "/.auto-run/AGENTS.md") == 1 and vim.fn.filereadable(container .. "/.auto-run/" .. marker) == 1)
+  NEW.restore(prev)
 end)()
 
 -- ── summary ─────────────────────────────────────────────────────

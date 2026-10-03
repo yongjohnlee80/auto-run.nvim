@@ -147,7 +147,17 @@ end
 ---@param data table
 ---@return boolean ok, string? err
 local function write_json(path, data)
-  return fs_atomic.write(path, encode_pretty(data) .. "\n", { mkdir = true })
+  local ok, err = fs_atomic.write(path, encode_pretty(data) .. "\n", { mkdir = true })
+  if ok then M.touch(path) end
+  return ok, err
+end
+
+---After any successful write into a `.auto-run/` folder: keep its AGENTS.md
+---and version marker current (ADR 0213 §2.5). Every store write path calls
+---this; reads never do.
+---@param path string
+function M.touch(path)
+  require("auto-run.store.agents").touch(path)
 end
 
 -- ── per-repo session state (shared tier's state.json) ──────────
@@ -179,6 +189,8 @@ function M.write_state(state)
     { mkdir = true })
   if not okw then
     log.debug("store", "state.json write failed: " .. tostring(werr))
+  else
+    M.touch(file)
   end
   return okw, werr
 end
@@ -198,7 +210,7 @@ local function scaffold_gitignore(dirs)
   local gi = fs_path.join(parent, ".gitignore")
   if fs_path.is_file(gi) then return end
   local okw, werr = fs_atomic.write(gi, "local/\n", { mkdir = true })
-  if not okw then log.debug("store", "gitignore scaffold failed: " .. tostring(werr)) end
+  if not okw then log.debug("store", "gitignore scaffold failed: " .. tostring(werr)) else M.touch(gi) end
 end
 
 -- ── raw tier access ─────────────────────────────────────────────
@@ -807,6 +819,7 @@ function M.remove(name, opts)
 
   local unlinked, derr = vim.uv.fs_unlink(target)
   if not unlinked then return false, "unlink: " .. tostring(derr) end
+  M.touch(target)
 
   -- Drop the overlay entry once the name is gone from both tiers
   -- (best-effort: a corrupt overrides file is left for validate()).

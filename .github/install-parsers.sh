@@ -43,6 +43,8 @@ grammar_repo() {
     # rust: the rust adapter (v0.1.12+) dispatches here. Pinned to the revision
     # nvim-treesitter's parsers.lua uses, so CI parses what developers parse.
     rust)       echo "tree-sitter/tree-sitter-rust|77a3747266f4d621d0757825e6b11edcbf991ca5|." ;;
+    # dart: the dart adapter (ADR 0196 r3). Pinned to nvim-treesitter's revision.
+    dart)       echo "UserNobody14/tree-sitter-dart|be07cf7118d3dba06236a3f19541685a68209934|." ;;
     *) echo "unknown grammar: $1" >&2; exit 1 ;;
   esac
 }
