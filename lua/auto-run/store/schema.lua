@@ -315,6 +315,17 @@ function M.field_doc(record, field)
   return docs and docs[field] or nil
 end
 
+---The value SHAPE a record's field takes — the catalog kind its validator
+---checks: "string", "string_list", "string_map", "name", "run_kind", … — or
+---nil for an unknown field. Editors use it to decide how to edit a field, so a
+---new plain-string field is editable without a second list to keep in step.
+---@param record "config"|"profile"
+---@param field string
+---@return string?
+function M.field_kind(record, field)
+  return (record == "profile" and PROFILE_FIELDS or CONFIG_FIELDS)[field]
+end
+
 ---Every field name a record accepts, sorted (for completeness checks).
 ---@param record "config"|"profile"
 ---@return string[]
