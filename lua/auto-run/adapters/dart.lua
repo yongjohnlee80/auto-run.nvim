@@ -156,7 +156,12 @@ end
 
 -- ── test files + discovery ──────────────────────────────────────
 
-local SKIP_DIRS = { build = true, [".dart_tool"] = true, integration_test = true }
+-- The scan keeps a dir when ANY adapter accepts it, so this also prunes the
+-- other ecosystems' noise (node_modules/, vendor/, target/).
+local SKIP_DIRS = {
+  build = true, [".dart_tool"] = true, integration_test = true,
+  node_modules = true, vendor = true, target = true,
+}
 
 function M.filter_dir(name, _rel, _root)
   return SKIP_DIRS[name] ~= true

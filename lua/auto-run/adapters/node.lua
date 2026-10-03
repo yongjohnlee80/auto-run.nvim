@@ -32,6 +32,10 @@ end
 
 function M.is_test_file(_path) return false end
 
+-- It claims no test files, so it never asks the scan to descend anywhere (the
+-- scan keeps a dir when ANY adapter accepts it; an absent filter accepts all).
+function M.filter_dir(_name, _rel, _root) return false end
+
 function M.discover_positions(_path) return nil, nil end
 
 function M.build_spec(_args)

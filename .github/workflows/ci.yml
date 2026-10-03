@@ -112,7 +112,7 @@ jobs:
       # language the code can dispatch to is one CI has to be able to parse.
       - name: install tree-sitter parsers
         env:
-          LANGS: "go javascript typescript tsx rust"
+          LANGS: "go javascript typescript tsx rust dart"
         run: ./.github/install-parsers.sh
 
       # Named "assert", not "verify", because it CAN fail: it compares the
@@ -257,7 +257,7 @@ jobs:
       # language the code can dispatch to is one CI has to be able to parse.
       - name: install tree-sitter parsers
         env:
-          LANGS: "go javascript typescript tsx rust"
+          LANGS: "go javascript typescript tsx rust dart"
         run: ./.github/install-parsers.sh
 
       - name: report which auto-core is under test

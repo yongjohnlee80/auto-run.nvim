@@ -35,9 +35,13 @@ function M.root(dir)
   return js.playwright_root(dir)
 end
 
+-- The scan keeps a dir when ANY adapter accepts it, so this prunes the
+-- cross-ecosystem noise the others prune too (vendor/, target/), or an
+-- accepting playwright would re-include them.
 local SKIP_DIRS = {
   node_modules = true, coverage = true, dist = true, build = true, out = true,
   ["playwright-report"] = true, ["test-results"] = true,
+  vendor = true, target = true,
 }
 
 function M.filter_dir(name, _rel, _root)

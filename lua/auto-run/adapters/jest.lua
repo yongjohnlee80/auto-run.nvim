@@ -406,7 +406,10 @@ function M.preflight(ctx)
   for _, i in ipairs(issues) do
     if i.code == "node_modules_missing" then node_modules_missing = true end
   end
-  if not node_modules_missing and not js.find_module(root, "jest/bin/jest.js") then
+  -- What each purpose actually executes: a run the `.bin/jest` launcher, a
+  -- debug jest's own `bin/jest.js` under node.
+  local needed = ctx.purpose == "debug" and "jest/bin/jest.js" or ".bin/jest"
+  if not node_modules_missing and not js.find_module(root, needed) then
     issues[#issues + 1] = { level = "error", code = "jest_missing",
       message = "jest is not installed in " .. vim.fn.fnamemodify(root, ":~"),
       fix = js.add_dev_cmd(js.package_manager(root), "jest") }

@@ -819,6 +819,7 @@ function M.remove(name, opts)
 
   local unlinked, derr = vim.uv.fs_unlink(target)
   if not unlinked then return false, "unlink: " .. tostring(derr) end
+  M.touch(target)
 
   -- Drop the overlay entry once the name is gone from both tiers
   -- (best-effort: a corrupt overrides file is left for validate()).
