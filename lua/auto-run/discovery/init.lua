@@ -679,6 +679,50 @@ local function publish_results()
   publish("run.results:changed", { root = tree.root.path, positions = positions })
 end
 
+---Results that arrive OUTSIDE a finished command run — a debugged test whose
+---runner reports over DAP events (the Dart bridge, ADR 0196 r3 §2.3.1) —
+---written into the same canonical result table runs use, so the tests pane
+---shows a debugged run exactly like an ordinary one. The ONE entry for that;
+---nothing else in discovery knows about debug sessions.
+---
+---`results` (position id → AutoRunResult) is merged in. `phase`:
+---  `{ running = true }` — mark every test under the scope running (start);
+---  `{ clear = true }`   — unwind running marks under the scope (no session);
+---  `{ final = true, died = bool, message = string? }` — unreported tests
+---    still running fill as `failed` (died) or `skipped`.
+---A scope that is no longer in the tree is ignored.
+---@param scope_id string
+---@param results table<string, AutoRunResult>?
+---@param phase { running: boolean?, clear: boolean?, final: boolean?, died: boolean?, message: string? }?
+function M.debug_results(scope_id, results, phase)
+  local tree = _tree
+  if not tree then return end
+  local scope = tree:get(scope_id)
+  if not scope then return end
+  phase = phase or {}
+  local ids = scope_test_ids(scope)
+  if phase.running then
+    for _, tid in ipairs(ids) do _results[tid] = { status = "running" } end
+  end
+  for id, r in pairs(results or {}) do _results[id] = r end
+  if phase.clear or phase.final then
+    for _, tid in ipairs(ids) do
+      local r = _results[tid]
+      if r and r.status == "running" then
+        if phase.clear then
+          _results[tid] = nil
+        elseif phase.died then
+          _results[tid] = { status = "failed", output = phase.message }
+        else
+          _results[tid] = { status = "skipped" }
+        end
+      end
+    end
+  end
+  aggregate_all()
+  publish_results()
+end
+
 -- ── run a position (exec routing + fallback decomposition) ──────
 
 ---Build the run specs for `node`, decomposing when an adapter
@@ -826,6 +870,34 @@ function M.run_position(id, opts)
       .. "discovery covers open buffers by default (the tests pane's S scans the full worktree)"
   end
 
+  -- Preflight (ADR 0213 §2.4): a missing SDK, dependency or runner refuses the
+  -- run before any spec is built (building one can already need the runner),
+  -- before anything is marked running or spawned. Each (adapter, root) of the
+  -- files under the position is checked once.
+  do
+    local checked = {}
+    local function visit(n)
+      if n.type == "file" or (n.type ~= "dir" and n.adapter) then
+        local adapter = adapters.get(n.adapter or "")
+        local root = adapter and adapter.root(fs_path.parent(n.path))
+        local key = adapter and root and (adapter.name .. "\0" .. root)
+        if key and not checked[key] then
+          checked[key] = true
+          local okp, perr = adapters.check(adapter, { root = root, purpose = "test" })
+          if not okp then return perr end
+        end
+        if n.type ~= "dir" then return nil end
+      end
+      for _, child in ipairs(n.children or {}) do
+        local err = visit(child)
+        if err then return err end
+      end
+      return nil
+    end
+    local perr = visit(node)
+    if perr then return nil, perr end
+  end
+
   local specs, berr = build_specs(tree, node)
   if not specs then return nil, berr end
 
@@ -967,6 +1039,9 @@ function M.debug_position(id)
   local adapter = adapters.get(node.adapter or "")
   local dap = require("auto-run.dap")
   if adapter and type(adapter.prepare_debug) == "function" then
+    local proot = adapter.root(fs_path.parent(node.path)) or fs_path.parent(node.path)
+    local okp, perr = adapters.check(adapter, { root = proot, purpose = "debug" })
+    if not okp then return nil, perr end
     -- Core-owned cancellation token (Lector P1-4): supersede/abort a prior
     -- pending build, and skip a late launch if this one was cancelled.
     -- Where this debug STARTED: the callback may run after a worktree switch,
@@ -975,6 +1050,7 @@ function M.debug_position(id)
     local token = dap.new_launch_token()
     adapter.prepare_debug(node, token, function(launch, perr)
       if token.cancelled then return end
+      dap.settle_launch(token)
       if perr then
         log.error("discovery", "debug prepare failed: "
           .. tostring(perr.message or perr.code))

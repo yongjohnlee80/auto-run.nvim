@@ -1,79 +1,267 @@
 # auto-run.nvim
 
-Unified run-config / test / debug plugin for the auto-family
-(ADR-0048). Manages run configurations, layered env profiles, test
-discovery/execution, and DAP orchestration behind one canonical
-per-repo store. Supersedes gobugger.nvim at feature parity.
+**Run, test and debug any project from Neovim the same way: one config
+store, one set of keys, two panes, whatever the language.**
 
-> **On the `gobugger` references throughout this repo:** gobugger.nvim was
-> **replaced by auto-run and no longer exists** (ADR-0048 Phase 4). Every
-> remaining mention — "gobugger parity", "port", `[provenance: gobugger dD]` —
-> records **where a behaviour came from**, never a runtime dependency: nothing
-> in `lua/` loads, requires or probes gobugger. The one thing that genuinely
-> did depend on it — the smoke suite's gobugger *parity gate*, which compared
-> auto-run's keymaps against gobugger's live `default_keymaps()` — was pruned
-> when gobugger was deleted, because it had nothing left to compare against.
+auto-run.nvim covers Go, Rust, Node.js, Jest and React Testing Library,
+Playwright, Dart and Flutter desktop, and it is built to take more.
 
-## Status
+## What it solves
 
-Phases 1–3 (store + env engine, execution + DAP, test discovery +
-adapters) — under active development. The auto-finder tests/debug
-views (the other half of Phase 3) live in auto-finder.nvim. See the
-accepted ADR for the full design:
-`$AUTO_AGENTS_KB_ROOT/shared/adrs/0048-auto-run-unified-run-test-debug-plugin.md`.
+Every language usually brings its own plugins: a test runner, a debugger, a
+`launch.json` dialect, its own keymaps and its own idea of where config lives.
+Moving from a Go service to the React client that calls it, or to a Flutter
+app, means switching all of them. A config that works on one machine is often
+hidden in someone's editor setup, so it never reaches the repo.
 
-## Store
+auto-run replaces that with one model:
 
-Two tiers per repo:
+- **One store per repo.** `.auto-run/` holds strict-JSON configs, committed
+  with the code, plus a local tier for personal overrides.
+- **One workflow** for every runtime: choose where to work, then run, test or
+  debug with the same keys and see the result in the same place.
+- **Discovery, not configuration.** Tests are found from the source (via
+  treesitter). A config is needed only for something extra: env vars, flags,
+  a script or a device.
 
-- **Tracked** — `<worktree>/.auto-run/{configs,profiles}/*.json`,
-  committed with the code.
-- **Shared-local** — `<container>/.auto-run/` (linked-worktree
-  layouts) or `<repo>/.auto-run/local/` (plain repos): personal
-  configs, overrides, breakpoints, session state. Never in git.
+## Philosophy
 
-Strict JSON, one file per config. Resolution through
-`require("auto-run.store").resolve_run_dirs()` — the only path
-authority.
+- **Minimal UI.** There are two panes, Tests and Debug (rendered by
+  [auto-finder.nvim](https://github.com/yongjohnlee80/auto-finder.nvim)), and
+  two key prefixes:
+  - `<leader>r` launches (lowercase runs, UPPERCASE debugs);
+  - `<leader>d` controls what is running.
 
-## Module layout (Phases 1–3)
+  There are no dashboards or floating wizards. State is visible: the working
+  directory, the picked configs, running sessions, and each session's pid,
+  port and log.
+- **Just make it work.** Things that would fail later are caught up front:
+  - a program path that does not exist is refused before the debugger
+    starts;
+  - a missing SDK, an `npm install` or `pub get` that was never run, absent
+    Playwright browsers or a missing debug adapter are named, with the
+    command that fixes them, before anything spawns;
+  - test results come from each runner's machine output (`go test -json`,
+    `--reporter=json`, …), never from scraped text, whenever the runner has
+    one.
+- **One simple, uniform workflow.** These are the same keys for every
+  runtime:
+
+  | | Run | Debug |
+  |---|---|---|
+  | The test under the cursor | `<leader>rt` | `<leader>rT` |
+  | The current file | `<leader>rf` | `<leader>rF` |
+  | An entry point (a config) | `<leader>rp` | `<leader>rP` |
+  | Again | `<leader>rl` | `<leader>rL` |
+  | Where to work (worktree / folder) | `<leader>rw` | |
+
+- **Declarative.** Configs are data in the repo, so they can be reviewed,
+  shared and written by tools. An agent can scaffold them (every `.auto-run/`
+  carries an `AGENTS.md`, below), but nothing at runtime needs one.
+
+## Supported languages and frameworks
+
+| Runtime | Runs | Tests | Debugs with | Needs installed |
+|---|---|---|---|---|
+| `go` | `go run` / the built program | `go test -json`, exact `-run` | delve (nvim-dap-go) | Go; `delve`; parser `go` |
+| `rust` | `cargo run` | `cargo test`, exact names | codelldb | Rust/Cargo; `codelldb`; parser `rust` |
+| `node` | `node <file>` (`tsx` for `.ts`), or a `package.json` script via npm / pnpm / yarn / bun | — (see Jest / Playwright) | js-debug (`pwa-node`) | Node; `node_modules` installed; `js-debug-adapter` to debug |
+| `jest` | — | Jest, React Testing Library included (`.js/.jsx/.ts/.tsx`) | js-debug (`--runInBand`) | `jest` in the project; parsers `javascript`, `typescript`, `tsx` |
+| `playwright` | — | `playwright test`, selected by `file:line` | js-debug (one worker, no timeout) | `@playwright/test`; its browsers (`npx playwright install`) |
+| `dart` | `dart run`; Flutter: `flutter run -d linux\|macos\|windows` | `dart test` / `flutter test`, exact `--name` | the SDK's own debug adapters | Dart or Flutter SDK; `pub get` run; parser `dart`; Flutter desktop: its platform toolchain |
+
+How the runtimes are told apart:
+- **Dart vs Flutter** is detected per package from pub's resolution
+  (`.dart_tool/package_config.json`), and a config's `dart_sdk` can force
+  either.
+- **Playwright vs Jest:** a spec is Playwright's when it imports
+  `@playwright/test` under a `playwright.config.*`, otherwise Jest's.
+
+Not supported (yet):
+- Python;
+- Flutter on phones, emulators or the web;
+- Vitest;
+- Node's built-in `node:test`.
+
+[Adding a language](#adding-a-language) is an adapter module.
+
+`:AutoRun doctor` lists what each runtime found at the working directory is
+missing, under **toolchains and dependencies**.
+
+## Getting started
+
+### With AutoVim
+
+[AutoVim](https://github.com/yongjohnlee80/autovim) ships everything wired:
+- auto-run and auto-finder;
+- nvim-dap with dap-view;
+- delve, and js-debug through the LazyVim TypeScript extra;
+- the LazyVim Dart extra (dartls, the `dart` parser, `dart format`);
+- the keymaps above.
+
+To use it:
+1. Open a project.
+2. Choose the working directory with `<leader>rw`.
+3. Open the Tests or Debug pane.
+
+Install the language toolchains you use (Go, Rust, Node, the Dart or Flutter
+SDK). AutoVim does not install SDKs.
+
+### Standalone
+
+```lua
+-- lazy.nvim
+{
+  "yongjohnlee80/auto-run.nvim",
+  version = "^0.1.0",
+  dependencies = {
+    "yongjohnlee80/auto-core.nvim",     -- required
+    "mfussenegger/nvim-dap",            -- debugging (any runtime)
+    "igorlfs/nvim-dap-view",            -- optional: the session UI
+    "leoluz/nvim-dap-go",               -- optional: Go debug-test and attach
+    "yongjohnlee80/auto-finder.nvim",   -- recommended: the Tests and Debug panes
+  },
+  event = "VeryLazy",
+  opts = {},
+  config = function(_, opts)
+    require("auto-run").setup(opts)
+    require("auto-run").default_keymaps()   -- optional: the <leader>r / <leader>d layout
+  end,
+}
+```
+
+Then, for each language you use:
+- **Treesitter parsers** for discovery: `go`, `rust`, `javascript`,
+  `typescript`, `tsx`, `dart` (e.g. `:TSInstall dart`).
+- **Debug adapters:**
+  - Go needs `delve`.
+  - Rust needs `codelldb`.
+  - JavaScript needs `js-debug-adapter`. auto-run registers
+    `dap.adapters["pwa-node"]` itself when that executable is on `PATH` or
+    in Mason's `bin`, and nothing else registered it.
+  - Dart and Flutter use the SDK's adapters. auto-run registers
+    `dap.adapters.dart` when no other plugin owns it.
+- Without auto-finder, everything still works from the keys and `:AutoRun`
+  commands; the panes are where results and state are shown.
+
+## Project structure
+
+What auto-run keeps in a repo. The layout is the same for AutoVim and
+standalone users; only the shared tier's location depends on how the repo is
+cloned.
 
 ```
-lua/auto-run/
-├── init.lua             -- setup(), topic registration, public facade
-├── config.lua           -- plugin opts (not run configs)
-├── log.lua              -- auto-core.log wrapper (silent-INFO degrade)
-├── store/
-│   ├── init.lua         -- CRUD + 7-layer merge assembly + validate/status
-│   ├── paths.lua        -- resolve_run_dirs() + set_dir override registry
-│   ├── schema.lua       -- config/profile validation
-│   └── merge.lua        -- pure merge engine (field rules, tombstones, extends)
-├── env/init.lua         -- substitution + profile pipeline + 0600 materialization
-├── import/init.lua      -- launch.json JSONC importer + read-through shims
-├── exec/
-│   ├── init.lua         -- start/test_run/stop/list, pick memory, run_last
-│   ├── job.lua          -- vim.system engine, per-run dirs, job table, events
-│   └── strategies.lua   -- run|term|dap resolution + terminal provider probe
-├── dap/
-│   ├── init.lua         -- provider registration, translation, debug_test parity,
-│   │                       attach/attach_remote, dap-view + winfixbuf + error capture
-│   └── breakpoints.lua  -- §9 persistence + reconcile sweep + restore
-├── adapters/
-│   ├── init.lua         -- AutoRunAdapter interface + register_adapter() registry
-│   ├── go.lua           -- go test -json adapter (treesitter discovery)
-│   └── jest.lua         -- jest --json adapter (treesitter discovery)
-├── discovery/init.lua   -- position tree, bounded scans, aggregation, run/debug
-├── keymaps.lua          -- default_keymaps() (§10 table)
-└── mailbox/commands.lua -- run.* verb SPECS + register_all()
-
-plugin/auto-run.lua      -- :AutoRun {run|debug|stop|env|doctor|import}
-tests/smoke.lua          -- nvim -n -i NONE --headless -u tests/smoke.lua -c 'qa!'
+<repo>/
+├── .auto-run/                        ← tracked: commit it
+│   ├── configs/<name>.json           ← run / test / debug configs (strict JSON, one per file)
+│   ├── profiles/<name>.json          ← env profiles
+│   ├── .env.*                        ← env files may live here (keep secrets out)
+│   ├── AGENTS.md                     ← how to scaffold configs here; written by auto-run
+│   ├── CLAUDE.md                     ← "read AGENTS.md"; created once, then yours
+│   ├── auto-run.nvim-v0.1.19         ← empty; names the version that wrote AGENTS.md
+│   ├── AGENTS.local.md               ← optional: your project's own notes (never touched)
+│   ├── .gitignore                    ← "local/" (plain clones)
+│   └── local/                        ← the shared tier in a plain clone: overrides,
+│                                       picks, breakpoints, state (not committed)
+└── …
 ```
 
-The auto-finder `tests`/`debug` views (the render surface over this
-discovery API) land in auto-finder.nvim per the ADR rollout table.
+- **In a bare repo with worktrees** (`<container>/.bare` plus
+  `<container>/<worktree>/`), the shared tier is `<container>/.auto-run/`,
+  shared by every worktree, and it gets its own `AGENTS.md` and marker.
+- **Projects in folders** (`go-contacts/`, `web/`, `flutter-client/` in one
+  repo) keep **one** store at the repo root. Each config sets `cwd` to its
+  folder. `<leader>rw` chooses the folder for test discovery and for configs
+  without a `cwd`.
+- **`AGENTS.md` stays current by itself.** Whenever auto-run writes into a
+  `.auto-run/` folder and finds the marker older than the running version, it
+  rewrites `AGENTS.md` and renames the marker. A marker from a *newer*
+  auto-run is left alone, so two machines never fight over the file. Reads
+  never write. A hand-written `AGENTS.md` found there is moved to
+  `AGENTS.local.md`, never overwritten.
+- **The rendered `AGENTS.md` is the field reference:**
+  - every config and profile field, its allowed values, and the runtimes it
+    applies to (generated from the schema);
+  - a worked config per runtime;
+  - the first-time scaffolding procedure;
+  - the keys for doing it by hand.
 
-## Usage
+A config, for the record:
+
+```json
+{ "name": "web", "kind": "run", "runtime": "node", "script": "dev", "cwd": "${worktree}/web" }
+```
+
+## Adding a language
+
+A language is an **adapter**: a plain Lua table of functions, registered
+before first use:
+
+```lua
+require("auto-run.adapters").register_adapter(require("my.python_adapter"))
+```
+
+The required part is the test-adapter interface:
+
+```lua
+local M = { name = "python", summary = "Python — pytest" }
+
+function M.root(dir) end                       -- project root for a file's dir, or nil
+function M.filter_dir(name, rel, root) end     -- optional: false prunes a dir from the scan
+function M.is_test_file(path) end              -- metadata-free: no subprocess
+function M.discover_positions(path) end        -- a type="file" position with namespace/test children
+function M.build_spec(args) end                -- { cmd, cwd, env, context } for a position
+function M.results(spec, exit, tree) end       -- the runner's machine output → { [position id] = result }
+```
+
+Optional capabilities turn a test adapter into a full runtime:
+
+| Capability | What it gives the user |
+|---|---|
+| `default_config(kind, name)` | the runtime appears in the panes' `a` (new config) |
+| `build_run_argv(eff, opts)` | `run` / the pane's `r` for a config |
+| `prepare_debug_config(eff, opts, cb)` | debugging a config (`d`, `<leader>rP`) |
+| `prepare_debug(pos, opts, cb)` | debugging a discovered test (`<leader>rT`, the tests pane's `d`) |
+| `preflight(ctx)` | named missing toolchains and dependencies, before anything spawns, and in doctor |
+| `output(exit, opts)` | the tests pane's output view (`i`) |
+
+Conventions the builtins follow, which a new adapter should too:
+
+- **Nesting and env:**
+  - Discover with treesitter and nest by source range:
+    `require("auto-run.adapters.nesting").file_position(path, flat)` turns
+    the flat matches into the position.
+  - Compose env through `require("auto-run.adapters.config").test_config(name)`,
+    so `env`, `env_files`, the selected env file and profiles reach your
+    runs exactly as they reach every other runtime.
+- **Selecting tests:** select exactly. Anchored regexes, or a `file:line`
+  position. A substring filter that also runs a test's prefix siblings is a
+  bug.
+- **The scan filter:** the scan keeps a directory when **any** adapter's
+  `filter_dir` accepts it. Prune the other ecosystems' noise too
+  (`node_modules`, `vendor`, `target`). An adapter that claims no test files
+  returns `false` always.
+- **Debugging:**
+  - `prepare_debug*` returns `{ dap_type, request, program, args, cwd, env,
+    extra }`, and `extra` is copied into the nvim-dap config verbatim.
+  - Validate before returning; nvim-dap's adapter callback has no error
+    channel.
+- **`preflight`:** it is synchronous and filesystem-only. It never spawns.
+  It runs on every launch.
+- **New config fields:** add them to `auto-run.store.schema` with a
+  `FIELD_DOCS` entry (`help`, `values`, `runtimes`). The panes then show and
+  edit them, and every `.auto-run/AGENTS.md` documents them, with no other
+  change.
+
+To ship it in auto-run itself, add the module to the builtin roster in
+`lua/auto-run/adapters/init.lua`. Order matters: the first adapter to claim a
+file owns it. Add smoke cells that run against the real toolchain.
+
+---
+
+The rest of this README is the reference.
+
+## Commands
 
 ```lua
 require("auto-run").setup()
@@ -141,7 +329,7 @@ live; a full discovery scan is the tests pane's `S`.
 > agent can never bootstrap its own execution trust (ADR-0035 §4.5,
 > ADR-0048 §11).
 
-### Configuring test runs (go and jest)
+### Configuring test runs
 
 Test discovery needs no configuration — the tests pane finds positions as
 soon as an adapter recognises the project. A **`kind=test` config is only
@@ -172,10 +360,13 @@ its `env` and `envFile` land as `env` and `env_files`).
 **Every field and its allowed values** are documented in
 `auto-run.store.schema.FIELD_DOCS`; auto-finder's panes show them beside each
 field of an expanded config (`o`), and `e` sets one, with a chooser for the
-fixed sets (kind, runtime, profile, extends, cargo_target_kind).
+fixed sets (kind, runtime, profile, extends, cargo_target_kind, dart_sdk,
+device). Each runtime's own fields (go `build_flags`, rust's Cargo identity,
+node `script`, dart `dart_sdk` / `device`) are shown for configs of that
+runtime.
 
-**Environment.** Both adapters compose identically, so anything that works
-for go works for jest:
+**Environment.** Every adapter composes identically, so anything that works
+for go works for jest, playwright, rust and dart:
 
 | field | what it is |
 | --- | --- |
@@ -237,6 +428,55 @@ works alone — measured on the two-process shape `sh -c "sleep 30; :"`:
 without process groups. That is the old behaviour, so the worst case is
 what shipped before rather than a new failure mode.
 
+## Default keymaps (ADR 0199 §4.2)
+
+`require("auto-run").default_keymaps()`. `<leader>r` **launches** — lowercase
+runs, the same letter UPPERCASE debugs; `<leader>d` **controls** what is
+running. `<leader>r` is auto-run's alone (remote-sync.nvim's keys live under
+`<leader>R`). Bindings are pcall-gated on their dependency and all carry
+`desc` strings; override any with `vim.keymap.set` after this call.
+
+| Target | Run | Debug |
+|---|---|---|
+| Nearest test | `<leader>rt` | `<leader>rT` |
+| Current file | `<leader>rf` — run the file | `<leader>rF` — choose a test in it |
+| Pick an entry point | `<leader>rp` | `<leader>rP` |
+| Again (last) | `<leader>rl` | `<leader>rL` |
+
+`rp` / `rP` dispatch on the picked config's kind, the same rule as
+`:AutoRun run` / `debug`: a `kind=test` config runs as a test / debugs the test
+at the cursor. `rl` / `rL` replay the last run / debug that **actually
+launched**, from any surface — a key, a command or a pane (`auto-run.last`). A
+target that no longer exists, or a changed active worktree, is refused with a
+message rather than silently substituted. `rL` with no auto-run debug yet falls
+back to nvim-dap's own `run_last`.
+
+`<leader>rw` chooses the **working directory**: a worktree from the same list
+`<leader>gw` shows, then the worktree root, one of its project folders (a
+`go.mod`, `Cargo.toml`, `package.json`, `pubspec.yaml` … within two levels) or
+a typed directory. That directory is where test discovery looks and where runs
+and debugs start when a config sets no `cwd`; the store stays at the repo root.
+The editor's cwd never moves (auto-core's `git.worktree.choose_active`, also the
+debug and tests panes' `w`).
+
+| Key | Action |
+|---|---|
+| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out |
+| `<leader>dc` | **resume only** — with no session it names the keys that start one |
+| `<leader>di` / `do` / `dO` | step into / over / out (no F-keys needed) |
+| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints |
+| `<leader>dq` / `dR` | terminate / restart |
+| `<leader>dv` / `dw` / `de` | dap-view / watch / evaluate |
+| `<leader>da` / `dA` | delve attach PID / remote — **go buffers only** |
+
+`<leader>rt` / `<leader>rf` run the discovery position nearest the cursor / the
+current file's position through the position engine; `<leader>rT` routes the
+same nearest resolution through `debug_position`. Buffers no adapter claims
+fall back to the kind=test config path with a logged hint.
+
+Not keys: new configs → `a` in the panes; the env profile → `:AutoRun env
+profile`; diagnostics → `:AutoRun doctor` (`--last-error`, `--fix`).
+
 ## Test discovery (ADR §7)
 
 ### Discovery model
@@ -275,8 +515,8 @@ dir → file → namespace → test        ids: path  |  path::ns::name
   dir → files → tests — when the adapter declines) and routes them
   through the exec job engine; machine output lands in the per-run
   dir and parses back to position ids. `discovery.debug_position(id)`
-  jumps to the test and reuses the Phase 2 `dap.debug_test` path (go
-  only for now). Results feed `run.results:changed`; container
+  jumps to the test and debugs it through the adapter's `prepare_debug`
+  (go, rust, jest, playwright, dart). Results feed `run.results:changed`; container
   statuses aggregate upward (running > failed > passed > skipped) and
   unreported in-scope tests fill as `skipped` (or `failed` when the
   runner died without reporting anything).
@@ -332,15 +572,38 @@ runner's machine output back to position ids. Baseline adapters:
   optional adapter capabilities (`default_config`, `build_run_argv`,
   `prepare_debug`, `prepare_debug_config`) drive scaffolding, `cargo
   run`, debug-a-test, and ordinary `kind=debug` launches.
+- **playwright** (ADR 0213) — `test.describe` / `test` (and their
+  `.only`/`.skip`/`.fixme`/… forms) in specs that import `@playwright/test`
+  under a `playwright.config.*`; runs `playwright test --reporter=json
+  <file>:<line>` (exact by position), aggregates a spec's projects (any
+  unexpected → failed, flaky → passed), and debugs `@playwright/test/cli.js`
+  under js-debug with one worker and no timeout. Preflight checks the
+  browsers **at the revisions the installed Playwright expects**.
+- **dart** (ADR 0196 r3) — `group` / `test` / `testWidgets` with
+  string-literal descriptions under `test/`; the tool (`dart` or `flutter`)
+  comes from pub's `.dart_tool/package_config.json` (a `flutter` package in the
+  resolved graph means Flutter); `--reporter=json` with an anchored `--name`
+  regex; `testWidgets` results reconcile through `root_url`; a suite that
+  fails to compile fails its tests with the compiler's message. Debugging
+  runs the SDK's `dart debug_adapter` / `flutter debug-adapter` (`--test` for
+  tests, whose `dart.testNotification` events feed the tests pane), and
+  Flutter apps run on desktop devices only.
+- **node** (ADR 0213) — a runtime, not a test adapter: `node <file>` (`tsx`
+  for TypeScript when installed) or `<pm> run <script>` with the package
+  manager its lockfile names; debugs through js-debug's `pwa-node` with
+  `outputCapture = "std"` so the program's output reaches the session.
+
+Writing one: see [Adding a language](#adding-a-language).
 
 #### One env convention for every language
 
-A `kind=test` config supplies the environment for test runs, and both
-baseline adapters resolve it through the **same** owner
+A `kind=test` config supplies the environment for test runs, and every
+adapter resolves it through the **same** owner
 (`auto-run.adapters.config`) and the same Phase 1 pipeline —
 `store.get` → `substitute_deep` → `env.compose`. So `env`, `env_files`,
 the §4.2 selected env file and secret manifests behave identically
-whether you are running `go test` or `jest`.
+whether you are running `go test`, `jest`, `playwright test`, `cargo test`
+or `dart test`.
 
 A config claims an adapter by `runtime`: `runtime = "go"` applies to go
 runs, `runtime = "jest"` to jest runs, and a config with **no**
@@ -503,74 +766,53 @@ require("auto-run").setup({
 -- Session-boundary + VimLeavePre flushes stay active even when disabled.
 ```
 
-## Default keymaps (ADR 0199 §4.2)
+## Module layout
 
-`require("auto-run").default_keymaps()`. `<leader>r` **launches** — lowercase
-runs, the same letter UPPERCASE debugs; `<leader>d` **controls** what is
-running. `<leader>r` is auto-run's alone (remote-sync.nvim's keys live under
-`<leader>R`). Bindings are pcall-gated on their dependency and all carry
-`desc` strings; override any with `vim.keymap.set` after this call.
+```
+lua/auto-run/
+├── init.lua             -- setup(), topic registration, public facade
+├── config.lua           -- plugin opts (not run configs)
+├── log.lua              -- auto-core.log wrapper (silent-INFO degrade)
+├── store/
+│   ├── init.lua         -- CRUD + 7-layer merge assembly + validate/status
+│   ├── paths.lua        -- resolve_run_dirs() + set_dir override registry
+│   ├── schema.lua       -- config/profile validation
+│   ├── merge.lua        -- pure merge engine (field rules, tombstones, extends)
+│   └── agents.lua       -- AGENTS.md + the version marker in every .auto-run/
+├── env/init.lua         -- substitution + profile pipeline + 0600 materialization
+├── import/init.lua      -- launch.json JSONC importer + read-through shims
+├── exec/
+│   ├── init.lua         -- start/test_run/stop/list, pick memory, run_last
+│   ├── job.lua          -- vim.system engine, per-run dirs, job table, events
+│   └── strategies.lua   -- run|term|dap resolution + terminal provider probe
+├── dap/
+│   ├── init.lua         -- provider registration, translation, debug_test parity,
+│   │                       attach/attach_remote, dap-view + winfixbuf + error capture
+│   ├── breakpoints.lua  -- §9 persistence + reconcile sweep + restore
+│   ├── sessions.lua     -- a session's pid, port and output journal
+│   └── dart_tests.lua   -- dart.testNotification → debugged-test results
+├── adapters/
+│   ├── init.lua         -- AutoRunAdapter interface + register_adapter() registry
+│   ├── config.lua       -- the shared kind=test config resolver (env for every adapter)
+│   ├── nesting.lua      -- treesitter matches → nested positions (jest, playwright, dart)
+│   ├── js.lua           -- what the JS adapters share: package root, lockfile → pm, node_modules
+│   ├── go.lua           -- go test -json adapter (treesitter discovery)
+│   ├── rust.lua         -- cargo test adapter + Cargo identity, codelldb debug
+│   ├── jest.lua         -- jest --json adapter (treesitter discovery), js-debug debug
+│   ├── playwright.lua   -- playwright test --reporter=json, file:line selection
+│   ├── dart.lua         -- dart / flutter test + run, package kind from package_config.json
+│   └── node.lua         -- node runtime: a file or a package.json script
+├── discovery/init.lua   -- position tree, bounded scans, aggregation, run/debug
+├── keymaps.lua          -- default_keymaps() (§10 table)
+└── mailbox/commands.lua -- run.* verb SPECS + register_all()
 
-| Target | Run | Debug |
-|---|---|---|
-| Nearest test | `<leader>rt` | `<leader>rT` |
-| Current file | `<leader>rf` — run the file | `<leader>rF` — choose a test in it |
-| Pick an entry point | `<leader>rp` | `<leader>rP` |
-| Again (last) | `<leader>rl` | `<leader>rL` |
+plugin/auto-run.lua      -- :AutoRun {run|debug|stop|env|doctor|import}
+templates/AGENTS.md      -- the .auto-run/AGENTS.md template (fields + runtimes rendered in)
+tests/run-all.sh         -- the suite runner; tests/smoke.lua is the suite
+```
 
-`rp` / `rP` dispatch on the picked config's kind, the same rule as
-`:AutoRun run` / `debug`: a `kind=test` config runs as a test / debugs the test
-at the cursor. `rl` / `rL` replay the last run / debug that **actually
-launched**, from any surface — a key, a command or a pane (`auto-run.last`). A
-target that no longer exists, or a changed active worktree, is refused with a
-message rather than silently substituted. `rL` with no auto-run debug yet falls
-back to nvim-dap's own `run_last`.
-
-`<leader>rw` chooses the **working directory**: a worktree from the same list
-`<leader>gw` shows, then the worktree root, one of its project folders (a
-`go.mod`, `Cargo.toml`, `package.json`, `pubspec.yaml` … within two levels) or
-a typed directory. That directory is where test discovery looks and where runs
-and debugs start when a config sets no `cwd`; the store stays at the repo root.
-The editor's cwd never moves (auto-core's `git.worktree.choose_active`, also the
-debug and tests panes' `w`).
-
-| Key | Action |
-|---|---|
-| `<F9>` / `<F8>` / `<F7>` / `<F10>` | continue / step over / into / out |
-| `<leader>dc` | **resume only** — with no session it names the keys that start one |
-| `<leader>di` / `do` / `dO` | step into / over / out (no F-keys needed) |
-| `<leader>db` / `dB` / `dC` | toggle / conditional / clear-all breakpoints |
-| `<leader>dq` / `dR` | terminate / restart |
-| `<leader>dv` / `dw` / `de` | dap-view / watch / evaluate |
-| `<leader>da` / `dA` | delve attach PID / remote — **go buffers only** |
-
-`<leader>rt` / `<leader>rf` run the discovery position nearest the cursor / the
-current file's position through the position engine; `<leader>rT` routes the
-same nearest resolution through `debug_position`. Buffers no adapter claims
-fall back to the kind=test config path with a logged hint.
-
-Not keys: new configs → `a` in the panes; the env profile → `:AutoRun env
-profile`; diagnostics → `:AutoRun doctor` (`--last-error`, `--fix`).
-
-## Requirements
-
-- Neovim ≥ 0.10
-- auto-core.nvim ≥ v0.1.61 (`events.register_topics` + `auto-core.trust`)
-- Treesitter parsers for `go` (go adapter) and
-  `javascript`/`typescript`/`tsx` (jest adapter) — test discovery
-  degrades to structured parse errors without them
-- Optional: nvim-dap (dap strategy + breakpoints), nvim-dap-go
-  (debug-test, attach), nvim-dap-view (session UI), auto-agents.nvim
-  (preferred terminal provider), worktree.nvim (preferred
-  `list_child_repos` surface; falls back to the auto-core primitive)
-
-## Phased rollout
-
-1. Store + env engine + launch.json import + `run.*` read/mutate verbs ✓
-2. Execution + DAP + breakpoint persistence + keymaps ✓
-3. Test discovery (go, jest) ✓ + auto-finder tests/debug views (auto-finder side)
-4. gobugger retirement
-5. Additional adapters (dart, rust, python)
+The Tests and Debug panes (the render surface over this API) live in
+auto-finder.nvim.
 
 ## Continuous integration
 
@@ -593,9 +835,10 @@ A runner's Neovim ships tree-sitter parsers for `c`, `lua`, `vim`,
 a developer installed once and stopped seeing. So a suite that renders
 tree-sitter output is green on every machine with a parser lying around and
 red on the first runner without one. `.github/install-parsers.sh` builds
-`go`, `javascript`, `typescript` and `tsx` from pinned grammar sources.
-Those four are the languages this plugin's discovery adapters
-have fixtures for.
+`go`, `javascript`, `typescript`, `tsx`, `rust` and `dart` from pinned grammar
+sources — the languages this plugin's discovery adapters have fixtures for.
+The Dart and Flutter SDKs are not installed in CI: the real-SDK cells run on
+the VM43 gate, where the suite asserts they ran (`dart real-SDK floor`).
 
 **`drift` — the early warning.** The same suite, with **auto-core resolved
 at its default branch** instead of the commit `lua` pins. A regression in
@@ -689,3 +932,14 @@ version was wrong:
   copy would have reported the age of a pin it does not use, in a step
   whose whole job is noticing staleness, with nothing about the copy
   looking wrong.
+
+## A note on `gobugger`
+
+gobugger.nvim was
+**replaced by auto-run and no longer exists** (ADR-0048 Phase 4). Every
+remaining mention — "gobugger parity", "port", `[provenance: gobugger dD]` —
+records **where a behaviour came from**, never a runtime dependency: nothing
+in `lua/` loads, requires or probes gobugger. The one thing that genuinely
+did depend on it — the smoke suite's gobugger *parity gate*, which compared
+auto-run's keymaps against gobugger's live `default_keymaps()` — was pruned
+when gobugger was deleted, because it had nothing left to compare against.

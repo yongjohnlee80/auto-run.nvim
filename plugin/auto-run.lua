@@ -159,6 +159,47 @@ function HANDLERS.doctor(args)
     lines[#lines + 1] = row("git info", "unavailable (" .. tostring(g) .. ")")
   end
 
+  -- ADR 0213 §2.4: what each runtime found here is missing.
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "toolchains and dependencies"
+  lines[#lines + 1] = "───────────────────────────"
+  local okt, tool_rows = pcall(function()
+    local dirs = store.resolve_run_dirs()
+    return require("auto-run.adapters").doctor(dirs.workdir or dirs.root or dirs.anchor)
+  end)
+  if not okt then
+    lines[#lines + 1] = row("preflight", "unavailable (" .. tostring(tool_rows) .. ")")
+  elseif #tool_rows == 0 then
+    lines[#lines + 1] = "  no node / playwright / jest / dart project at the working directory"
+  else
+    for _, r in ipairs(tool_rows) do
+      lines[#lines + 1] = ("  %-11s %s%s"):format(r.name, vim.fn.fnamemodify(r.root, ":~"),
+        #r.issues == 0 and "  — ok" or "")
+      for _, i in ipairs(r.issues) do
+        lines[#lines + 1] = ("    %s %s%s"):format(i.level == "error" and "✗" or "!", i.message,
+          i.fix and ("  → " .. i.fix) or "")
+      end
+    end
+  end
+
+  -- ADR 0213 §2.5: each .auto-run folder's AGENTS.md / version marker.
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "AGENTS.md (auto-run v" .. require("auto-run").version .. ")"
+  lines[#lines + 1] = "──────────────────────────"
+  do
+    local agents = require("auto-run.store.agents")
+    local seen = {}
+    for _, tier in ipairs({ s.tracked, s.shared }) do
+      local folder = tier and agents.folder_of(tier)
+      if folder and not seen[folder] then
+        seen[folder] = true
+        local st = agents.status(folder)
+        lines[#lines + 1] = ("  %s  %s"):format(vim.fn.fnamemodify(folder, ":~"), st.state)
+      end
+    end
+    if next(seen) == nil then lines[#lines + 1] = "  no .auto-run folder yet" end
+  end
+
   lines[#lines + 1] = ""
   lines[#lines + 1] = "config validation"
   lines[#lines + 1] = "─────────────────"

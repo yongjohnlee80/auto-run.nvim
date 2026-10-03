@@ -122,9 +122,12 @@ end
 ---@return boolean ok, string? err
 local function write(records)
   sort_records(records)
-  return fs_atomic.write(store_file(),
+  local file = store_file()
+  local ok, err = fs_atomic.write(file,
     vim.json.encode({ version = 1, breakpoints = records }) .. "\n",
     { mkdir = true })
+  if ok then require("auto-run.store").touch(file) end
+  return ok, err
 end
 
 ---Comparable projection (drops vim.NIL noise, normalizes shape).

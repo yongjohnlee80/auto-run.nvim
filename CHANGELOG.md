@@ -284,6 +284,101 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.19] — 2026-10-03 — Node, Playwright, Dart and Flutter; missing-dependency alerts; AGENTS.md in every .auto-run/
+
+Patch (ADR 0213, ADR 0196 r3).
+
+- **A `node` runtime** (`adapters/node.lua`). A config runs a file
+  (`node <program>`, the project's `tsx` for a `.ts` entry) or a
+  `package.json` **script** (new field `script`) with the package manager the
+  lockfile names: npm, pnpm, yarn or bun, with `--` before args for npm only.
+  Debugging goes through js-debug's `pwa-node`: a script debugs as
+  `runtimeExecutable = <pm>`, `runtimeArgs = { "run", <script>, … }`, and
+  every JS launch sets `outputCapture = "std"`. Without it the program's
+  output never reached the session (verified on VM43). The `program` check
+  refuses a missing file, an unknown script (listing the package's scripts),
+  and both or neither. `a` scaffolds from the working directory's
+  `package.json`.
+- **Jest tests can be debugged** (`prepare_debug`), React Testing Library
+  `.tsx` tests included. The package's `jest/bin/jest.js` runs under
+  `pwa-node` with `--runInBand` and the same anchored name/file patterns a run
+  uses; on VM43 it stopped at a breakpoint inside a `.tsx` test through
+  ts-jest's source maps.
+- **A `playwright` adapter.**
+  - Discovery: `test.describe` / `test` and their modifier forms, in specs
+    that import `@playwright/test` under a `playwright.config.*`. Jest
+    declines those specs, and the roster puts Playwright first.
+  - Runs: `playwright test --reporter=json <file>:<line>`, exact by position.
+  - Results: a spec's projects aggregate, with ANSI stripped from errors.
+  - Debug: `@playwright/test/cli.js` with one worker and no timeout.
+- **A `dart` adapter for Dart and Flutter.**
+  - Package kind comes from pub's own `.dart_tool/package_config.json`. A
+    `flutter` package in the resolved graph means Flutter, which is also true
+    of a `flutter_test`-only package. No YAML is parsed. New fields:
+    `dart_sdk` (force the tool) and `device`.
+  - Discovery: `group` / `test` / `testWidgets`, with literal decoding;
+    interpolated names yield no position.
+  - Runs: `dart test` / `flutter test --reporter=json` with an **anchored**
+    `--name`, because `--plain-name` is a substring match.
+  - Results: `testWidgets` results reconcile through `root_url`, and a suite
+    that fails to compile fails its tests with the compiler's message.
+  - Configs: `dart run`, or `flutter run -d <linux|macos|windows>`; other
+    devices are refused.
+  - Debug: through the SDK's `dart debug_adapter` / `flutter debug-adapter`,
+    registered as `dap.adapters.dart` when no other plugin owns the key.
+    Unsupported rows are refused before `dap.run`.
+- **The `dart.testNotification` bridge** (`dap/dart_tests.lua`). A debugged
+  Dart test's results arrive as DAP events. A run id in the launch config
+  binds them to their own session. They publish into the canonical results
+  through `discovery.debug_results`, so the tests pane shows a debugged run
+  like any other. Unreported tests fill skipped, or failed after a non-zero
+  exit. Stale and foreign events are ignored, and state is cleared when the
+  session ends.
+- **Preflight: missing toolchains and dependencies are named before anything
+  spawns.** A new optional adapter capability, `preflight(ctx)`, is
+  filesystem-only. It is checked before every test run, test debug, config
+  run, terminal command and config debug. An `error` refuses the launch with
+  the fix (`npm install`, `dart pub get`, `npx playwright install`, install
+  js-debug-adapter, the Linux desktop toolchain …); a `warn` is logged.
+  Playwright browsers are checked **at the revisions the installed version
+  expects**. `:AutoRun doctor` gains a "toolchains and dependencies" section.
+- **Every `.auto-run/` folder carries `AGENTS.md`, `CLAUDE.md` and an empty
+  `auto-run.nvim-v<version>` marker** (`store/agents.lua`,
+  `templates/AGENTS.md`).
+  - `AGENTS.md` tells an agent how to scaffold configs here. The field and
+    runtime tables are rendered from `FIELD_DOCS` and the adapter roster, so
+    they cannot drift.
+  - After any store write into the folder (configs, profiles, overrides,
+    state, breakpoints, env files, removes), auto-run compares the marker.
+    Missing or older: `AGENTS.md` is rewritten and the marker renamed. Newer:
+    left alone, so machines on different versions don't ping-pong.
+  - Reads never write.
+  - A hand-written `AGENTS.md` is moved to `AGENTS.local.md`, which auto-run
+    never touches. `CLAUDE.md` is created once.
+  - Doctor shows each folder's state.
+- **Fixed: a second debug no longer aborts the first.** The core's launch
+  token stayed "pending" after its launch reached nvim-dap. The next debug
+  then "superseded" it and called its `abort` on a session that was already
+  running. `dap.settle_launch` retires the token at launch.
+- **Fixed: a test run's preflight happens before its specs are built.**
+  Building a spec can already need the runner.
+- `schema.field_kind(record, field)`: the value shape of a field, so editors
+  can treat every plain-string field as editable.
+- Each builtin adapter has a one-line `summary`.
+- The roster is go, playwright, jest, rust, dart, node.
+- CI builds the `dart` parser (pinned to nvim-treesitter's revision).
+- **Smoke: cells [47]–[52].** The real Dart and Flutter SDK cells (a whole
+  file, an exact single test, a Flutter widget test, and a real debugged test
+  through the bridge) run on VM43, with a floor asserting they ran. Gate:
+  1091/0.
+- **README restructured:**
+  1. what auto-run solves and its philosophy;
+  2. supported languages and frameworks;
+  3. getting started, with AutoVim and standalone;
+  4. project structure;
+  5. adding a language;
+  6. then the reference.
+
 ## [v0.1.18] — 2026-09-29 — field help, folder-aware Go scaffolds, env files in .auto-run/
 
 Patch.

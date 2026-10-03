@@ -24,6 +24,7 @@ local fs_path = require("auto-core.fs.path")
 local M = {}
 
 M.name = "go"
+M.summary = "Go — run or debug a package (delve); `go test` with exact -run selection"
 
 -- ── root detection (primary-root cache) ─────────────────────────
 
