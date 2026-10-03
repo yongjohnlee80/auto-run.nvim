@@ -60,6 +60,12 @@ local CONFIG_FIELDS = {
   cargo_package     = "string",
   cargo_target      = "string",
   cargo_target_kind = "string",
+  -- Node (ADR 0213 §2.1): a package.json script to run instead of a program.
+  script            = "string",
+  -- Dart / Flutter (ADR 0196 r3): an explicit package-kind override, and the
+  -- desktop device a Flutter app runs on.
+  dart_sdk          = "dart_sdk",
+  device            = "string",
 }
 
 ---Env-profile fields (ADR-0048 §4).
@@ -98,6 +104,11 @@ end
 VALIDATORS.run_kind = function(v)
   if type(v) == "string" and M.VALID_KIND[v] then return true end
   return false, "must be one of run|test|debug"
+end
+
+VALIDATORS.dart_sdk = function(v)
+  if v == "dart" or v == "flutter" then return true end
+  return false, "must be one of dart|flutter"
 end
 
 VALIDATORS.string = function(v)
@@ -260,8 +271,8 @@ M.FIELD_DOCS = {
     kind        = { help = "what it is for", values = { "run", "test", "debug" } },
     runtime     = { help = "the adapter that runs it", values_from = "runtimes" },
     extends     = { help = "another config whose fields this one inherits", values_from = "configs" },
-    program     = { help = "go: the package directory to build · rust: unset (Cargo builds it) or an executable · other: the command" },
-    args        = { help = "arguments for the program (for a test config, the test binary)" },
+    program     = { help = "go: the package directory to build · rust: unset (Cargo builds it) or an executable · node: the entry file · dart: the entry file (bin/<name>.dart, Flutter lib/main.dart) · other: the command" },
+    args        = { help = "arguments for the program (test config: the test runner; node script: the script; flutter: flags for flutter run, e.g. --dart-define=K=V)" },
     cwd         = { help = "where it runs — unset: the working directory (w / <leader>rw)" },
     build_flags = { help = "go build / test flags, e.g. -tags=integration -count=1", runtimes = { "go" } },
     env         = { help = "inline KEY=value pairs — win over every env file" },
@@ -279,6 +290,9 @@ M.FIELD_DOCS = {
     cargo_package     = { help = "rust: the Cargo package (-p)", runtimes = { "rust" } },
     cargo_target      = { help = "rust: a target of that package — set with cargo_target_kind", runtimes = { "rust" } },
     cargo_target_kind = { help = "rust: the target's kind", values = { "lib", "bin", "test" }, runtimes = { "rust" } },
+    script      = { help = "node: a package.json script to run (npm/pnpm/yarn/bun run <script>) — instead of program", runtimes = { "node" } },
+    dart_sdk    = { help = "dart: force the tool — unset: detected from pub's package_config (flutter when the package uses Flutter)", values = { "dart", "flutter" }, runtimes = { "dart" } },
+    device      = { help = "dart: the Flutter desktop device to run on (unset: this machine's)", values = { "linux", "macos", "windows" }, runtimes = { "dart" } },
   },
   profile = {
     name             = { help = "the profile's name — also its file name" },

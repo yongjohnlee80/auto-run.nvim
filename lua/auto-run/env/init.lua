@@ -766,6 +766,7 @@ function M.create_file(path)
     return nil, structured_err("write_failed", "create_file: " .. tostring(oerr))
   end
   vim.uv.fs_close(fd)
+  require("auto-run.store").touch(path)
   publish("run.env:changed", { action = "created", path = path })
   return true, nil
 end

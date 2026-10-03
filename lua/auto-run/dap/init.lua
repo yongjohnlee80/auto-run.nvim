@@ -439,6 +439,87 @@ function M.ensure_rust_adapter(dap)
   }
 end
 
+-- ── JavaScript (js-debug / pwa-node) ────────────────────────────
+
+---The js-debug server executable, when one is installed: `js-debug-adapter`
+---on PATH, else Mason's bin. nil when neither.
+---@return string?
+function M.js_debug_command()
+  if vim.fn.executable("js-debug-adapter") == 1 then return "js-debug-adapter" end
+  local mason = vim.fs.normalize(vim.fn.stdpath("data") .. "/mason/bin/js-debug-adapter")
+  if vim.fn.executable(mason) == 1 then return mason end
+  return nil
+end
+
+---Register `dap.adapters["pwa-node"]` when nothing has (LazyVim's
+---lang.typescript extra normally does) and js-debug is installed — the same
+---server shape LazyVim uses (ADR 0213 §2.1). Idempotent; never overwrites.
+---@param dap table
+function M.ensure_js_adapter(dap)
+  if dap.adapters["pwa-node"] ~= nil then return end
+  local cmd = M.js_debug_command()
+  if not cmd then return end
+  dap.adapters["pwa-node"] = {
+    type = "server",
+    host = "localhost",
+    port = "${port}",
+    executable = { command = cmd, args = { "${port}" } },
+  }
+end
+
+-- ── Dart / Flutter (the SDKs' own DAP servers, ADR 0196 r3 §2.3) ─
+
+---The four in-scope rows: (kind, mode) → the executable + args.
+local DART_ROWS = {
+  ["dart:run"]     = { "dart", { "debug_adapter" } },
+  ["dart:test"]    = { "dart", { "debug_adapter", "--test" } },
+  ["flutter:run"]  = { "flutter", { "debug-adapter" } },
+  ["flutter:test"] = { "flutter", { "debug-adapter", "--test" } },
+}
+
+---auto-run's `dap.adapters.dart`: selects the executable from the config's
+---discriminants. nvim-dap's callback has ONE argument and no error channel, so
+---this only ever sees rows `resolve_dart_launch` already validated (a config
+---that reaches it some other way, without discriminants, gets the plain Dart
+---adapter). Kept as one function value so ownership can be recognised.
+local function dart_adapter(callback, config)
+  local row = DART_ROWS[tostring(config.autoRunDartKind) .. ":" .. tostring(config.autoRunDartMode)]
+    or DART_ROWS["dart:run"]
+  callback({ type = "executable", command = row[1], args = vim.deepcopy(row[2]) })
+end
+
+---Register auto-run's Dart adapter when the key is free. Another plugin's
+---`dap.adapters.dart` is never overwritten (preflight warns instead).
+---@param dap table
+function M.ensure_dart_adapter(dap)
+  if dap.adapters.dart == nil then dap.adapters.dart = dart_adapter end
+end
+
+---Is `dap.adapters.dart` auto-run's own?
+---@param dap table
+---@return boolean
+function M.owns_dart_adapter(dap)
+  return dap.adapters.dart == dart_adapter
+end
+
+---Validate a Dart launch's discriminants BEFORE dap.run — the only place a
+---refusal has an error channel (Lector r2 MF1). `(true)` or `(nil, err)`:
+---unknown or absent kind/mode, and a Flutter app launch on a non-desktop
+---device (ADR 0196 §2.4), are refused and dap.run is never called.
+---@param cfg table  the launch config (discriminants already merged in)
+---@return boolean? ok, string? err
+function M.resolve_dart_launch(cfg)
+  local kind, mode = cfg.autoRunDartKind, cfg.autoRunDartMode
+  if not DART_ROWS[tostring(kind) .. ":" .. tostring(mode)] then
+    return nil, ("dart launch: unknown kind/mode %s/%s"):format(tostring(kind), tostring(mode))
+  end
+  if kind == "flutter" and mode == "run" then
+    local derr = require("auto-run.adapters.dart").device_error(cfg.autoRunDartDevice)
+    if derr then return nil, derr end
+  end
+  return true, nil
+end
+
 -- ── core-owned debug launch token (cancellation, Lector P1-4) ───
 
 -- The pending async debug launch. A NEW launch supersedes the prior one (its
@@ -481,6 +562,7 @@ function M.launch(launch)
   local okd, dap = pcall(require, "dap")
   if not okd then return nil, "nvim-dap is not installed" end
   if launch.dap_type == "rust" then M.ensure_rust_adapter(dap) end
+  if launch.dap_type == "pwa-node" then M.ensure_js_adapter(dap) end
   local cfg = {
     type    = launch.dap_type,
     request = launch.request or "launch",
@@ -493,6 +575,15 @@ function M.launch(launch)
   -- Adapter-specific dap fields (e.g. go's mode / dlvCwd / buildFlags).
   if type(launch.extra) == "table" then
     for k, v in pairs(launch.extra) do cfg[k] = v end
+  end
+  if launch.dap_type == "dart" then
+    local okr, rerr = M.resolve_dart_launch(cfg)
+    if not okr then
+      -- A refused debugged-test launch never gets a session: unwind its marks.
+      require("auto-run.dap.dart_tests").abort(cfg.autoRunRunId)
+      return nil, rerr
+    end
+    M.ensure_dart_adapter(dap)
   end
   -- Opening the view is a CONVENIENCE; it must never be able to prevent the
   -- session. Unguarded, anything it raises (window ops are the usual source)
@@ -532,6 +623,10 @@ function M.debug_start(name, opts)
   local eff, comp, err, detail = resolve_effective(name, opts)
   if not eff then return nil, err, detail end
   if comp and next(comp.env) ~= nil then eff.env = comp.env end
+  -- Preflight (ADR 0213 §2.4): what is missing refuses the debug before any
+  -- adapter work or session.
+  local okp, pferr = require("auto-run.exec").preflight(eff, "debug")
+  if not okp then return nil, pferr end
 
   local adapter = eff.runtime and require("auto-run.adapters").get(eff.runtime) or nil
   if adapter and type(adapter.prepare_debug_config) == "function" then
@@ -723,6 +818,9 @@ function M.health()
     dap_view_installed = okv,
     adapters           = adapters,
     go_adapter         = okd and dap.adapters.go ~= nil or false,
+    js_adapter         = okd and dap.adapters["pwa-node"] ~= nil or false,
+    dart_adapter       = okd and (dap.adapters.dart == nil and "none"
+      or M.owns_dart_adapter(dap) and "auto-run" or "other plugin") or "none",
     provider_registered = okd and dap.providers.configs["auto-run"] ~= nil or false,
     last_error_captured = last_failure ~= nil,
   }
@@ -746,6 +844,12 @@ function M.setup()
   -- register it so both the provider path (explicit-program configs) and the
   -- capability launcher resolve the adapter. Idempotent.
   M.ensure_rust_adapter(dap)
+  -- Dart / Flutter via the SDK DAP servers (ADR 0196 r3) and js-debug for
+  -- Node (ADR 0213) — each only when no other plugin registered the key.
+  M.ensure_dart_adapter(dap)
+  M.ensure_js_adapter(dap)
+  -- Debugged Dart tests report over dart.testNotification events.
+  require("auto-run.dap.dart_tests").attach(dap)
 
   -- dap-go registers its default `dap.configurations.go` entries
   -- ("Debug", "Attach", …) from inside its setup(); attach() needs

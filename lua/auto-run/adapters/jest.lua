@@ -17,13 +17,23 @@
 ---regex-escaped, ancestor-joined `--testNamePattern` for
 ---test/namespace positions. `results()` parses the output file back
 ---to position ids via `ancestorTitles` + `title`.
+---
+---Debug (ADR 0213 §2.2): `pwa-node` runs the package's `jest/bin/jest.js`
+---with `--runInBand` (so the test runs in the debugged process and
+---breakpoints bind) and the same name/file patterns a run uses — verified on
+---VM43 stopping inside a `.tsx` RTL test through ts-jest's source maps.
+---
+---A spec that imports `@playwright/test` is Playwright's, not Jest's, even
+---when it sits in a Jest package (`auto-run.adapters.js.is_playwright_spec`).
 ---@module 'auto-run.adapters.jest'
 
 local fs_path = require("auto-core.fs.path")
+local js = require("auto-run.adapters.js")
 
 local M = {}
 
 M.name = "jest"
+M.summary = "Jest tests in JS/TS, React Testing Library included; debug with js-debug"
 
 -- ── root detection (per-package.json, memoized) ─────────────────
 
@@ -74,10 +84,13 @@ function M.is_test_file(path)
   if type(path) ~= "string" then return false end
   local ext = path:match("%.([%w]+)$")
   if not ext or not EXTENSIONS[ext] then return false end
-  if path:match("%.test%.[%w]+$") or path:match("%.spec%.[%w]+$") then
-    return true
-  end
-  return path:match("/__tests__/[^/]+$") ~= nil
+  local named = path:match("%.test%.[%w]+$") or path:match("%.spec%.[%w]+$")
+    or path:match("/__tests__/[^/]+$")
+  if not named then return false end
+  -- Playwright's own specs are not Jest's (ADR 0213 §2.2): the roster puts
+  -- playwright first, and this keeps the attribution if a third party
+  -- reorders it.
+  return not js.is_playwright_spec(path)
 end
 
 -- ── discovery (treesitter, injections disabled) ─────────────────
@@ -187,52 +200,7 @@ function M.discover_positions(path)
     end
   end
   if #flat == 0 then return nil, nil end
-
-  table.sort(flat, function(a, b)
-    if a.sbyte == b.sbyte then return a.ebyte > b.ebyte end
-    return a.sbyte < b.sbyte
-  end)
-  local top, stack = {}, {}
-  for _, item in ipairs(flat) do
-    while #stack > 0 and item.sbyte >= stack[#stack].ebyte do
-      table.remove(stack)
-    end
-    local parent = stack[#stack]
-    if parent then
-      parent.children[#parent.children + 1] = item
-    else
-      top[#top + 1] = item
-    end
-    stack[#stack + 1] = item
-  end
-
-  local function to_position(item)
-    local pos = {
-      type     = item.kind,
-      name     = item.name,
-      path     = path,
-      lnum     = item.srow,
-      end_lnum = item.erow,
-    }
-    if #item.children > 0 then
-      pos.children = {}
-      for _, child in ipairs(item.children) do
-        pos.children[#pos.children + 1] = to_position(child)
-      end
-    end
-    return pos
-  end
-
-  local file_pos = {
-    type     = "file",
-    name     = fs_path.basename(path),
-    path     = path,
-    children = {},
-  }
-  for _, item in ipairs(top) do
-    file_pos.children[#file_pos.children + 1] = to_position(item)
-  end
-  return file_pos, nil
+  return require("auto-run.adapters.nesting").file_position(path, flat), nil
 end
 
 -- ── build_spec ──────────────────────────────────────────────────
@@ -281,6 +249,28 @@ local function full_name(pos)
   return table.concat(id_segments(pos), " ")
 end
 
+---The run's name / file pattern args for a position (shared by build_spec and
+---the debug launch, so both select the same tests).
+---@param pos AutoRunPosition
+---@param root string
+---@return string[]
+local function selection_args(pos, root)
+  local out = {}
+  if pos.type == "test" or pos.type == "namespace" then
+    local pat = "^" .. regex_escape(full_name(pos))
+    if pos.type == "test" then pat = pat .. "$" end
+    out[#out + 1] = "--testNamePattern=" .. pat
+  end
+  if pos.type ~= "dir" then
+    out[#out + 1] = regex_escape(fs_path.relative(pos.path, root) or pos.path)
+  else
+    local rel = fs_path.relative(pos.path, root)
+    if rel and rel ~= "" then out[#out + 1] = regex_escape(rel) end
+  end
+  return out
+end
+M._selection_args = selection_args
+
 ---@param args AutoRunSpecArgs
 ---@return AutoRunSpec? spec, string? err
 function M.build_spec(args)
@@ -303,22 +293,11 @@ function M.build_spec(args)
   local output_file = fs_path.join(args.run_dir, "jest-output.json")
   local argv = { bin, "--json", "--outputFile=" .. output_file }
 
-  if pos.type == "test" or pos.type == "namespace" then
-    local pat = "^" .. regex_escape(full_name(pos))
-    if pos.type == "test" then pat = pat .. "$" end
-    argv[#argv + 1] = "--testNamePattern=" .. pat
-    argv[#argv + 1] = regex_escape(fs_path.relative(pos.path, root) or pos.path)
-  elseif pos.type == "file" then
-    argv[#argv + 1] = regex_escape(fs_path.relative(pos.path, root) or pos.path)
-  elseif pos.type == "dir" then
-    local rel = fs_path.relative(pos.path, root)
-    if rel and rel ~= "" then
-      argv[#argv + 1] = regex_escape(rel)
-    end
-    -- dir == root → no path pattern: the whole package runs.
-  else
+  if pos.type ~= "test" and pos.type ~= "namespace" and pos.type ~= "file" and pos.type ~= "dir" then
     return nil, "jest adapter cannot run a '" .. tostring(pos.type) .. "' position"
   end
+  -- A dir at the package root adds no path pattern: the whole package runs.
+  vim.list_extend(argv, selection_args(pos, root))
 
   return {
     cmd     = argv,
@@ -381,6 +360,59 @@ function M.results(spec, exit, tree)
     end
   end
   return results
+end
+
+-- ── debug + preflight (ADR 0213 §2.2 / §2.4) ────────────────────
+
+
+---Launch-ready pwa-node config for a discovered Jest position.
+---@param pos AutoRunPosition
+---@param _opts table
+---@param cb fun(launch: table|nil, err: table|nil)
+function M.prepare_debug(pos, _opts, cb)
+  local root = M.root(fs_path.parent(pos.path))
+  if not root then
+    return cb(nil, { code = "no_root", message = "no package.json above " .. pos.path })
+  end
+  local cli = js.find_module(root, "jest/bin/jest.js")
+  if not cli then
+    return cb(nil, { code = "jest_missing",
+      message = "jest is not installed under " .. vim.fn.fnamemodify(root, ":~")
+        .. " (no node_modules/jest/bin/jest.js)" })
+  end
+  local applied, cfg_err = require("auto-run.adapters.config").test_config(M.name)
+  if cfg_err then return cb(nil, { code = "config_failed", message = cfg_err }) end
+  local args = { "--runInBand" }
+  vim.list_extend(args, selection_args(pos, root))
+  return cb({
+    dap_type = "pwa-node",
+    request  = "launch",
+    program  = cli,
+    args     = args,
+    cwd      = root,
+    env      = applied and applied.env or nil,
+    extra    = js.debug_extra(),
+  }, nil)
+end
+
+---Missing toolchain / dependencies for a Jest package.
+---@param ctx { root: string, purpose: "run"|"test"|"debug", eff: table? }
+---@return AutoRunIssue[]
+function M.preflight(ctx)
+  local root = ctx.root and M.root(ctx.root) or nil
+  if not root then return {} end
+  local issues = js.base_issues(root)
+  local node_modules_missing = false
+  for _, i in ipairs(issues) do
+    if i.code == "node_modules_missing" then node_modules_missing = true end
+  end
+  if not node_modules_missing and not js.find_module(root, "jest/bin/jest.js") then
+    issues[#issues + 1] = { level = "error", code = "jest_missing",
+      message = "jest is not installed in " .. vim.fn.fnamemodify(root, ":~"),
+      fix = js.add_dev_cmd(js.package_manager(root), "jest") }
+  end
+  if ctx.purpose == "debug" then vim.list_extend(issues, js.debug_issues()) end
+  return issues
 end
 
 ---Test-only: drop the memoized package-root cache.

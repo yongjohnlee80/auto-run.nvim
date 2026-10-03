@@ -28,6 +28,7 @@ local fs_path = require("auto-core.fs.path")
 local M = {}
 
 M.name = "rust"
+M.summary = "Rust — Cargo build / run / test; debug with codelldb"
 
 -- ── root detection (crate + workspace, memoized) ────────────────
 
