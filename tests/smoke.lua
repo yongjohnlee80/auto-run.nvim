@@ -6752,6 +6752,15 @@ print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNot
   if not okd then ok("[51] nvim-dap available", false) return end
   local bridge_mod = require("auto-run.dap")
   bridge_mod.setup() -- idempotent: attaches the bridge listeners
+  -- The synthetic part below tests the launch matrix and the bridge, not the
+  -- SDK: preflight would (rightly) refuse every Dart debug on a machine without
+  -- one (CI), before the bridge is ever reached. So `dart` / `flutter` read as
+  -- installed until the real-SDK block, which uses the real PATH.
+  local real_executable = vim.fn.executable
+  vim.fn.executable = function(x)
+    if x == "dart" or x == "flutter" then return 1 end
+    return real_executable(x)
+  end
   local prev = worktree.get_active()
   local root = fx .. "/dart51"
   ok("[51] fixture repo", NEW.repo(root))
@@ -6904,6 +6913,7 @@ print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNot
   require("auto-run.dap.dart_tests").abort(rid)
   ok("[51] abort (no session) unwinds the running mark", P3.discovery.results()[ids["one"]] == nil)
 
+  vim.fn.executable = real_executable
   -- real SDK, real nvim-dap: debug one test end to end through the public path
   if HAVE_DART then
     vim.fn.delete(pkg .. "/.dart_tool", "rf")
