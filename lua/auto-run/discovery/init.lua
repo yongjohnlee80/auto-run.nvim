@@ -1040,6 +1040,7 @@ function M.debug_position(id)
     local token = dap.new_launch_token()
     adapter.prepare_debug(node, token, function(launch, perr)
       if token.cancelled then return end
+      dap.settle_launch(token)
       if perr then
         log.error("discovery", "debug prepare failed: "
           .. tostring(perr.message or perr.code))

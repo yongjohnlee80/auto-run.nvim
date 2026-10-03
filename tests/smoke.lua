@@ -6800,8 +6800,10 @@ print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNot
   ok("[51] the launch: type dart, test mode, a run id, the exact --name, the file as program",
     c1 and c1.type == "dart" and c1.autoRunDartKind == "dart" and c1.autoRunDartMode == "test" and type(c1.autoRunRunId) == "string"
       and vim.deep_equal(c1.toolArgs, { "--name", "^g one$" }) and c1.program == tfile and c1.cwd == pkg, vim.inspect(c1))
+  local function status(id) local r = P3.discovery.results()[id] return r and r.status end
   local rs = P3.discovery.results()
-  ok("[51] the debugged tests show running until their session reports", rs[ids["one"]] and rs[ids["one"]].status == "running")
+  ok("[51] the debugged tests show running until their session reports", status(ids["one"]) == "running",
+    vim.inspect({ ids = ids, results = rs, root = P3.discovery.tree().root.path }))
   local L = dap.listeners.after
   local KEY = "auto-run.dart_tests"
   local function notify(sess, body) L["event_dart.testNotification"][KEY](sess, body) end
@@ -6816,33 +6818,33 @@ print("\n[51] dart debug — launch matrix, refusals before dap.run, the testNot
   notify(s2, { type = "testDone", testID = 3, result = "failure", skipped = false, hidden = false, time = 3 })
   rs = P3.discovery.results()
   ok("[51] two concurrent sessions land only in their own scopes (same testID 3 in both)",
-    rs[ids["one"]].status == "passed" and rs[ids["two"]].status == "failed" and rs[ids["two"]].output == "boom", vim.inspect(rs))
+    status(ids["one"]) == "passed" and status(ids["two"]) == "failed" and (rs[ids["two"]] or {}).output == "boom", vim.inspect(rs))
   ok("[51] a run's result is published (run.results:changed reached the canonical table)", rs[ids["g"]] ~= nil)
   L.event_terminated[KEY](s1)
   notify(s1, { type = "testStart", test = { id = 9, name = "g three", url = furl }, time = 5 })
   notify(s1, { type = "testDone", testID = 9, result = "success", skipped = false, hidden = false, time = 6 })
   rs = P3.discovery.results()
-  ok("[51] events after a session terminated are dropped (three stays running)", rs[ids["three"]].status == "running")
+  ok("[51] events after a session terminated are dropped (three stays running)", status(ids["three"]) == "running")
   notify({ id = 99099, config = { autoRunRunId = "dart-forged-1" } },
     { type = "testDone", testID = 1, result = "failure", skipped = false, hidden = false, time = 1 })
-  ok("[51] an event from an unknown session changes nothing", P3.discovery.results()[ids["three"]].status == "running")
+  ok("[51] an event from an unknown session changes nothing", status(ids["three"]) == "running")
   -- a runner that exits non-zero having reported nothing → failed, not skipped
   local s3 = { id = 99003, config = cfgs[3] }
   L.event_exited[KEY](s3, { exitCode = 254 })
   L.event_terminated[KEY](s3)
   rs = P3.discovery.results()
-  ok("[51] exit 254 with no reports → failed, with the reason", rs[ids["three"]].status == "failed"
-    and tostring(rs[ids["three"]].output):find("code=254", 1, true) ~= nil, vim.inspect(rs[ids["three"]]))
+  ok("[51] exit 254 with no reports → failed, with the reason", status(ids["three"]) == "failed"
+    and tostring((rs[ids["three"]] or {}).output):find("code=254", 1, true) ~= nil, vim.inspect(rs[ids["three"]]))
   local s4 = { id = 99004, config = cfgs[4] }
   L.event_exited[KEY](s4, { exitCode = 0 })
   L.disconnect[KEY](s4)
-  ok("[51] a clean exit with nothing reported → skipped", P3.discovery.results()[ids["four"]].status == "skipped")
+  ok("[51] a clean exit with nothing reported → skipped", status(ids["four"]) == "skipped")
   L.event_terminated[KEY](s2)
   local st = require("auto-run.dap.dart_tests")._state()
   ok("[51] every session's state is cleared after it ends", next(st.active) == nil and next(st.pending) == nil, vim.inspect(st))
   -- a launch that never got a session unwinds its marks
   local rid = require("auto-run.dap.dart_tests").begin(P3.discovery.tree():get(ids["one"]), pkg)
-  ok("[51] begin marks running", P3.discovery.results()[ids["one"]].status == "running")
+  ok("[51] begin marks running", status(ids["one"]) == "running")
   require("auto-run.dap.dart_tests").abort(rid)
   ok("[51] abort (no session) unwinds the running mark", P3.discovery.results()[ids["one"]] == nil)
 

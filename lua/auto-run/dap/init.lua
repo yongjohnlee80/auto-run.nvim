@@ -544,6 +544,17 @@ function M.new_launch_token()
   return token
 end
 
+---Retire a launch token once its launch was handed to nvim-dap (or failed):
+---it is no longer PENDING, so a later launch must not supersede-and-abort it.
+---Without this, the next debug called the previous token's `abort` after its
+---session was already running — for a Dart test that unwound the running
+---session's result tracking (ADR 0196 r3 §2.3.1).
+---@param token table
+function M.settle_launch(token)
+  if _pending_launch == token then _pending_launch = nil end
+  token.abort = nil
+end
+
 ---Cancel the pending debug launch (aborting its in-flight build), if any.
 function M.cancel_launch()
   if _pending_launch then
@@ -637,6 +648,7 @@ function M.debug_start(name, opts)
     local token = M.new_launch_token()
     adapter.prepare_debug_config(eff, token, function(launch, perr)
       if token.cancelled then return end -- superseded / cancelled mid-build
+      M.settle_launch(token)
       if perr then
         log.error("dap", "debug prepare failed: "
           .. tostring(perr.message or perr.code))
