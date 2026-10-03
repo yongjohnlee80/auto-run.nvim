@@ -6383,9 +6383,11 @@ print("\n[48] jest — debug a test, preflight, and Playwright specs are not Jes
   write_file(root3 .. "/playwright.config.ts", "export default {}\n")
   ok("[48] with a playwright config, jest declines the @playwright/test spec", not jest.is_test_file(root3 .. "/e2e/a.spec.ts"))
   ok("[48] ... and keeps the plain spec beside it", jest.is_test_file(root3 .. "/unit/b.spec.ts"))
+  local a_pw = P3.adapters.adapter_for(root3 .. "/e2e/a.spec.ts")
+  local a_js = P3.adapters.adapter_for(root3 .. "/unit/b.spec.ts")
   ok("[48] adapter_for attributes them: playwright / jest",
-    P3.adapters.adapter_for(root3 .. "/e2e/a.spec.ts").name == "playwright"
-      and P3.adapters.adapter_for(root3 .. "/unit/b.spec.ts").name == "jest")
+    a_pw and a_pw.name == "playwright" and a_js and a_js.name == "jest",
+    vim.inspect({ a_pw and a_pw.name, a_js and a_js.name }))
   NEW.restore(prev)
 end)()
 
@@ -6609,7 +6611,7 @@ print("\n[50] dart / flutter — package kind, discovery, selection, results"
   end
   P3.discovery._reset_for_tests()
   local outcome, perr = P3.discovery.parse_file(tfile)
-  ok("[50] the dart adapter discovers the file", outcome == "parsed" and P3.discovery.tree():get(tfile).adapter == "dart",
+  ok("[50] the dart adapter discovers the file", outcome == "parsed" and (P3.discovery.tree():get(tfile) or {}).adapter == "dart",
     tostring(perr))
   local ids = NEW.ids_by_name(P3.discovery.tree().root)
   ok("[50] nested groups → namespaces; interpolated description → no position; raw `$` kept",
