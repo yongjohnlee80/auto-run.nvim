@@ -335,7 +335,11 @@ end
 ---@param test table
 ---@return string?
 local function test_file(state, test)
-  for _, u in ipairs({ test.root_url, test.url }) do
+  -- Two explicit checks, not ipairs over { root_url, url }: an absent
+  -- root_url (plain `test`s on some package:test versions) is a nil at index 1
+  -- and ipairs would stop before ever reading `url`.
+  for i = 1, 2 do
+    local u = i == 1 and test.root_url or test.url
     if type(u) == "string" and u:sub(1, 7) == "file://" then
       return fs_path.normalize(vim.uri_to_fname(u))
     end
@@ -373,6 +377,14 @@ function M.reconcile(state, ev)
   elseif t == "testDone" then
     local rec = state.tests[ev.testID]
     if not rec or ev.hidden or not rec.file or type(rec.name) ~= "string" then return nil end
+    -- A suite that failed to LOAD (a compile error) reports it as its
+    -- "loading <file>" pseudo-test, visible only on failure. Remembered per
+    -- file so the file's tests can carry the real error, not "exit 1".
+    if rec.name:sub(1, 8) == "loading " and ev.result ~= "success" then
+      state.load_errors = state.load_errors or {}
+      state.load_errors[rec.file] = rec.err or ("failed to load " .. rec.file)
+      return nil
+    end
     state.reported = true
     local status = ev.skipped and "skipped" or (ev.result == "success" and "passed" or "failed")
     local dur = (type(ev.time) == "number" and type(rec.start) == "number") and (ev.time - rec.start) or nil
@@ -427,6 +439,15 @@ function M.results(spec, exit, tree)
   for ev in events(exit.stdout_file) do
     local key, res = M.reconcile(state, ev)
     if key and map[key] then results[map[key]] = res end
+  end
+  -- A file that failed to load fails each of its unreported tests with the
+  -- loader's error (usually the compile error), never a bare exit code.
+  for file, err in pairs(state.load_errors or {}) do
+    for key, id in pairs(map) do
+      if results[id] == nil and key:sub(1, #file + 1) == file .. "\0" then
+        results[id] = { status = "failed", output = err }
+      end
+    end
   end
   return results
 end

@@ -6588,6 +6588,7 @@ print("\n[50] dart / flutter — package kind, discovery, selection, results"
     "    });",
     "    test('fails', () => expect(1, 2));",
     "    test('skipped', () {}, skip: 'not now');",
+    "    final x = 1;",
     "    test('interp $x', () {});",
     "    test(r'raw $not (interp)', () {});",
     "  });",
@@ -6661,6 +6662,17 @@ print("\n[50] dart / flutter — package kind, discovery, selection, results"
   ok("[50] passed, and skip (result=success, skipped=true) → skipped; the hidden loading test is ignored",
     res[wids["adds"]] and res[wids["adds"]].status == "passed" and res[wids["top skip"]] and res[wids["top skip"]].status == "skipped"
       and vim.tbl_count(res) == 3, vim.inspect(res))
+  local lerr_lines = {
+    vim.json.encode({ type = "suite", suite = { id = 0, path = "test/w_test.dart" } }),
+    vim.json.encode({ type = "testStart", test = { id = 1, name = "loading test/w_test.dart", suiteID = 0 }, time = 0 }),
+    vim.json.encode({ type = "error", testID = 1, error = "Failed to load: Error: Undefined name 'x'.", time = 1 }),
+    vim.json.encode({ type = "testDone", testID = 1, result = "error", skipped = false, hidden = false, time = 2 }),
+  }
+  write_file(stdout, table.concat(lerr_lines, "\n") .. "\n")
+  local lres = dart.results({ context = { position_id = wfile, root = pkg } }, { stdout_file = stdout }, tree)
+  ok("[50] a file that fails to load (compile error) fails its tests WITH the compiler's message",
+    lres[wids["adds"]] and lres[wids["adds"]].status == "failed"
+      and tostring(lres[wids["adds"]].output):find("Undefined name", 1, true) ~= nil and vim.tbl_count(lres) == 3, vim.inspect(lres))
 
   -- real SDK: a pure Dart package, the whole file, then ONE test by its exact name
   if HAVE_DART then

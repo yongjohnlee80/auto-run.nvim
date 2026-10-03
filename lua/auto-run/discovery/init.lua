@@ -870,26 +870,36 @@ function M.run_position(id, opts)
       .. "discovery covers open buffers by default (the tests pane's S scans the full worktree)"
   end
 
-  local specs, berr = build_specs(tree, node)
-  if not specs then return nil, berr end
-
   -- Preflight (ADR 0213 §2.4): a missing SDK, dependency or runner refuses the
-  -- run before anything is marked running or spawned.
+  -- run before any spec is built (building one can already need the runner),
+  -- before anything is marked running or spawned. Each (adapter, root) of the
+  -- files under the position is checked once.
   do
     local checked = {}
-    for _, s in ipairs(specs) do
-      local root = s.spec.cwd or s.position.path
-      local key = s.adapter.name .. "\0" .. root
-      if not checked[key] then
-        checked[key] = true
-        local okp, perr = adapters.check(s.adapter, { root = root, purpose = "test" })
-        if not okp then
-          for _, sp in ipairs(specs) do pcall(vim.uv.fs_rmdir, sp.run_dir) end
-          return nil, perr
+    local function visit(n)
+      if n.type == "file" or (n.type ~= "dir" and n.adapter) then
+        local adapter = adapters.get(n.adapter or "")
+        local root = adapter and adapter.root(fs_path.parent(n.path))
+        local key = adapter and root and (adapter.name .. "\0" .. root)
+        if key and not checked[key] then
+          checked[key] = true
+          local okp, perr = adapters.check(adapter, { root = root, purpose = "test" })
+          if not okp then return perr end
         end
+        if n.type ~= "dir" then return nil end
       end
+      for _, child in ipairs(n.children or {}) do
+        local err = visit(child)
+        if err then return err end
+      end
+      return nil
     end
+    local perr = visit(node)
+    if perr then return nil, perr end
   end
+
+  local specs, berr = build_specs(tree, node)
+  if not specs then return nil, berr end
 
   local job = require("auto-run.exec.job")
   local pending = #specs
