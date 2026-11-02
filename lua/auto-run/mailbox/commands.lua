@@ -1,4 +1,4 @@
----auto-run.mailbox.commands — register the `run.*` mailbox verbs
+---auto-run.mailbox.commands — register the `run.*` verbs in auto-core's command registry
 ---(ADR-0048 §11; SPECS-table blueprint from
 ---auto-agents/mailbox/todos_commands.lua).
 ---
@@ -635,20 +635,39 @@ local SPECS = {
 
 M._SPECS = SPECS  -- exposed for tests / introspection
 
----Register every run.* command against the auto-core mailbox command
----registry. Idempotent — safe on every setup (re-registering with the
----same owner replaces the spec).
+---The auto-core command registry the run.* verbs register into: auto-core.commands
+---(auto-core v0.6.0 on, which has no file mailbox), else the mailbox's
+---(auto-core.mailbox.commands, before v0.6.0); nil when auto-core has neither.
+---@return table|nil
+function M.registry()
+  local okc, core = pcall(require, "auto-core")
+  if not (okc and type(core) == "table") then return nil end
+  if type(core.commands) == "table" and type(core.commands.register) == "function" then
+    return core.commands
+  end
+  if type(core.mailbox) == "table" and type(core.mailbox.commands) == "table" then
+    return core.mailbox.commands
+  end
+  return nil
+end
+
+---Register every run.* command against auto-core's command registry
+---(M.registry). Idempotent — safe on every setup (re-registering with the
+---same owner replaces the spec). With no registry every verb is skipped,
+---with one log line.
 ---@return { registered: string[], skipped: string[] }
 function M.register_all()
-  local okc, core = pcall(require, "auto-core")
+  local registry = M.registry()
   local out = { registered = {}, skipped = {} }
-  if not (okc and core and core.mailbox and core.mailbox.commands) then
+  if not registry then
     for name in pairs(SPECS) do out.skipped[#out.skipped + 1] = name end
     table.sort(out.skipped)
+    require("auto-run.log").warn("mailbox",
+      "auto-core has no command registry (auto-core.commands, or auto-core.mailbox.commands before v0.6.0): the run.* verbs are not registered")
     return out
   end
   for name, spec in pairs(SPECS) do
-    local okr, regerr = core.mailbox.commands.register(name, spec)
+    local okr, regerr = registry.register(name, spec)
     if okr then
       out.registered[#out.registered + 1] = name
     else

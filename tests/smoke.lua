@@ -1169,8 +1169,12 @@ end
 
 -- ── [9] mailbox verbs — run.* envelopes ─────────────────────────
 print("\n[9] mailbox — run.* verb registration + envelope contracts")
-local commands = require("auto-core.mailbox.commands")
 local run_cmds = require("auto-run.mailbox.commands")
+-- the registry auto-run registers into: auto-core.commands from auto-core v0.6.0, the
+-- mailbox's before it (whichever the sibling auto-core serves)
+local commands = run_cmds.registry()
+ok("auto-core serves a command registry", commands ~= nil
+  and commands == (require("auto-core").commands or require("auto-core").mailbox.commands))
 
 local reg = run_cmds.register_all()
 ok("register_all registers all 19 verbs (idempotent)",
@@ -1302,6 +1306,47 @@ local function find_bp(records, path, lnum)
 end
 
 -- ── [10] exec — job engine end-to-end ───────────────────────────
+-- ── [9b] the registry auto-run picks, by auto-core's shape ─────────
+print("\n[9b] registry — auto-core.commands (v0.6.0, no file mailbox) first, the mailbox's before it")
+do
+  local real = package.loaded["auto-core"]
+  ---a stand-in registry: what register stores, by name
+  local function fake()
+    local r = { got = {} }
+    function r.register(name, spec) r.got[name] = spec; return true end
+    return r
+  end
+  local function count(t) local n = 0; for _ in pairs(t) do n = n + 1 end; return n end
+
+  -- auto-core v0.6.0: commands, and no mailbox at all
+  local v6 = fake()
+  package.loaded["auto-core"] = { commands = v6 }
+  local r6 = run_cmds.register_all()
+  ok("*** auto-core v0.6.0 (no mailbox): all 19 verbs go to auto-core.commands ***",
+    #r6.registered == 19 and #r6.skipped == 0 and count(v6.got) == 19 and v6.got["run.list"] ~= nil,
+    vim.inspect(r6))
+
+  -- both present (a v0.6.0 that kept a mailbox table): auto-core.commands wins
+  local cmds, mb = fake(), fake()
+  package.loaded["auto-core"] = { commands = cmds, mailbox = { commands = mb } }
+  run_cmds.register_all()
+  ok("auto-core.commands is preferred to the mailbox's", count(cmds.got) == 19 and count(mb.got) == 0)
+
+  -- before v0.6.0: the mailbox's registry
+  local old = fake()
+  package.loaded["auto-core"] = { mailbox = { commands = old } }
+  local r5 = run_cmds.register_all()
+  ok("before v0.6.0: the verbs go to auto-core.mailbox.commands", #r5.registered == 19 and count(old.got) == 19)
+
+  -- neither: every verb skipped, nothing raised
+  package.loaded["auto-core"] = {}
+  local rn = run_cmds.register_all()
+  ok("no registry: all 19 verbs skipped", #rn.registered == 0 and #rn.skipped == 19, vim.inspect(rn))
+
+  package.loaded["auto-core"] = real
+  run_cmds.register_all() -- the real registry again, for the cells after
+end
+
 print("\n[10] exec — job engine (per-run dirs, events, env, stop)")
 do
   worktree.set_active(plain)
