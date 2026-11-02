@@ -140,11 +140,11 @@ function M.setup(opts)
   resubscribe(core.events)
   require("auto-run.store.paths").invalidate()
 
-  -- Mailbox verbs — registered when the auto-core mailbox surface is
-  -- present (the registry accepts registrations independent of
-  -- transport configuration; verbs become reachable once the host
-  -- configures the mailbox).
-  if type(core.mailbox) == "table" and type(core.mailbox.commands) == "table" then
+  -- The run.* verbs, registered in auto-core's command registry:
+  -- auto-core.commands from auto-core v0.6.0 (no file mailbox), the
+  -- mailbox's before it. Agents reach them through the registry's host
+  -- (auto-agents' editor socket).
+  if require("auto-run.mailbox.commands").registry() then
     require("auto-run.mailbox.commands").register_all()
   end
 
