@@ -284,6 +284,17 @@ half. Smoke 579/0.
 - **Config**: `discovery = { max_files = 5000, max_roots = 200,
   open_buffers = true }`.
 
+## [v0.1.20] — 2026-11-03 — the run.* verbs register in auto-core.commands (auto-core v0.6.0)
+
+### Fixed
+
+- **The `run.*` verbs register in auto-core's command registry, `auto-core.commands`**, and in the
+  file mailbox's (`auto-core.mailbox.commands`) only on an auto-core older than v0.6.0. auto-core
+  v0.6.0 retires the file mailbox, and v0.1.19 registered through it alone, so every `run.*` verb
+  would have vanished from the registry, and from the agents' editor socket, with no warning.
+  `require("auto-run.mailbox.commands").registry()` names the registry used; with neither, the
+  verbs are skipped with one log line. Tag before auto-core v0.6.0.
+
 ## [v0.1.19] — 2026-10-03 — Node, Playwright, Dart and Flutter; missing-dependency alerts; AGENTS.md in every .auto-run/
 
 Patch (ADR 0213, ADR 0196 r3).
